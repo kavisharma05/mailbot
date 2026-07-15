@@ -10,13 +10,16 @@ from config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_MAX_ATTEMPTS = 4
+_MAX_ATTEMPTS = 3
 _RETRY_STATUS = {429, 500, 502, 503}
 _CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 
 _last_error: str | None = None
 _last_status: int | None = None
 _last_provider: str | None = None
+
+# Once Groq hits daily TPD, skip it for the rest of this process lifetime
+_groq_daily_limit_hit = False
 
 
 def get_last_groq_error() -> tuple[str | None, int | None]:
@@ -41,7 +44,17 @@ def _set_last_error(
 
 def _is_daily_token_limit(exc: APIStatusError) -> bool:
     text = str(exc).lower()
-    return "tokens per day" in text or "tpd" in text or "rate_limit_exceeded" in text
+    return (
+        "tokens per day" in text
+        or "tpd" in text
+        or ("rate_limit_exceeded" in text and "day" in text)
+    )
+
+
+def _mark_groq_daily_limit() -> None:
+    global _groq_daily_limit_hit
+    _groq_daily_limit_hit = True
+    logger.warning("Groq daily limit flagged — subsequent calls will use Cerebras first")
 
 
 def _call_cerebras(
@@ -55,6 +68,9 @@ def _call_cerebras(
     """OpenAI-compatible Cerebras chat completion. Returns message content or None."""
     settings = get_settings()
     if not settings.cerebras_api_key:
+        logger.error(
+            "Cerebras fallback skipped: CEREBRAS_API_KEY is not set in environment"
+        )
         return None
 
     resolved_model = model or settings.cerebras_model
@@ -107,6 +123,10 @@ def _call_groq(
     max_tokens: int,
     model: str | None = None,
 ) -> str | None:
+    if _groq_daily_limit_hit:
+        logger.info("Skipping Groq (daily limit already hit this process)")
+        return None
+
     settings = get_settings()
     client = Groq(api_key=settings.groq_api_key)
     resolved_model = model or settings.groq_model
@@ -133,10 +153,11 @@ def _call_groq(
         except APIStatusError as exc:
             if exc.status_code == 429 and _is_daily_token_limit(exc):
                 _set_last_error(str(exc), 429, "groq")
+                _mark_groq_daily_limit()
                 logger.error("Groq daily token limit hit: %s", exc)
                 return None
             if exc.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS:
-                delay = 2 ** (attempt - 1)
+                delay = min(2 ** (attempt - 1), 2)
                 logger.warning(
                     "Groq transient error %s (attempt %d/%d), retrying in %ds",
                     exc.status_code,
@@ -160,8 +181,15 @@ def _complete(
     max_tokens: int,
     model: str | None = None,
 ) -> str | None:
-    """Try Groq first; on failure (esp. rate limit), fall back to Cerebras."""
+    """Try Groq first (unless daily-limited); fall back to Cerebras."""
     _set_last_error(None, None, None)
+
+    # If Groq already exhausted today, go straight to Cerebras
+    if _groq_daily_limit_hit:
+        logger.info("Using Cerebras (Groq daily limit active)")
+        return _call_cerebras(
+            system, user, json_mode=json_mode, max_tokens=max_tokens, model=None
+        )
 
     text = _call_groq(
         system,
@@ -179,7 +207,7 @@ def _complete(
         user,
         json_mode=json_mode,
         max_tokens=max_tokens,
-        model=None,  # always use cerebras_model for fallback
+        model=None,
     )
 
 
@@ -191,7 +219,6 @@ def call_json(system: str, user: str, model: str | None = None) -> dict[str, Any
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Some models wrap JSON in fences
         cleaned = text.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.strip("`")
