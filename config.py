@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     telegram_bot_token: str
     telegram_owner_chat_id: str
     telegram_webhook_secret: str
+    telegram_chat_deadlines: str = ""
+    telegram_chat_placements: str = ""
+    telegram_chat_admin: str = ""
+    telegram_chat_other: str = ""
 
     groq_api_key: str
     groq_model: str = "llama-3.3-70b-versatile"

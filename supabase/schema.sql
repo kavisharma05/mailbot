@@ -11,6 +11,7 @@ create table if not exists assignments (
     gmail_message_id text,
     expected_filename_hint text,
     summary text,
+    category text check (category in ('deadline', 'placement', 'admin', 'other')),
     confidence text check (confidence in ('high', 'medium', 'low')),
     status text not null default 'open' check (status in ('open', 'done', 'dismissed')),
     created_at timestamptz not null default now()
@@ -43,3 +44,7 @@ create table if not exists low_confidence_log (
 );
 
 create index if not exists idx_low_confidence_log_created on low_confidence_log (created_at desc);
+
+-- Migration for existing projects (run once in Supabase SQL editor):
+-- alter table assignments add column if not exists category text
+--   check (category in ('deadline', 'placement', 'admin', 'other'));

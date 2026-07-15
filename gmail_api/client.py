@@ -35,7 +35,6 @@ def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | No
                 "userId": "me",
                 "startHistoryId": start_history_id,
                 "historyTypes": ["messageAdded"],
-                "labelId": "INBOX",
             }
             if page_token:
                 kwargs["pageToken"] = page_token
@@ -47,7 +46,7 @@ def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | No
                 for added in record.get("messagesAdded", []):
                     msg = added.get("message", {})
                     labels = msg.get("labelIds", [])
-                    if "INBOX" in labels:
+                    if "INBOX" in labels or "SPAM" in labels:
                         message_ids.append(msg["id"])
 
             page_token = response.get("nextPageToken")
@@ -61,14 +60,38 @@ def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | No
 
 
 def list_recent_inbox_message_ids() -> list[str]:
+    return list_inbox_message_ids_since(days=1, max_results=50)
+
+
+def list_inbox_message_ids_since(days: int = 14, max_results: int = 200) -> list[str]:
+    """List inbox and spam message IDs from the last N days, paginated up to max_results."""
     service = get_gmail_service()
-    response = (
-        service.users()
-        .messages()
-        .list(userId="me", q="in:inbox newer_than:1d", maxResults=50)
-        .execute()
-    )
-    return [m["id"] for m in response.get("messages", [])]
+    # Spam is excluded from searches by default; include it explicitly.
+    query = f"(in:inbox OR in:spam) newer_than:{days}d"
+    message_ids: list[str] = []
+    page_token = None
+
+    while len(message_ids) < max_results:
+        page_size = min(100, max_results - len(message_ids))
+        kwargs: dict[str, Any] = {
+            "userId": "me",
+            "q": query,
+            "maxResults": page_size,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        response = service.users().messages().list(**kwargs).execute()
+        for message in response.get("messages", []):
+            message_ids.append(message["id"])
+            if len(message_ids) >= max_results:
+                break
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return list(dict.fromkeys(message_ids))
 
 
 def _decode_body_data(data: str) -> str:

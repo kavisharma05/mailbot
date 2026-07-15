@@ -9,30 +9,39 @@ if the student's name isn't given.
 - Respond ONLY with strict JSON, no markdown fences, no preamble:
 {{"subject": "...", "body": "..."}}"""
 
-DEADLINE_PROMPT = """You screen college emails for a student who gets 5-7 emails a day and
-misses deadlines buried in long messages. For each email you receive,
-decide if it contains an assignment, project, exam, or submission
-deadline the student needs to act on.
+DEADLINE_PROMPT = """You triage MBA/college emails for a student who gets many emails a day
+and misses important items buried in long messages. For each email,
+classify it and decide if the student needs to act.
 
 Today's date for resolving relative deadlines: {today}
 
+Categories (pick exactly one):
+- "deadline" — assignments, projects, cases, quizzes, exams, submissions
+- "placement" — shortlists, CV/resume deadlines, company PPTs, interview slots, internships
+- "admin" — fees, registration, forms, ID/library/hostel, official notices
+- "other" — clubs, events, newsletters, FYI-only mail with no action required
+
 Rules:
-- Ignore newsletters, general announcements, FYI-only mail, and anything
-with no action required from the student.
-- If it IS actionable, extract the deadline as precisely as the email
-states it. If no explicit date/time is given but urgency is implied
-(e.g. "by end of week"), say so in "deadline_text" and set
-"deadline_date" to null.
-- Write "summary" as ONE short sentence a student could read at a glance
-on their phone — course/topic + what's due + when. No preamble, no
-restating the sender.
-- "confidence" reflects how sure you are this is a real actionable deadline.
+- Set "is_actionable" true only when the student must do something (submit,
+register, attend, respond, pay, etc.). Newsletters and pure FYI mail are
+not actionable.
+- "category" must match the email's primary purpose even when not actionable.
+- Placement and admin emails may be actionable without a specific due date;
+set "deadline_text"/"deadline_date" to null when none is stated.
+- If actionable with a deadline, extract it as precisely as the email states.
+If urgency is implied but no explicit date (e.g. "by end of week"), put that
+in "deadline_text" and set "deadline_date" to null.
+- Write "summary" as ONE short sentence readable on a phone — topic + action +
+when (if any). No preamble, no restating the sender.
+- "confidence" reflects how sure you are this classification and action item
+are correct.
 
 Respond ONLY with strict JSON, no markdown fences, no preamble:
 {{
 "is_actionable": true/false,
+"category": "deadline|placement|admin|other",
 "course_or_topic": "string or null",
-"task": "string or null (e.g. 'Submit assignment 3', 'Take-home exam')",
+"task": "string or null (e.g. 'Submit assignment 3', 'Upload CV for shortlist')",
 "deadline_text": "string or null (as stated in the email)",
 "deadline_date": "YYYY-MM-DDTHH:MM or null (only if explicit)",
 "sender": "string or null",

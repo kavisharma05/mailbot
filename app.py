@@ -6,7 +6,7 @@ from telegram import Update
 
 from bot.telegram_app import build_telegram_application
 from config import get_settings
-from services.watcher import run_gmail_watcher
+from services.watcher import run_gmail_backfill, run_gmail_watcher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,4 +53,21 @@ async def watch_gmail(x_task_secret: str = Header(..., alias="x-task-secret")):
 
     result = await run_gmail_watcher(ptb_app.bot)
     logger.info("Gmail watcher result: %s", result)
+    return result
+
+
+@app.post("/tasks/backfill")
+async def backfill_gmail(
+    days: int = 14,
+    x_task_secret: str = Header(..., alias="x-task-secret"),
+):
+    settings = get_settings()
+    if x_task_secret != settings.task_secret:
+        raise HTTPException(status_code=403, detail="Invalid task secret")
+
+    if days < 1 or days > 30:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 30")
+
+    result = await run_gmail_backfill(ptb_app.bot, days=days)
+    logger.info("Gmail backfill result: %s", result)
     return result
