@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     groq_api_key: str
     groq_model: str = "llama-3.3-70b-versatile"
 
+    # Fallback when Groq hits rate limits (https://cloud.cerebras.ai)
+    cerebras_api_key: str = ""
+    cerebras_model: str = "gemma-4-31b"
+
     gmail_client_id: str
     gmail_client_secret: str
     gmail_refresh_token: str

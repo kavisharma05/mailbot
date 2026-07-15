@@ -75,6 +75,7 @@ To get each group's chat ID: send a message in the group, then open `https://api
 
 1. Get a free API key from [console.groq.com/keys](https://console.groq.com/keys)
 2. Set `GROQ_API_KEY` and optionally `GROQ_MODEL`
+3. Optionally set `CEREBRAS_API_KEY` as fallback when Groq hits daily limits
 
 ### 5. Run locally
 
@@ -126,6 +127,8 @@ Backfill stores all classified emails but only alerts on actionable items with f
 | `TELEGRAM_CHAT_OTHER` | Chat ID for other/FYI alerts (optional) |
 | `GROQ_API_KEY` | Groq API key (free from console.groq.com) |
 | `GROQ_MODEL` | Model name (default: llama-3.3-70b-versatile) |
+| `CEREBRAS_API_KEY` | Cerebras fallback when Groq is rate-limited |
+| `CEREBRAS_MODEL` | Cerebras model (default: `gemma-4-31b`) |
 | `GMAIL_CLIENT_ID` | Google OAuth client ID |
 | `GMAIL_CLIENT_SECRET` | Google OAuth client secret |
 | `GMAIL_REFRESH_TOKEN` | From get_gmail_token.py |
@@ -157,3 +160,4 @@ For free-text in groups without mentioning, disable privacy in BotFather: `/setp
 - Alerts route to category-specific groups when chat IDs are configured
 - Watcher only processes **new** mail after first run; use `/tasks/backfill` for older mail
 - Both the watcher and backfill scan the **Inbox and Spam** folders (important emails sometimes land in spam)
+- LLM calls use **Groq first**, then **Cerebras** if Groq fails / rate-limits

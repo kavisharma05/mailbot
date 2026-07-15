@@ -181,11 +181,10 @@ async def _answer_chat_question(
     await update.message.chat.send_action("typing")
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
 
-    # Q&A uses broader item set; category is a hint, not a hard filter
-    items = get_assignments_for_qa(category=None, limit=60)
+    # Keep payload small for Groq free-tier TPD limits
+    items = get_assignments_for_qa(category=None, limit=25)
     if category:
-        # Also include category-specific items at front
-        cat_items = get_assignments_for_qa(category=category, limit=30)
+        cat_items = get_assignments_for_qa(category=category, limit=15)
         seen = {i["id"] for i in cat_items}
         items = cat_items + [i for i in items if i["id"] not in seen]
 

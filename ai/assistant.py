@@ -1,19 +1,21 @@
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from ai.client import call_json, call_text
+from ai.client import call_json, call_text, get_last_groq_error
 from ai.prompts import ASSISTANT_PROMPT, GMAIL_QUERY_PROMPT
 from gmail_api.client import get_message_details, search_message_ids
 
 logger = logging.getLogger(__name__)
 
-_MAX_EMAILS = 12
-_BODY_CHARS = 2500
-_MAX_USER_CHARS = 14000
-_PASTED_CHARS = 3000
+# Keep prompts small to reduce Groq free-tier token burn
+_MAX_EMAILS = 5
+_BODY_CHARS = 900
+_MAX_USER_CHARS = 6000
+_PASTED_CHARS = 1800
+_MAX_ITEMS = 20
 
 _STOPWORDS = {
     "a", "an", "the", "is", "are", "was", "were", "for", "on", "in", "at", "to",
@@ -49,7 +51,6 @@ def _extract_keywords(text: str, max_words: int = 6) -> list[str]:
 
 def _queries_from_pasted_email(text: str) -> list[str]:
     queries: list[str] = []
-    # Professor / sender line
     for match in re.finditer(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)", text):
         name = match.group(1)
         if any(w in name.lower() for w in ("professor", "chairperson", "dear", "thanks")):
@@ -57,7 +58,6 @@ def _queries_from_pasted_email(text: str) -> list[str]:
         if len(name.split()) >= 2:
             queries.append(f'from:"{name}" newer_than:90d')
             break
-    # Quoted phrases from email body
     for phrase in ("Brady Training", "Organisational Behaviour", "Organizational Behaviour"):
         if phrase.lower() in text.lower():
             queries.append(f'"{phrase}" newer_than:90d')
@@ -67,36 +67,60 @@ def _queries_from_pasted_email(text: str) -> list[str]:
     return queries
 
 
-def build_gmail_queries(question: str, pasted_email: str | None = None) -> list[str]:
-    today = datetime.now().strftime("%Y-%m-%d")
-    system = GMAIL_QUERY_PROMPT.format(today=today)
-    result = call_json(system, f"Question:\n{question}")
+def _is_simple_deadline_question(question: str) -> bool:
+    q = question.lower()
+    return any(
+        w in q
+        for w in (
+            "deadline",
+            "due",
+            "tomorrow",
+            "today",
+            "what's due",
+            "what is due",
+            "any deadline",
+        )
+    )
+
+
+def build_gmail_queries(
+    question: str,
+    pasted_email: str | None = None,
+    *,
+    use_llm: bool = True,
+) -> list[str]:
     queries: list[str] = []
 
-    if result:
-        if isinstance(result.get("queries"), list):
-            queries.extend(q.strip() for q in result["queries"] if isinstance(q, str) and q.strip())
-        elif isinstance(result.get("query"), str) and result["query"].strip():
-            queries.append(result["query"].strip())
+    # Skip LLM query builder for simple deadline questions to save tokens
+    if use_llm and not _is_simple_deadline_question(question):
+        today = datetime.now().strftime("%Y-%m-%d")
+        system = GMAIL_QUERY_PROMPT.format(today=today)
+        result = call_json(system, f"Question:\n{question}")
+        if result:
+            if isinstance(result.get("queries"), list):
+                queries.extend(
+                    q.strip() for q in result["queries"] if isinstance(q, str) and q.strip()
+                )
+            elif isinstance(result.get("query"), str) and result["query"].strip():
+                queries.append(result["query"].strip())
 
     keywords = _extract_keywords(question)
     if keywords:
-        queries.append(f"({' OR '.join(keywords)}) newer_than:90d")
+        queries.append(f"({' OR '.join(keywords)}) newer_than:30d")
 
     if pasted_email:
         queries.extend(_queries_from_pasted_email(pasted_email))
 
     if not queries:
-        queries.append(f"{question} newer_than:90d")
+        queries.append("newer_than:14d")
 
-    # Dedupe preserving order
     seen: set[str] = set()
     unique: list[str] = []
     for q in queries:
         if q not in seen:
             seen.add(q)
             unique.append(q)
-    return unique[:5]
+    return unique[:3]
 
 
 def _fetch_relevant_emails(question: str, pasted_email: str | None = None) -> list[dict[str, Any]]:
@@ -136,6 +160,95 @@ def _fetch_relevant_emails(question: str, pasted_email: str | None = None) -> li
     return emails
 
 
+def _parse_target_date(question: str) -> datetime | None:
+    """Resolve 'tomorrow' / 'today' / explicit dates in the question to a local date."""
+    q = question.lower()
+    now = datetime.now().astimezone()
+    if "tomorrow" in q:
+        return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if "today" in q:
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    m = re.search(
+        r"(\d{1,2})(?:st|nd|rd|th)?\s+(jan|january|feb|february|mar|march|apr|april|"
+        r"may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|"
+        r"nov|november|dec|december)\s+(\d{4})",
+        q,
+    )
+    if m:
+        months = {
+            "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+            "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+            "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+            "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+        }
+        day, mon, year = int(m.group(1)), months[m.group(2)], int(m.group(3))
+        return datetime(year, mon, day, tzinfo=now.tzinfo)
+
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", q)
+    if m:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=now.tzinfo)
+    return None
+
+
+def _item_deadline_dt(item: dict[str, Any]) -> datetime | None:
+    value = item.get("deadline_date")
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone()
+    except ValueError:
+        return None
+
+
+def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -> str | None:
+    """Answer deadline questions from DB without Groq when AI is unavailable."""
+    if not _is_simple_deadline_question(question) and _parse_target_date(question) is None:
+        return None
+
+    target = _parse_target_date(question)
+    if target is None and "deadline" not in question.lower() and "due" not in question.lower():
+        return None
+
+    matched: list[dict[str, Any]] = []
+    for item in items:
+        if item.get("status") and item.get("status") != "open":
+            continue
+        dt = _item_deadline_dt(item)
+        if target is not None:
+            if dt is None:
+                text = (item.get("deadline_text") or "").lower()
+                if target.date() == (datetime.now().astimezone() + timedelta(days=1)).date():
+                    if "tomorrow" not in text:
+                        continue
+                elif "today" not in text:
+                    continue
+            elif dt.date() != target.date():
+                continue
+        matched.append(item)
+
+    label = target.strftime("%d %b %Y") if target else "upcoming"
+    if not matched:
+        return f"No open deadlines found for {label} in tracked items."
+
+    lines = [f"Deadlines for {label} ({len(matched)}):", ""]
+    for i, item in enumerate(matched[:15], start=1):
+        task = item.get("task") or item.get("summary") or "Untitled"
+        course = item.get("course_or_topic") or "—"
+        dt = _item_deadline_dt(item)
+        due = dt.strftime("%d %b %Y %I:%M %p") if dt else (item.get("deadline_text") or "Not specified")
+        created = item.get("created_at") or "unknown"
+        lines.append(f"{i}. {task}")
+        lines.append(f"   Course: {course}")
+        lines.append(f"   Due: {due}")
+        lines.append(f"   Tracked since: {created}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def _build_user_prompt(
     question: str,
     items: list[dict[str, Any]],
@@ -143,7 +256,19 @@ def _build_user_prompt(
     category: str | None,
     pasted_email: str | None,
 ) -> str:
-    scope = f"Category hint: {category}" if category else "Category hint: none (search all)"
+    scope = f"Category hint: {category}" if category else "Category hint: none"
+    slim_items = [
+        {
+            "category": i.get("category"),
+            "course_or_topic": i.get("course_or_topic"),
+            "task": i.get("task"),
+            "deadline_text": i.get("deadline_text"),
+            "deadline_date": i.get("deadline_date"),
+            "summary": i.get("summary"),
+            "status": i.get("status"),
+        }
+        for i in items[:_MAX_ITEMS]
+    ]
     parts = [scope, ""]
 
     if pasted_email:
@@ -151,7 +276,7 @@ def _build_user_prompt(
         parts.append(pasted_email[:_PASTED_CHARS])
         parts.append("")
 
-    parts.append(f"Tracked items (JSON):\n{json.dumps(items, default=str)}")
+    parts.append(f"Tracked items (JSON):\n{json.dumps(slim_items, default=str)}")
     parts.append(f"\nMatching Gmail emails (JSON):\n{json.dumps(emails, default=str)}")
     parts.append(f"\nStudent question:\n{question}")
 
@@ -172,6 +297,16 @@ def answer_question(
     today = datetime.now().strftime("%Y-%m-%d")
     system = ASSISTANT_PROMPT.format(today=today)
 
+    if _is_simple_deadline_question(question) or _parse_target_date(question):
+        deterministic = _deterministic_deadline_answer(question, items)
+        if deterministic and not pasted_email:
+            emails = _fetch_relevant_emails(question, pasted_email=pasted_email) if scan_gmail else []
+            user = _build_user_prompt(question, items, emails, category, pasted_email)
+            answer = call_text(system, user)
+            if answer:
+                return answer
+            return deterministic
+
     emails = _fetch_relevant_emails(question, pasted_email=pasted_email) if scan_gmail else []
     user = _build_user_prompt(question, items, emails, category, pasted_email)
 
@@ -179,17 +314,21 @@ def answer_question(
     if answer:
         return answer
 
-    # Retry with slimmer context if LLM failed (often token/size related)
-    slim_user = _build_user_prompt(
-        question,
-        items[:15],
-        emails[:4],
-        category,
-        pasted_email[:1500] if pasted_email else None,
-    )
-    answer = call_text(system, slim_user)
-    if answer:
-        return answer
+    _, status = get_last_groq_error()
+    deterministic = _deterministic_deadline_answer(question, items)
+    if deterministic:
+        if status == 429:
+            return (
+                deterministic
+                + "\n\n(Note: AI is temporarily rate-limited; this list is from tracked items only.)"
+            )
+        return deterministic
+
+    if status == 429:
+        return (
+            "Groq AI rate limit hit for today (token quota). "
+            "Try again later, or use /due to see tracked deadlines without AI."
+        )
 
     if pasted_email:
         return (
@@ -197,7 +336,7 @@ def answer_question(
             "From what you shared: it mentions tasks for tomorrow's session — "
             "check the Brady Training Program case and values chapter for OB."
         )
-    return "I couldn't generate an answer right now. Try rephrasing or paste the email text."
+    return "I couldn't generate an answer right now. Try /due, or ask again in a few minutes."
 
 
 def split_question_and_paste(text: str) -> tuple[str, str | None]:
@@ -206,7 +345,6 @@ def split_question_and_paste(text: str) -> tuple[str, str | None]:
         return text, None
 
     lines = text.strip().splitlines()
-    # First short line(s) may be the question
     question_lines: list[str] = []
     paste_start = 0
     for i, line in enumerate(lines):
