@@ -61,15 +61,21 @@ def insert_assignment(data: dict[str, Any]) -> dict[str, Any]:
     return result.data[0]
 
 
-def get_open_assignments() -> list[dict[str, Any]]:
+def get_open_assignments(category: str | None = None, limit: int = 40) -> list[dict[str, Any]]:
     db = get_db()
-    result = (
+    query = (
         db.table("assignments")
-        .select("id, course_or_topic, task, deadline_date, expected_filename_hint, gmail_thread_id")
+        .select(
+            "id, category, course_or_topic, task, deadline_text, deadline_date, "
+            "summary, confidence, status, created_at"
+        )
         .eq("status", "open")
         .order("deadline_date")
-        .execute()
+        .limit(limit)
     )
+    if category:
+        query = query.eq("category", category)
+    result = query.execute()
     return result.data or []
 
 

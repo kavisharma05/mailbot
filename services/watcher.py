@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 VALID_CATEGORIES = ("deadline", "placement", "admin", "other")
 
 CATEGORY_LABELS = {
-    "deadline": "Deadline alert",
-    "placement": "Placement alert",
-    "admin": "Admin alert",
-    "other": "Mail alert",
+    "deadline": "Deadline",
+    "placement": "Placement",
+    "admin": "Admin",
+    "other": "Other",
 }
 
 
@@ -42,11 +42,86 @@ def _resolve_chat_id(category: str, settings: Settings) -> str:
     return chat_id
 
 
-async def send_telegram_alert(summary: str, bot, category: str) -> None:
+def _escape_html(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _format_deadline_display(deadline_date: str | None, deadline_text: str | None) -> str:
+    if deadline_date:
+        try:
+            dt = datetime.fromisoformat(deadline_date)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            local = dt.astimezone()
+            formatted = local.strftime("%a, %d %b %Y %I:%M %p")
+            if deadline_text and deadline_text.strip():
+                return f"{formatted} ({deadline_text.strip()})"
+            return formatted
+        except ValueError:
+            pass
+    if deadline_text and deadline_text.strip():
+        return deadline_text.strip()
+    return "Not specified"
+
+
+def format_alert_message(
+    *,
+    category: str,
+    course_or_topic: str | None,
+    task: str | None,
+    deadline_date: str | None,
+    deadline_text: str | None,
+    summary: str | None,
+    sender: str | None,
+) -> str:
+    label = CATEGORY_LABELS.get(category, "Mail")
+    lines = [f"<b>{_escape_html(label)}</b>"]
+
+    if course_or_topic:
+        lines.append(f"<b>Course:</b> {_escape_html(str(course_or_topic))}")
+    if task:
+        lines.append(f"<b>Task:</b> {_escape_html(str(task))}")
+
+    due = _format_deadline_display(deadline_date, deadline_text)
+    lines.append(f"<b>Due:</b> {_escape_html(due)}")
+
+    if sender:
+        lines.append(f"<b>From:</b> {_escape_html(str(sender))}")
+
+    if summary:
+        lines.append("")
+        lines.append(_escape_html(str(summary)))
+
+    return "\n".join(lines)
+
+
+async def send_telegram_alert(
+    bot,
+    category: str,
+    *,
+    course_or_topic: str | None = None,
+    task: str | None = None,
+    deadline_date: str | None = None,
+    deadline_text: str | None = None,
+    summary: str | None = None,
+    sender: str | None = None,
+) -> None:
     settings = get_settings()
     chat_id = _resolve_chat_id(category, settings)
-    label = CATEGORY_LABELS.get(category, "Mail alert")
-    await bot.send_message(chat_id=chat_id, text=f"{label}: {summary}")
+    text = format_alert_message(
+        category=category,
+        course_or_topic=course_or_topic,
+        task=task,
+        deadline_date=deadline_date,
+        deadline_text=deadline_text,
+        summary=summary,
+        sender=sender,
+    )
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 def _parse_deadline_date(value: str | None) -> str | None:
@@ -143,7 +218,16 @@ async def _process_message(
             deadline_date,
             skip_past_deadlines=skip_past_deadlines,
         ):
-            await send_telegram_alert(summary, bot, category)
+            await send_telegram_alert(
+                bot,
+                category,
+                course_or_topic=result.get("course_or_topic"),
+                task=result.get("task"),
+                deadline_date=deadline_date,
+                deadline_text=result.get("deadline_text"),
+                summary=summary,
+                sender=result.get("sender") or details.get("sender"),
+            )
             alerts = 1
     elif is_actionable or confidence == "low":
         log_low_confidence(

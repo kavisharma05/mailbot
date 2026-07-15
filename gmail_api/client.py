@@ -94,6 +94,18 @@ def list_inbox_message_ids_since(days: int = 14, max_results: int = 200) -> list
     return list(dict.fromkeys(message_ids))
 
 
+def search_message_ids(query: str, max_results: int = 8) -> list[str]:
+    """Search the whole mailbox (incl. spam) for a Gmail query string."""
+    service = get_gmail_service()
+    response = (
+        service.users()
+        .messages()
+        .list(userId="me", q=query, maxResults=max_results, includeSpamTrash=True)
+        .execute()
+    )
+    return [m["id"] for m in response.get("messages", [])]
+
+
 def _decode_body_data(data: str) -> str:
     padded = data + "=" * (-len(data) % 4)
     return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")

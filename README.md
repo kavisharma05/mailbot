@@ -140,8 +140,14 @@ Backfill stores all classified emails but only alerts on actionable items with f
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Welcome message |
+| `/start` | Welcome + help |
+| `/due` or `/list` | Show open items for this chat's category |
+| `/ask <question>` | Ask about tracked deadlines/placements/admin |
 | `/send` | Compose and send an email |
+| `/cancel` | Cancel the current `/send` flow |
+
+In groups, also reply to the bot or mention it (`@IMTAssistant_bot what's due?`).  
+For free-text in groups without mentioning, disable privacy in BotFather: `/setprivacy` → Disable.
 
 ## Notes
 

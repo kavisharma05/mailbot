@@ -61,3 +61,39 @@ def call_json(system: str, user: str, model: str | None = None) -> dict[str, Any
     except json.JSONDecodeError:
         logger.warning("Failed to parse JSON from Groq response: %s", text[:200])
         return None
+
+
+def call_text(system: str, user: str, model: str | None = None) -> str | None:
+    """Call Groq and return plain text (for chat answers)."""
+    settings = get_settings()
+    client = Groq(api_key=settings.groq_api_key)
+    resolved_model = model or settings.groq_model
+
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=resolved_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                max_tokens=1024,
+                temperature=0.3,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            return text or None
+        except APIStatusError as exc:
+            if exc.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS:
+                delay = 2 ** (attempt - 1)
+                logger.warning(
+                    "Groq transient error %s (attempt %d/%d), retrying in %ds",
+                    exc.status_code,
+                    attempt,
+                    _MAX_ATTEMPTS,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            logger.error("Groq call failed: %s", exc)
+            return None
+    return None
