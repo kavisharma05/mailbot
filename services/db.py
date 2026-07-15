@@ -79,6 +79,24 @@ def get_open_assignments(category: str | None = None, limit: int = 40) -> list[d
     return result.data or []
 
 
+def get_assignments_for_qa(category: str | None = None, limit: int = 60) -> list[dict[str, Any]]:
+    """Recent tracked items for Q&A — open first, includes recently created items."""
+    db = get_db()
+    query = (
+        db.table("assignments")
+        .select(
+            "id, category, course_or_topic, task, deadline_text, deadline_date, "
+            "summary, confidence, status, created_at"
+        )
+        .order("deadline_date")
+        .limit(limit)
+    )
+    if category:
+        query = query.eq("category", category)
+    result = query.execute()
+    return result.data or []
+
+
 def log_low_confidence(kind: str, payload: dict[str, Any]) -> None:
     db = get_db()
     db.table("low_confidence_log").insert({"kind": kind, "payload": payload}).execute()

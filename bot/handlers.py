@@ -14,11 +14,11 @@ from telegram.ext import (
     filters,
 )
 
-from ai.assistant import answer_question
+from ai.assistant import answer_question, split_question_and_paste
 from ai.composer import compose_email
 from config import get_settings
 from gmail_api.client import send_email
-from services.db import get_open_assignments, log_low_confidence
+from services.db import get_assignments_for_qa, get_open_assignments, log_low_confidence
 
 logger = logging.getLogger(__name__)
 
@@ -159,8 +159,10 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         and update.message.reply_to_message.from_user
         and update.message.reply_to_message.from_user.id == context.bot.id
     )
+    category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
+    is_category_group = category is not None
 
-    if not (is_private or mentioned or is_reply_to_bot):
+    if not (is_private or mentioned or is_reply_to_bot or is_category_group):
         return
 
     question = _strip_bot_mention(text, bot_username)
@@ -178,8 +180,22 @@ async def _answer_chat_question(
 ) -> None:
     await update.message.chat.send_action("typing")
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
-    items = get_open_assignments(category=category)
-    answer = answer_question(question, items, category=category)
+
+    # Q&A uses broader item set; category is a hint, not a hard filter
+    items = get_assignments_for_qa(category=None, limit=60)
+    if category:
+        # Also include category-specific items at front
+        cat_items = get_assignments_for_qa(category=category, limit=30)
+        seen = {i["id"] for i in cat_items}
+        items = cat_items + [i for i in items if i["id"] not in seen]
+
+    question_text, pasted = split_question_and_paste(question)
+    answer = answer_question(
+        question_text,
+        items,
+        category=category,
+        pasted_email=pasted,
+    )
     await update.message.reply_text(answer)
 
 

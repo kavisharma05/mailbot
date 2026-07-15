@@ -1,6 +1,7 @@
 import base64
 import logging
 import re
+from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from typing import Any
 
@@ -157,11 +158,21 @@ def get_message_details(message_id: str) -> dict[str, str]:
     sender = headers.get("from", "")
     body = _extract_text_from_payload(msg.get("payload", {}))
 
+    received_at = ""
+    internal_ms = msg.get("internalDate")
+    if internal_ms:
+        try:
+            dt = datetime.fromtimestamp(int(internal_ms) / 1000, tz=timezone.utc)
+            received_at = dt.astimezone().strftime("%Y-%m-%d %I:%M %p")
+        except (TypeError, ValueError, OSError):
+            received_at = headers.get("date", "")
+
     return {
         "message_id": message_id,
         "thread_id": msg.get("threadId", ""),
         "subject": subject,
         "sender": sender,
+        "received_at": received_at,
         "body": body[:8000],
     }
 
