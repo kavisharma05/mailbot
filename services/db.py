@@ -16,8 +16,9 @@ def get_db() -> Client:
 
 def get_watch_state() -> dict[str, Any] | None:
     db = get_db()
-    result = db.table("watch_state").select("*").eq("id", 1).maybe_single().execute()
-    return result.data
+    result = db.table("watch_state").select("*").eq("id", 1).limit(1).execute()
+    rows = result.data or []
+    return rows[0] if rows else None
 
 
 def update_watch_state(last_history_id: str | None = None, last_checked_at: datetime | None = None) -> None:
@@ -33,8 +34,8 @@ def update_watch_state(last_history_id: str | None = None, last_checked_at: date
 
 def is_email_processed(message_id: str) -> bool:
     db = get_db()
-    result = db.table("processed_emails").select("message_id").eq("message_id", message_id).maybe_single().execute()
-    return result.data is not None
+    result = db.table("processed_emails").select("message_id").eq("message_id", message_id).limit(1).execute()
+    return bool(result.data)
 
 
 def mark_email_processed(
