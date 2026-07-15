@@ -1,0 +1,11 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-telegram-bot>=21.7
+groq>=0.13.0
+google-api-python-client>=2.150.0
+google-auth>=2.36.0
+google-auth-oauthlib>=1.2.1
+supabase>=2.10.0
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.1
+httpx>=0.28.0

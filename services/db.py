@@ -1,0 +1,78 @@
+import logging
+from datetime import datetime
+from typing import Any
+
+from supabase import Client, create_client
+
+from config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+def get_db() -> Client:
+    settings = get_settings()
+    return create_client(settings.supabase_url, settings.supabase_service_key)
+
+
+def get_watch_state() -> dict[str, Any] | None:
+    db = get_db()
+    result = db.table("watch_state").select("*").eq("id", 1).maybe_single().execute()
+    return result.data
+
+
+def update_watch_state(last_history_id: str | None = None, last_checked_at: datetime | None = None) -> None:
+    db = get_db()
+    payload: dict[str, Any] = {}
+    if last_history_id is not None:
+        payload["last_history_id"] = last_history_id
+    if last_checked_at is not None:
+        payload["last_checked_at"] = last_checked_at.isoformat()
+    if payload:
+        db.table("watch_state").update(payload).eq("id", 1).execute()
+
+
+def is_email_processed(message_id: str) -> bool:
+    db = get_db()
+    result = db.table("processed_emails").select("message_id").eq("message_id", message_id).maybe_single().execute()
+    return result.data is not None
+
+
+def mark_email_processed(
+    message_id: str,
+    is_actionable: bool | None,
+    confidence: str | None,
+    assignment_id: str | None = None,
+) -> None:
+    db = get_db()
+    db.table("processed_emails").insert(
+        {
+            "message_id": message_id,
+            "is_actionable": is_actionable,
+            "confidence": confidence,
+            "assignment_id": assignment_id,
+        }
+    ).execute()
+
+
+def insert_assignment(data: dict[str, Any]) -> dict[str, Any]:
+    db = get_db()
+    result = db.table("assignments").insert(data).execute()
+    return result.data[0]
+
+
+def get_open_assignments() -> list[dict[str, Any]]:
+    db = get_db()
+    result = (
+        db.table("assignments")
+        .select("id, course_or_topic, task, deadline_date, expected_filename_hint, gmail_thread_id")
+        .eq("status", "open")
+        .order("deadline_date")
+        .execute()
+    )
+    return result.data or []
+
+
+def log_low_confidence(kind: str, payload: dict[str, Any]) -> None:
+    db = get_db()
+    db.table("low_confidence_log").insert({"kind": kind, "payload": payload}).execute()
+    logger.info("Logged low-confidence %s output", kind)
