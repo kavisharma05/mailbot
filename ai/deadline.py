@@ -1,8 +1,16 @@
+from datetime import datetime
 from typing import Any
 
 from ai.client import call_json
 from ai.prompts import DEADLINE_PROMPT, DEADLINE_REPAIR_PROMPT
-from services.timeutil import now_ist, resolve_deadline, today_ist
+from services.timeutil import (
+    IST,
+    _extract_time,
+    now_ist,
+    parse_iso_deadline,
+    resolve_deadline,
+    today_ist,
+)
 
 VALID_CATEGORIES = ("deadline", "placement", "admin", "other")
 VALID_CONFIDENCE = ("high", "medium", "low")
@@ -20,16 +28,48 @@ def _normalize_confidence(value: str | None) -> str:
     return "low"
 
 
-def normalize_classification(result: dict[str, Any]) -> dict[str, Any]:
+def _reference_now(received_at: datetime | str | None) -> datetime:
+    """Use email received time for relative phrases like 'tomorrow'."""
+    if received_at is None:
+        return now_ist()
+    if isinstance(received_at, datetime):
+        dt = received_at
+    else:
+        dt = parse_iso_deadline(str(received_at))
+        if dt is None:
+            return now_ist()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST)
+    return dt.astimezone(IST)
+
+
+def _enrich_deadline_text(deadline_text: str | None, summary: str | None) -> str | None:
+    """If deadline_text has no clock time but summary does, merge them for resolution."""
+    if not deadline_text:
+        return deadline_text
+    if _extract_time(deadline_text):
+        return deadline_text
+    if summary and _extract_time(summary):
+        return f"{deadline_text}; {summary}"
+    return deadline_text
+
+
+def normalize_classification(
+    result: dict[str, Any],
+    *,
+    received_at: datetime | str | None = None,
+) -> dict[str, Any]:
     """Validate enums, resolve deadlines in IST, and ensure summary fallback."""
     category = _normalize_category(result.get("category"))
     confidence = _normalize_confidence(result.get("confidence"))
     task = result.get("task")
     course = result.get("course_or_topic")
     deadline_text = result.get("deadline_text")
-    resolved_date = resolve_deadline(result.get("deadline_date"), deadline_text, now=now_ist())
-
     summary = (result.get("summary") or "").strip()
+    ref = _reference_now(received_at)
+    enriched = _enrich_deadline_text(deadline_text, summary)
+    resolved_date = resolve_deadline(result.get("deadline_date"), enriched, now=ref)
+
     if not summary:
         headline = task or course
         if headline:
@@ -50,12 +90,23 @@ def normalize_classification(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def classify_email(subject: str, body: str, sender: str) -> dict[str, Any] | None:
-    ref = now_ist()
-    today = today_ist().isoformat()
+def classify_email(
+    subject: str,
+    body: str,
+    sender: str,
+    *,
+    received_at: datetime | str | None = None,
+) -> dict[str, Any] | None:
+    ref = _reference_now(received_at)
+    today = ref.date().isoformat()
     now_str = ref.strftime("%Y-%m-%d %H:%M %Z")
     system = DEADLINE_PROMPT.format(today=today, now=now_str, today_year=ref.year)
-    user = f"From: {sender}\nSubject: {subject}\n\n{body}"
+    user = (
+        f"From: {sender}\n"
+        f"Subject: {subject}\n"
+        f"Email received at (IST reference for relative dates): {now_str}\n\n"
+        f"{body}"
+    )
 
     result = call_json(system, user)
     if result is None:
@@ -65,4 +116,4 @@ def classify_email(subject: str, body: str, sender: str) -> dict[str, Any] | Non
     if not result or not isinstance(result, dict):
         return None
 
-    return normalize_classification(result)
+    return normalize_classification(result, received_at=ref)

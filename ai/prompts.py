@@ -7,8 +7,11 @@ Timezone: Asia/Kolkata (IST). Today is {today}. Current time: {now}.
 Rules:
 - Be concise but complete. If multiple deadlines match, list ALL of them.
 - For each email cited, include when it was received (received_at field).
-- "Tomorrow" means the day after today in IST. Resolve relative dates in IST.
+- For tracked items, trust deadline_date when present. Relative words in deadline_text
+  (tomorrow/today) were relative to when the email was received — do NOT reinterpret
+  them as the day after the student asked the question.
 - If the student pasted email text, treat it as real mail and answer from it.
+  Resolve that paste's "tomorrow" from the email's Date / received_at, not ask-time.
 - Use tracked items for saved deadlines; use Gmail emails for full mail content.
 - If emails are provided in the JSON, NEVER say "no emails were received".
 - If pasted email text is provided, NEVER say no emails were found.
@@ -65,8 +68,11 @@ not actionable.
 - "category" must match the email's primary purpose even when not actionable.
 - Placement and admin emails may be actionable without a specific due date;
 set "deadline_text"/"deadline_date" to null when none is stated.
-- Resolve relative deadlines using IST (today = {today}). If unambiguous
-("tomorrow", "Friday 5pm", "16 July"), set deadline_date.
+- Resolve relative deadlines using the email received time as "today" ({today} / {now}).
+  If the email says "tomorrow", that means the calendar day AFTER the email was received,
+  not after whenever this classifier runs later.
+- If unambiguous ("tomorrow 9:45", "Friday 5pm", "16 July"), set deadline_date.
+- Put the full deadline phrase including time into deadline_text (e.g. "tomorrow 9:45 am").
 - Only leave deadline_date null when the deadline is truly vague
 ("sometime next week", "soon", "ASAP" with no anchor).
 - deadline_date format: YYYY-MM-DDTHH:MM+05:30. If only a date is given, use 23:59+05:30.

@@ -205,7 +205,8 @@ def _fetch_relevant_emails(question: str, pasted_email: str | None = None) -> li
 
 
 def _item_deadline_dt(item: dict[str, Any]) -> datetime | None:
-    return item_effective_deadline_dt(item, now=now_ist())
+    # Anchor "tomorrow"/"today" to when the item was tracked (email time), not ask-time
+    return item_effective_deadline_dt(item)
 
 
 def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -> str | None:

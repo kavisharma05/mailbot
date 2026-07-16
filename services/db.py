@@ -5,7 +5,7 @@ from typing import Any
 from supabase import Client, create_client
 
 from config import get_settings
-from services.timeutil import parse_iso_deadline, resolve_deadline_text
+from services.timeutil import item_effective_deadline_dt, parse_iso_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -102,11 +102,7 @@ def _parse_deadline_dt(value: str | None) -> datetime | None:
 
 
 def _deadline_on_local_day(item: dict[str, Any], day: date, tz) -> bool:
-    dt = _parse_deadline_dt(item.get("deadline_date"))
-    if dt is None:
-        text = item.get("deadline_text")
-        if text:
-            dt = resolve_deadline_text(text)
+    dt = item_effective_deadline_dt(item)
     if dt is None:
         return False
     local = dt.astimezone(tz)
@@ -129,9 +125,7 @@ def get_assignments_due_between(
     items = get_open_assignments(category=category, limit=200)
     matched: list[dict[str, Any]] = []
     for item in items:
-        dt = _parse_deadline_dt(item.get("deadline_date"))
-        if dt is None:
-            dt = resolve_deadline_text(item.get("deadline_text"))
+        dt = item_effective_deadline_dt(item)
         if dt is None:
             continue
         local_date = dt.astimezone(tz).date()

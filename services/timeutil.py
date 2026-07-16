@@ -181,10 +181,20 @@ def item_effective_deadline_dt(
     *,
     now: datetime | None = None,
 ) -> datetime | None:
+    """Prefer stored deadline_date; else resolve deadline_text from created_at (not wall clock)."""
     parsed = parse_iso_deadline(item.get("deadline_date"))
     if parsed is not None:
         return parsed
-    return resolve_deadline_text(item.get("deadline_text"), now=now)
+
+    ref = now
+    if ref is None and item.get("created_at"):
+        ref = parse_iso_deadline(str(item["created_at"]))
+    # Merge summary time if deadline_text is just "tomorrow"/"today"
+    text = item.get("deadline_text")
+    summary = item.get("summary")
+    if text and summary and not _extract_time(str(text)) and _extract_time(str(summary)):
+        text = f"{text}; {summary}"
+    return resolve_deadline_text(text, now=ref)
 
 
 def format_deadline_display(

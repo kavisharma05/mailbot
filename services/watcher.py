@@ -151,7 +151,12 @@ async def _process_message(
 ) -> dict[str, Any]:
     """Classify one email, persist results, optionally alert."""
     details = get_message_details(message_id)
-    result = classify_email(details["subject"], details["body"], details["sender"])
+    result = classify_email(
+        details["subject"],
+        details["body"],
+        details["sender"],
+        received_at=details.get("received_at_iso") or details.get("received_at"),
+    )
 
     if result is None:
         log_low_confidence(
