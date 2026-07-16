@@ -43,14 +43,45 @@ def _reference_now(received_at: datetime | str | None) -> datetime:
     return dt.astimezone(IST)
 
 
-def _enrich_deadline_text(deadline_text: str | None, summary: str | None) -> str | None:
-    """If deadline_text has no clock time but summary does, merge them for resolution."""
+def _first_time_phrase(*texts: str | None) -> str | None:
+    """Pull a clock time like '9:45 am' from summary/body for session deadlines."""
+    import re
+
+    for text in texts:
+        if not text:
+            continue
+        m = re.search(
+            r"(\d{1,2}\s*:\s*\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _enrich_deadline_text(
+    deadline_text: str | None,
+    summary: str | None,
+    body: str | None = None,
+) -> str | None:
+    """If deadline_text has no clock time, pull it from summary or email body (e.g. 9:45)."""
     if not deadline_text:
+        # Still try to keep a relative anchor if body mentions tomorrow/today + time
+        if body and ("tomorrow" in body.lower() or "today" in body.lower()):
+            time_bit = _first_time_phrase(summary, body)
+            if time_bit and "tomorrow" in body.lower():
+                return f"tomorrow {time_bit}"
+            if time_bit and "today" in body.lower():
+                return f"today {time_bit}"
         return deadline_text
     if _extract_time(deadline_text):
         return deadline_text
     if summary and _extract_time(summary):
         return f"{deadline_text}; {summary}"
+    time_bit = _first_time_phrase(summary, body)
+    if time_bit:
+        return f"{deadline_text} {time_bit}"
     return deadline_text
 
 
@@ -58,6 +89,7 @@ def normalize_classification(
     result: dict[str, Any],
     *,
     received_at: datetime | str | None = None,
+    body: str | None = None,
 ) -> dict[str, Any]:
     """Validate enums, resolve deadlines in IST, and ensure summary fallback."""
     category = _normalize_category(result.get("category"))
@@ -67,8 +99,12 @@ def normalize_classification(
     deadline_text = result.get("deadline_text")
     summary = (result.get("summary") or "").strip()
     ref = _reference_now(received_at)
-    enriched = _enrich_deadline_text(deadline_text, summary)
+    enriched = _enrich_deadline_text(deadline_text, summary, body=body)
     resolved_date = resolve_deadline(result.get("deadline_date"), enriched, now=ref)
+
+    # Prefer storing the enriched phrase so later Q&A keeps the session time
+    if enriched and enriched != deadline_text:
+        deadline_text = enriched
 
     if not summary:
         headline = task or course
@@ -116,4 +152,4 @@ def classify_email(
     if not result or not isinstance(result, dict):
         return None
 
-    return normalize_classification(result, received_at=ref)
+    return normalize_classification(result, received_at=ref, body=body)

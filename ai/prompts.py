@@ -79,6 +79,8 @@ set "deadline_text"/"deadline_date" to null when none is stated.
   not after whenever this classifier runs later.
 - If unambiguous ("tomorrow 9:45", "Friday 5pm", "16 July"), set deadline_date.
 - Put the full deadline phrase including time into deadline_text (e.g. "tomorrow 9:45 am").
+- If the email says prepare/read for a session AND gives a meeting time ("see you at 9:45"),
+  that session time IS the deadline_date (not end of day).
 - Only leave deadline_date null when the deadline is truly vague
 ("sometime next week", "soon", "ASAP" with no anchor).
 - deadline_date format: YYYY-MM-DDTHH:MM+05:30. If only a date is given, use 23:59+05:30.
