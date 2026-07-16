@@ -7,7 +7,14 @@ from typing import Any
 from ai.client import call_json, call_text, get_last_groq_error
 from ai.prompts import ASSISTANT_PROMPT, GMAIL_QUERY_PROMPT
 from gmail_api.client import get_message_details, search_message_ids
-from services.timeutil import IST, format_deadline_display, item_effective_deadline_dt, now_ist, resolve_deadline_text, today_ist
+from services.timeutil import (
+    IST,
+    format_deadline_display,
+    item_effective_deadline_dt,
+    now_ist,
+    resolve_deadline_text,
+    today_ist,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -211,11 +218,22 @@ def _item_deadline_dt(item: dict[str, Any]) -> datetime | None:
 
 def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -> str | None:
     """Answer deadline questions from DB without Groq when AI is unavailable."""
+    q = question.lower()
     if not _is_simple_deadline_question(question) and _parse_target_date(question) is None:
-        return None
+        if not any(w in q for w in ("need to do", "to do", "anything", "tasks")):
+            return None
 
     target = _parse_target_date(question)
-    if target is None and "deadline" not in question.lower() and "due" not in question.lower():
+    day_set: set | None = None
+    if "today" in q and "tomorrow" in q:
+        day_set = {today_ist(), today_ist() + timedelta(days=1)}
+        label = "today and tomorrow (IST)"
+    elif target is not None:
+        day_set = {target.astimezone(IST).date()}
+        label = target.strftime("%d %b %Y")
+    elif any(w in q for w in ("deadline", "due", "need to do", "to do", "anything", "tasks")):
+        label = "upcoming"
+    else:
         return None
 
     matched: list[dict[str, Any]] = []
@@ -223,14 +241,11 @@ def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -
         if item.get("status") and item.get("status") != "open":
             continue
         dt = _item_deadline_dt(item)
-        if target is not None:
-            if dt is None:
-                continue
-            if dt.astimezone(IST).date() != target.astimezone(IST).date():
+        if day_set is not None:
+            if dt is None or dt.astimezone(IST).date() not in day_set:
                 continue
         matched.append(item)
 
-    label = target.strftime("%d %b %Y") if target else "upcoming"
     if not matched:
         return f"No open deadlines found for {label} in tracked items."
 
@@ -238,15 +253,34 @@ def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -
     for i, item in enumerate(matched[:15], start=1):
         task = item.get("task") or item.get("summary") or "Untitled"
         course = item.get("course_or_topic") or "—"
-        dt = _item_deadline_dt(item)
-        due = dt.astimezone(IST).strftime("%d %b %Y %I:%M %p") if dt else (item.get("deadline_text") or "Not specified")
-        created = item.get("created_at") or "unknown"
+        due = format_deadline_display(item.get("deadline_date"), item.get("deadline_text"), tz=IST)
         lines.append(f"{i}. {task}")
         lines.append(f"   Course: {course}")
-        lines.append(f"   Due: {due}")
-        lines.append(f"   Tracked since: {created}")
+        lines.append(f"   Due (IST): {due}")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def _slim_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
+    """Give the LLM IST display times — never raw UTC ISO for user-facing answers."""
+    due_ist = format_deadline_display(
+        item.get("deadline_date"),
+        item.get("deadline_text"),
+        tz=IST,
+    )
+    dt = item_effective_deadline_dt(item)
+    due_day_ist = dt.astimezone(IST).strftime("%Y-%m-%d") if dt else None
+    return {
+        "category": item.get("category"),
+        "course_or_topic": item.get("course_or_topic"),
+        "task": item.get("task"),
+        "deadline_text": item.get("deadline_text"),
+        "due_ist": due_ist,
+        "due_day_ist": due_day_ist,
+        "summary": item.get("summary"),
+        "status": item.get("status"),
+        "tracked_at": item.get("created_at"),
+    }
 
 
 def _build_user_prompt(
@@ -257,18 +291,7 @@ def _build_user_prompt(
     pasted_email: str | None,
 ) -> str:
     scope = f"Category hint: {category}" if category else "Category hint: none"
-    slim_items = [
-        {
-            "category": i.get("category"),
-            "course_or_topic": i.get("course_or_topic"),
-            "task": i.get("task"),
-            "deadline_text": i.get("deadline_text"),
-            "deadline_date": i.get("deadline_date"),
-            "summary": i.get("summary"),
-            "status": i.get("status"),
-        }
-        for i in items[:_MAX_ITEMS]
-    ]
+    slim_items = [_slim_item_for_prompt(i) for i in items[:_MAX_ITEMS]]
     parts = [scope, ""]
 
     if pasted_email:

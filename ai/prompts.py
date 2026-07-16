@@ -6,10 +6,15 @@ Timezone: Asia/Kolkata (IST). Today is {today}. Current time: {now}.
 
 Rules:
 - Be concise but complete. If multiple deadlines match, list ALL of them.
-- For each email cited, include when it was received (received_at field).
-- For tracked items, trust deadline_date when present. Relative words in deadline_text
-  (tomorrow/today) were relative to when the email was received — do NOT reinterpret
-  them as the day after the student asked the question.
+- Always show times in IST using each item's due_ist / due_day_ist fields.
+  NEVER print raw ISO timestamps like 2026-07-16T04:15:00+00:00.
+- For "today" / "tomorrow" questions, filter by due_day_ist against Today ({today}).
+  Tomorrow = the next IST calendar day after {today}.
+- For each email cited, include when it was received (received_at field, already IST).
+- For tracked items, trust due_ist. Relative words in deadline_text were relative to
+  when the email was received — do NOT reinterpret them as ask-time.
+- If Gmail emails include readings/cases/prep for a session, include those actions
+  even if not yet in tracked items.
 - If the student pasted email text, treat it as real mail and answer from it.
   Resolve that paste's "tomorrow" from the email's Date / received_at, not ask-time.
 - Use tracked items for saved deadlines; use Gmail emails for full mail content.
@@ -62,9 +67,10 @@ Categories (pick exactly one):
 - "other" — clubs, events, newsletters, FYI-only mail with no action required
 
 Rules:
-- Set "is_actionable" true only when the student must do something (submit,
-register, attend, respond, pay, etc.). Newsletters and pure FYI mail are
-not actionable.
+- Set "is_actionable" true when the student must do something: submit, register,
+attend, respond, pay, OR prepare/read a case/chapter for an upcoming class/session.
+Reading prep for "tomorrow's session" is actionable (category "deadline").
+Newsletters and pure FYI mail are not actionable.
 - "category" must match the email's primary purpose even when not actionable.
 - Placement and admin emails may be actionable without a specific due date;
 set "deadline_text"/"deadline_date" to null when none is stated.
@@ -89,6 +95,9 @@ Email: "Submit Marketing case study by 20 July."
 
 Email: "Tomorrow's OB session at 9:45 AM — read Brady Training case."
 {{"is_actionable":true,"category":"deadline","course_or_topic":"Organisational Behaviour","task":"Read Brady Training case","deadline_text":"tomorrow 9:45 AM","deadline_date":"TOMORROW_0945","sender":null,"summary":"Read Brady case before tomorrow 9:45 AM OB session","confidence":"high"}}
+
+Email: "Kindly do the following readings for tomorrow's session in OB. Prepare chapter on Values and case Is Anything Wrong at Wright & Fehr Investments?"
+{{"is_actionable":true,"category":"deadline","course_or_topic":"Organisational Behaviour","task":"Prepare Values chapter + Wright & Fehr Investments case","deadline_text":"tomorrow's session","deadline_date":"TOMORROW_2359","sender":null,"summary":"Prepare OB Values chapter and Wright & Fehr case for tomorrow","confidence":"high"}}
 
 Email: "Shortlist for ABC Corp — upload CV by Friday 5pm."
 {{"is_actionable":true,"category":"placement","course_or_topic":"ABC Corp","task":"Upload CV for shortlist","deadline_text":"Friday 5pm","deadline_date":"FRIDAY_1700","sender":null,"summary":"Upload CV for ABC Corp shortlist by Friday 5pm","confidence":"high"}}

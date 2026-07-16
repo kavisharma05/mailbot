@@ -9,6 +9,7 @@ from gmail_api.client import (
     get_profile_history_id,
     list_history_message_ids,
     list_inbox_message_ids_since,
+    search_message_ids,
 )
 from services.db import (
     get_watch_state,
@@ -222,6 +223,15 @@ async def _process_message(
     return {"processed": 1, "alerts": alerts}
 
 
+def _recent_unprocessed_message_ids(max_results: int = 40) -> list[str]:
+    """Safety net: history API can skip mail if historyId advanced after a failed classify."""
+    try:
+        return search_message_ids("newer_than:2d", max_results=max_results)
+    except Exception as exc:
+        logger.warning("Recent catch-up Gmail search failed: %s", exc)
+        return []
+
+
 async def run_gmail_watcher(bot) -> dict:
     """Poll Gmail for new emails, classify, route alerts by category."""
     state = get_watch_state()
@@ -230,14 +240,38 @@ async def run_gmail_watcher(bot) -> dict:
     if not state or not state.get("last_history_id"):
         history_id = get_profile_history_id()
         update_watch_state(last_history_id=history_id, last_checked_at=now)
-        logger.info("Initialized watch state at historyId=%s", history_id)
-        return {"status": "initialized", "history_id": history_id, "processed": 0, "alerts": 0}
+        logger.info("Initialized watch state at historyId=%s — running 2-day catch-up", history_id)
+        # Don't silently skip recent mail on (re)init
+        catchup_ids = _recent_unprocessed_message_ids(max_results=60)
+        processed = 0
+        alerts = 0
+        for message_id in catchup_ids:
+            if is_email_processed(message_id):
+                continue
+            outcome = await _process_message(message_id, bot)
+            processed += outcome["processed"]
+            alerts += outcome["alerts"]
+        return {
+            "status": "initialized",
+            "history_id": history_id,
+            "processed": processed,
+            "alerts": alerts,
+            "catchup_candidates": len(catchup_ids),
+        }
 
     start_id = state["last_history_id"]
     message_ids, latest_history_id = list_history_message_ids(start_id)
 
+    # Merge recent inbox/spam scan so failed/skipped history items still get retried
+    seen: set[str] = set(message_ids)
+    for mid in _recent_unprocessed_message_ids():
+        if mid not in seen:
+            message_ids.append(mid)
+            seen.add(mid)
+
     processed = 0
     alerts = 0
+    failed = 0
 
     for message_id in message_ids:
         if is_email_processed(message_id):
@@ -246,14 +280,26 @@ async def run_gmail_watcher(bot) -> dict:
         outcome = await _process_message(message_id, bot)
         processed += outcome["processed"]
         alerts += outcome["alerts"]
+        if outcome["processed"] == 0:
+            failed += 1
 
-    new_history_id = latest_history_id or get_profile_history_id()
-    update_watch_state(last_history_id=new_history_id, last_checked_at=now)
+    # Only advance history when nothing failed classification — otherwise retry next run
+    if failed == 0:
+        new_history_id = latest_history_id or get_profile_history_id()
+        update_watch_state(last_history_id=new_history_id, last_checked_at=now)
+    else:
+        new_history_id = start_id
+        update_watch_state(last_checked_at=now)
+        logger.warning(
+            "Deferred history advance: %d message(s) failed classify and will retry",
+            failed,
+        )
 
     return {
         "status": "ok",
         "processed": processed,
         "alerts": alerts,
+        "failed_retries": failed,
         "history_id": new_history_id,
     }
 
