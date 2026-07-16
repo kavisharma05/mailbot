@@ -18,6 +18,12 @@ from services.db import (
     mark_email_processed,
     update_watch_state,
 )
+from services.timeutil import (
+    IST,
+    format_deadline_display,
+    now_ist,
+    parse_iso_deadline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,21 +57,7 @@ def _escape_html(text: str) -> str:
 
 
 def _format_deadline_display(deadline_date: str | None, deadline_text: str | None) -> str:
-    if deadline_date:
-        try:
-            dt = datetime.fromisoformat(deadline_date)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            local = dt.astimezone()
-            formatted = local.strftime("%a, %d %b %Y %I:%M %p")
-            if deadline_text and deadline_text.strip():
-                return f"{formatted} ({deadline_text.strip()})"
-            return formatted
-        except ValueError:
-            pass
-    if deadline_text and deadline_text.strip():
-        return deadline_text.strip()
-    return "Not specified"
+    return format_deadline_display(deadline_date, deadline_text, tz=IST)
 
 
 def format_alert_message(
@@ -124,18 +116,6 @@ async def send_telegram_alert(
     await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
-def _parse_deadline_date(value: str | None) -> str | None:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
-    except ValueError:
-        return None
-
-
 def _normalize_category(value: str | None) -> str:
     if value in VALID_CATEGORIES:
         return value
@@ -143,15 +123,10 @@ def _normalize_category(value: str | None) -> str:
 
 
 def _deadline_is_past(deadline_date: str | None) -> bool:
-    if not deadline_date:
+    dt = parse_iso_deadline(deadline_date)
+    if dt is None:
         return False
-    try:
-        dt = datetime.fromisoformat(deadline_date)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt < datetime.now(timezone.utc)
-    except ValueError:
-        return False
+    return dt < now_ist()
 
 
 def _should_alert(
@@ -181,15 +156,14 @@ async def _process_message(
     if result is None:
         log_low_confidence(
             "deadline_classifier",
-            {"message_id": message_id, "subject": details["subject"]},
+            {"message_id": message_id, "subject": details["subject"], "retry": True},
         )
-        mark_email_processed(message_id, None, None)
-        return {"processed": 1, "alerts": 0}
+        return {"processed": 0, "alerts": 0}
 
     is_actionable = result.get("is_actionable", False)
     confidence = result.get("confidence", "low")
     category = _normalize_category(result.get("category"))
-    deadline_date = _parse_deadline_date(result.get("deadline_date"))
+    deadline_date = result.get("deadline_date")
     assignment_id = None
     alerts = 0
 
@@ -212,7 +186,7 @@ async def _process_message(
         assignment_id = assignment["id"]
 
         summary = result.get("summary")
-        if summary and _should_alert(
+        if _should_alert(
             is_actionable,
             confidence,
             deadline_date,

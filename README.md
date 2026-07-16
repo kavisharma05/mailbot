@@ -6,6 +6,7 @@ A Telegram bot that helps MBA/college students manage academic email: compose po
 
 - **`/send`** — Turn rough instructions into a polished email draft, approve, and send via Gmail
 - **Email watcher** — Polls Gmail every 15 minutes, classifies emails with Groq (Llama 3.3), routes alerts to category-specific Telegram groups
+- **Scheduled digests** — Morning (7:00 IST) and evening (19:00 IST) summaries per category group
 - **14-day backfill** — One-time scan of recent inbox mail via `POST /tasks/backfill`
 
 Email categories: `deadline`, `placement`, `admin`, `other`.
@@ -15,7 +16,7 @@ Scaffolded for later: submission matcher (#3), manual reminder parser (#4).
 ## Architecture
 
 - **FastAPI** app on Render (free tier) with Telegram webhook
-- **GitHub Actions** cron hits `/tasks/watch-gmail` every 15 min (keeps Render awake + polls Gmail + keeps Supabase active)
+- **GitHub Actions** cron hits `/tasks/watch-gmail` every 15 min, plus digest endpoints at 7:00 and 19:00 IST
 - **Supabase** Postgres for assignments, processed emails, watch state
 - **Gmail API** (OAuth2) for read + send
 - **Groq API** (free tier, Llama 3.3 70B) for structured JSON classification/composition
@@ -102,7 +103,15 @@ python scripts/set_webhook.py
    - `RENDER_URL` — your Render app URL (e.g. `https://mailbot-abc.onrender.com`)
    - `TASK_SECRET` — same value as in Render env
 
-The `.github/workflows/watcher.yml` workflow will ping `/tasks/watch-gmail` every 15 minutes.
+The `.github/workflows/watcher.yml` workflow will:
+
+| Schedule (UTC) | IST | Endpoint |
+|----------------|-----|----------|
+| `*/15 * * * *` | every 15 min | `/tasks/watch-gmail` |
+| `30 1 * * *` | 7:00 | `/tasks/digest-morning` |
+| `30 13 * * *` | 19:00 | `/tasks/digest-evening` |
+
+Use **Actions → Gmail Deadline Watcher → Run workflow** to manually trigger the watcher or either digest.
 
 ### One-time 14-day backfill
 
@@ -113,6 +122,15 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 ```
 
 Backfill stores all classified emails but only alerts on actionable items with future (or unknown) deadlines.
+
+### Test digests (dry run)
+
+Returns JSON previews without sending Telegram messages:
+
+```bash
+curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.com/tasks/digest-morning?dry_run=1"
+curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.com/tasks/digest-evening?dry_run=1"
+```
 
 ## Environment variables
 
@@ -135,7 +153,7 @@ Backfill stores all classified emails but only alerts on actionable items with f
 | `GMAIL_USER` | Your Gmail address |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SERVICE_KEY` | Supabase service role key |
-| `TASK_SECRET` | Protects `/tasks/watch-gmail` and `/tasks/backfill` |
+| `TASK_SECRET` | Protects `/tasks/watch-gmail`, `/tasks/backfill`, and digest endpoints |
 | `STUDENT_NAME` | Sign-off name for composed emails |
 | `RENDER_URL` | Public URL (for set_webhook.py) |
 
@@ -144,7 +162,8 @@ Backfill stores all classified emails but only alerts on actionable items with f
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome + help |
-| `/due` or `/list` | Show open items for this chat's category |
+| `/due` or `/list` | Show numbered open items for this chat's category |
+| `/done <n>` | Mark item #n from the last `/due` list as complete |
 | `/ask <question>` | Ask about tracked deadlines/placements/admin |
 | `/send` | Compose and send an email |
 | `/cancel` | Cancel the current `/send` flow |
@@ -156,8 +175,14 @@ For free-text in groups without mentioning, disable privacy in BotFather: `/setp
 
 - Verify `GROQ_MODEL` matches a model available on the Groq free tier
 - Low-confidence classifier outputs are logged to `low_confidence_log` in Supabase
-- Only `medium` and `high` confidence actionable emails trigger Telegram alerts
+- Only `medium` and `high` confidence actionable emails trigger real-time Telegram alerts (every ~15 min)
+- **Morning digest (7:00 IST):** today's due items + recently tracked assignments per category group
+- **Evening digest (19:00 IST):** overdue, today, and tomorrow due items per category group
+- If a category group has nothing due, that group is skipped; if all groups are empty, a short note goes to owner DM only
 - Alerts route to category-specific groups when chat IDs are configured
 - Watcher only processes **new** mail after first run; use `/tasks/backfill` for older mail
 - Both the watcher and backfill scan the **Inbox and Spam** folders (important emails sometimes land in spam)
 - LLM calls use **Groq first**, then **Cerebras** if Groq fails / rate-limits
+- **Deadlines resolve in IST (Asia/Kolkata):** relative phrases like "tomorrow 9:45" are normalized server-side; date-only deadlines default to 23:59 IST
+- If email classification fails (LLM/JSON error), the message is **not** marked processed and will retry on the next watcher run (~15 min)
+- `/ask` uses stronger Gmail retrieval for date/topic questions and falls back to structured extracts when AI is unavailable

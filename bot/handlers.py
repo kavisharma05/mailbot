@@ -1,7 +1,6 @@
 import html
 import logging
 import re
-from datetime import datetime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
@@ -18,7 +17,13 @@ from ai.assistant import answer_question, split_question_and_paste
 from ai.composer import compose_email
 from config import get_settings
 from gmail_api.client import send_email
-from services.db import get_assignments_for_qa, get_open_assignments, log_low_confidence
+from services.db import (
+    get_assignments_for_qa,
+    get_open_assignments,
+    log_low_confidence,
+    mark_assignment_done,
+)
+from services.timeutil import IST, format_deadline_display
 
 logger = logging.getLogger(__name__)
 
@@ -66,15 +71,7 @@ def _format_due_list(items: list[dict], category: str | None) -> str:
     for i, item in enumerate(items[:20], start=1):
         task = item.get("task") or item.get("summary") or "Untitled"
         course = item.get("course_or_topic") or "—"
-        due = item.get("deadline_date") or item.get("deadline_text") or "Not specified"
-        if item.get("deadline_date"):
-            try:
-                dt = datetime.fromisoformat(item["deadline_date"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                due = dt.astimezone().strftime("%d %b %Y %I:%M %p")
-            except ValueError:
-                pass
+        due = format_deadline_display(item.get("deadline_date"), item.get("deadline_text"), tz=IST)
         cat = item.get("category") or "other"
         prefix = f"[{CATEGORY_TITLES.get(cat, cat)}] " if not category else ""
         lines.append(f"{i}. {prefix}<b>{html.escape(str(task))}</b>")
@@ -102,6 +99,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Commands:\n"
         "/due — open items for this chat/category\n"
         "/list — same as /due\n"
+        "/done <n> — mark item #n from /due as complete\n"
         "/ask <question> — ask anything; I search your Gmail + tracked items\n"
         "/send — compose and send an email (DM preferred)\n"
         "/cancel — cancel the current /send flow\n\n"
@@ -117,7 +115,58 @@ async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
     items = get_open_assignments(category=category)
+    context.user_data["due_items"] = [i["id"] for i in items[:20]]
     await update.message.reply_text(_format_due_list(items, category), parse_mode="HTML")
+
+
+async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+
+    category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
+
+    if not context.args:
+        items = get_open_assignments(category=category)
+        context.user_data["due_items"] = [i["id"] for i in items[:20]]
+        await update.message.reply_text(
+            "Usage: /done <number>\n\n" + _format_due_list(items, category),
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        index = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /done <number> — use the number from /due")
+        return
+
+    due_ids: list[str] = context.user_data.get("due_items") or []
+    if not due_ids:
+        items = get_open_assignments(category=category)
+        due_ids = [i["id"] for i in items[:20]]
+        context.user_data["due_items"] = due_ids
+
+    if index < 1 or index > len(due_ids):
+        items = get_open_assignments(category=category)
+        context.user_data["due_items"] = [i["id"] for i in items[:20]]
+        await update.message.reply_text(
+            f"No item #{index}. Pick from the list:\n\n" + _format_due_list(items, category),
+            parse_mode="HTML",
+        )
+        return
+
+    assignment_id = due_ids[index - 1]
+    updated = mark_assignment_done(assignment_id)
+    if not updated:
+        await update.message.reply_text("Could not mark that item done — it may already be closed.")
+        return
+
+    task = updated.get("task") or updated.get("summary") or "Untitled"
+    course = updated.get("course_or_topic") or "—"
+    await update.message.reply_text(
+        f"Marked done: <b>{html.escape(str(task))}</b>\nCourse: {html.escape(str(course))}",
+        parse_mode="HTML",
+    )
 
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -302,6 +351,7 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("due", due_command))
     application.add_handler(CommandHandler("list", due_command))
+    application.add_handler(CommandHandler("done", done_command))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(build_conversation_handler())
     # Free-text Q&A after conversation handler so /send flow keeps priority

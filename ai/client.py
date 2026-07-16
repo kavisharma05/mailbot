@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -86,33 +87,47 @@ def _call_cerebras(
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
-    try:
-        resp = httpx.post(
-            _CEREBRAS_URL,
-            headers={
-                "Authorization": f"Bearer {settings.cerebras_api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=60,
-        )
-        if resp.status_code >= 400:
-            _set_last_error(resp.text[:400], resp.status_code, "cerebras")
-            logger.error("Cerebras call failed (%s): %s", resp.status_code, resp.text[:300])
-            return None
+    for attempt in range(1, 3):
+        try:
+            resp = httpx.post(
+                _CEREBRAS_URL,
+                headers={
+                    "Authorization": f"Bearer {settings.cerebras_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=60,
+            )
+            if resp.status_code in _RETRY_STATUS and attempt < 2:
+                delay = min(2 ** (attempt - 1), 2)
+                logger.warning(
+                    "Cerebras transient error %s (attempt %d/2), retrying in %ds",
+                    resp.status_code,
+                    attempt,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            if resp.status_code >= 400:
+                _set_last_error(resp.text[:400], resp.status_code, "cerebras")
+                logger.error("Cerebras call failed (%s): %s", resp.status_code, resp.text[:300])
+                return None
 
-        data = resp.json()
-        message = (data.get("choices") or [{}])[0].get("message", {}) or {}
-        # Some Cerebras models (e.g. gpt-oss) put text in reasoning with empty content
-        text = (message.get("content") or message.get("reasoning") or "").strip()
-        if text:
-            logger.info("LLM answered via Cerebras model=%s", resolved_model)
-            _set_last_error(None, None, "cerebras")
-        return text or None
-    except Exception as exc:
-        _set_last_error(str(exc), None, "cerebras")
-        logger.error("Cerebras call exception: %s", exc)
-        return None
+            data = resp.json()
+            message = (data.get("choices") or [{}])[0].get("message", {}) or {}
+            text = (message.get("content") or message.get("reasoning") or "").strip()
+            if text:
+                logger.info("LLM answered via Cerebras model=%s", resolved_model)
+                _set_last_error(None, None, "cerebras")
+            return text or None
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(1)
+                continue
+            _set_last_error(str(exc), None, "cerebras")
+            logger.error("Cerebras call exception: %s", exc)
+            return None
+    return None
 
 
 def _call_groq(
@@ -211,25 +226,42 @@ def _complete(
     )
 
 
+def _parse_json_text(text: str) -> dict[str, Any] | None:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:].strip()
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
 def call_json(system: str, user: str, model: str | None = None) -> dict[str, Any] | None:
     """Call LLM and parse strict JSON from the response (Groq → Cerebras)."""
     text = _complete(system, user, json_mode=True, max_tokens=512, model=model)
     if not text:
         return None
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:].strip()
-            try:
-                return json.loads(cleaned)
-            except json.JSONDecodeError:
-                pass
+
+    parsed = _parse_json_text(text)
+    if parsed is None:
         logger.warning("Failed to parse JSON from LLM response: %s", text[:200])
-        return None
+    return parsed
 
 
 def call_text(system: str, user: str, model: str | None = None) -> str | None:

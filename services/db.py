@@ -1,12 +1,17 @@
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from supabase import Client, create_client
 
-from config import get_settings
+from services.timeutil import parse_iso_deadline, resolve_deadline_text
 
 logger = logging.getLogger(__name__)
+
+_ASSIGNMENT_COLUMNS = (
+    "id, category, course_or_topic, task, deadline_text, deadline_date, "
+    "summary, confidence, status, created_at"
+)
 
 
 def get_db() -> Client:
@@ -65,10 +70,7 @@ def get_open_assignments(category: str | None = None, limit: int = 40) -> list[d
     db = get_db()
     query = (
         db.table("assignments")
-        .select(
-            "id, category, course_or_topic, task, deadline_text, deadline_date, "
-            "summary, confidence, status, created_at"
-        )
+        .select(_ASSIGNMENT_COLUMNS)
         .eq("status", "open")
         .order("deadline_date")
         .limit(limit)
@@ -84,10 +86,7 @@ def get_assignments_for_qa(category: str | None = None, limit: int = 60) -> list
     db = get_db()
     query = (
         db.table("assignments")
-        .select(
-            "id, category, course_or_topic, task, deadline_text, deadline_date, "
-            "summary, confidence, status, created_at"
-        )
+        .select(_ASSIGNMENT_COLUMNS)
         .order("deadline_date")
         .limit(limit)
     )
@@ -95,6 +94,91 @@ def get_assignments_for_qa(category: str | None = None, limit: int = 60) -> list
         query = query.eq("category", category)
     result = query.execute()
     return result.data or []
+
+
+def _parse_deadline_dt(value: str | None) -> datetime | None:
+    return parse_iso_deadline(value)
+
+
+def _deadline_on_local_day(item: dict[str, Any], day: date, tz) -> bool:
+    dt = _parse_deadline_dt(item.get("deadline_date"))
+    if dt is None:
+        text = item.get("deadline_text")
+        if text:
+            dt = resolve_deadline_text(text)
+    if dt is None:
+        return False
+    local = dt.astimezone(tz)
+    return local.date() == day
+
+
+def get_assignments_due_on(day: date, tz, category: str | None = None) -> list[dict[str, Any]]:
+    """Open assignments whose deadline_date falls on the given local calendar day."""
+    items = get_open_assignments(category=category, limit=200)
+    return [i for i in items if _deadline_on_local_day(i, day, tz)]
+
+
+def get_assignments_due_between(
+    start_day: date,
+    end_day: date,
+    tz,
+    category: str | None = None,
+) -> list[dict[str, Any]]:
+    """Open assignments with deadline_date on any day from start_day through end_day (inclusive)."""
+    items = get_open_assignments(category=category, limit=200)
+    matched: list[dict[str, Any]] = []
+    for item in items:
+        dt = _parse_deadline_dt(item.get("deadline_date"))
+        if dt is None:
+            dt = resolve_deadline_text(item.get("deadline_text"))
+        if dt is None:
+            continue
+        local_date = dt.astimezone(tz).date()
+        if start_day <= local_date <= end_day:
+            matched.append(item)
+    return matched
+
+
+def get_recent_assignments(since: datetime, category: str | None = None) -> list[dict[str, Any]]:
+    """Assignments created since `since` (typically last 18h for morning digest)."""
+    db = get_db()
+    query = (
+        db.table("assignments")
+        .select(_ASSIGNMENT_COLUMNS)
+        .gte("created_at", since.isoformat())
+        .order("created_at", desc=True)
+        .limit(50)
+    )
+    if category:
+        query = query.eq("category", category)
+    result = query.execute()
+    return result.data or []
+
+
+def mark_assignment_done(assignment_id: str) -> dict[str, Any] | None:
+    db = get_db()
+    result = (
+        db.table("assignments")
+        .update({"status": "done"})
+        .eq("id", assignment_id)
+        .eq("status", "open")
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+def get_assignment_by_id(assignment_id: str) -> dict[str, Any] | None:
+    db = get_db()
+    result = (
+        db.table("assignments")
+        .select(_ASSIGNMENT_COLUMNS)
+        .eq("id", assignment_id)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
 
 
 def log_low_confidence(kind: str, payload: dict[str, Any]) -> None:

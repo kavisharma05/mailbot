@@ -6,6 +6,7 @@ from telegram import Update
 
 from bot.telegram_app import build_telegram_application
 from config import get_settings
+from services.digest import run_evening_digest, run_morning_digest
 from services.watcher import run_gmail_backfill, run_gmail_watcher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -70,4 +71,32 @@ async def backfill_gmail(
 
     result = await run_gmail_backfill(ptb_app.bot, days=days)
     logger.info("Gmail backfill result: %s", result)
+    return result
+
+
+@app.post("/tasks/digest-morning")
+async def digest_morning(
+    dry_run: int = 0,
+    x_task_secret: str = Header(..., alias="x-task-secret"),
+):
+    settings = get_settings()
+    if x_task_secret != settings.task_secret:
+        raise HTTPException(status_code=403, detail="Invalid task secret")
+
+    result = await run_morning_digest(ptb_app.bot, dry_run=bool(dry_run))
+    logger.info("Morning digest result: %s", result)
+    return result
+
+
+@app.post("/tasks/digest-evening")
+async def digest_evening(
+    dry_run: int = 0,
+    x_task_secret: str = Header(..., alias="x-task-secret"),
+):
+    settings = get_settings()
+    if x_task_secret != settings.task_secret:
+        raise HTTPException(status_code=403, detail="Invalid task secret")
+
+    result = await run_evening_digest(ptb_app.bot, dry_run=bool(dry_run))
+    logger.info("Evening digest result: %s", result)
     return result
