@@ -4,6 +4,7 @@ from typing import Any
 
 from supabase import Client, create_client
 
+from config import get_settings
 from services.timeutil import parse_iso_deadline, resolve_deadline_text
 
 logger = logging.getLogger(__name__)
