@@ -115,6 +115,7 @@ def normalize_classification(
 
     return {
         "is_actionable": bool(result.get("is_actionable")),
+        "is_schedule": bool(result.get("is_schedule")),
         "category": category,
         "course_or_topic": course,
         "task": task,
@@ -132,16 +133,20 @@ def classify_email(
     sender: str,
     *,
     received_at: datetime | str | None = None,
+    attachment_text: str | None = None,
 ) -> dict[str, Any] | None:
     ref = _reference_now(received_at)
     today = ref.date().isoformat()
     now_str = ref.strftime("%Y-%m-%d %H:%M %Z")
     system = DEADLINE_PROMPT.format(today=today, now=now_str, today_year=ref.year)
+    attach_block = ""
+    if attachment_text and attachment_text.strip():
+        attach_block = f"\n\nExtracted attachment text:\n{attachment_text[:6000]}"
     user = (
         f"From: {sender}\n"
         f"Subject: {subject}\n"
         f"Email received at (IST reference for relative dates): {now_str}\n\n"
-        f"{body}"
+        f"{body}{attach_block}"
     )
 
     result = call_json(system, user)
@@ -152,4 +157,5 @@ def classify_email(
     if not result or not isinstance(result, dict):
         return None
 
-    return normalize_classification(result, received_at=ref, body=body)
+    combined_body = f"{body}\n{attachment_text or ''}"
+    return normalize_classification(result, received_at=ref, body=combined_body)

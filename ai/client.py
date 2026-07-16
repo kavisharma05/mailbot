@@ -266,4 +266,4 @@ def call_json(system: str, user: str, model: str | None = None) -> dict[str, Any
 
 def call_text(system: str, user: str, model: str | None = None) -> str | None:
     """Call LLM and return plain text (Groq → Cerebras)."""
-    return _complete(system, user, json_mode=False, max_tokens=700, model=model)
+    return _complete(system, user, json_mode=False, max_tokens=900, model=model)

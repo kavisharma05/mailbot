@@ -23,7 +23,8 @@ from services.db import (
     log_low_confidence,
     mark_assignment_done,
 )
-from services.timeutil import IST, format_deadline_display
+from services.schedule import format_today_classes
+from services.timeutil import IST, format_deadline_display, today_ist
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/due — open items for this chat/category\n"
         "/list — same as /due\n"
         "/done <n> — mark item #n from /due as complete\n"
-        "/ask <question> — ask anything; I search your Gmail + tracked items\n"
+        "/classes — today's classes (time + room)\n"
+        "/ask <question> — ask about deadlines, mails today, senders, or email content\n"
         "/send — compose and send an email (DM preferred)\n"
         "/cancel — cancel the current /send flow\n\n"
         "In groups: reply to my messages, or mention me:\n"
@@ -117,6 +119,21 @@ async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     items = get_open_assignments(category=category)
     context.user_data["due_items"] = [i["id"] for i in items[:20]]
     await update.message.reply_text(_format_due_list(items, category), parse_mode="HTML")
+
+
+async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+
+    text = format_today_classes(today_ist())
+    if not text:
+        await update.message.reply_text(
+            "No classes stored for today yet.\n"
+            "When college sends a timetable (body or PDF/Excel), I'll parse it and "
+            "show rooms/times here + in the morning digest."
+        )
+        return
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -352,6 +369,7 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("due", due_command))
     application.add_handler(CommandHandler("list", due_command))
     application.add_handler(CommandHandler("done", done_command))
+    application.add_handler(CommandHandler("classes", classes_command))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(build_conversation_handler())
     # Free-text Q&A after conversation handler so /send flow keeps priority

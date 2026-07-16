@@ -180,3 +180,30 @@ def log_low_confidence(kind: str, payload: dict[str, Any]) -> None:
     db = get_db()
     db.table("low_confidence_log").insert({"kind": kind, "payload": payload}).execute()
     logger.info("Logged low-confidence %s output", kind)
+
+
+def insert_class_sessions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    db = get_db()
+    result = db.table("class_sessions").insert(rows).execute()
+    return result.data or []
+
+
+def delete_class_sessions_for_week(week_start: str) -> None:
+    db = get_db()
+    db.table("class_sessions").delete().eq("week_start", week_start).execute()
+
+
+def get_classes_on(session_date: str) -> list[dict[str, Any]]:
+    db = get_db()
+    result = (
+        db.table("class_sessions")
+        .select(
+            "id, course_or_topic, session_date, start_time, end_time, room, faculty, notes, week_start"
+        )
+        .eq("session_date", session_date)
+        .order("start_time")
+        .execute()
+    )
+    return result.data or []

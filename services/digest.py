@@ -9,6 +9,7 @@ from services.db import (
     get_assignments_due_on,
     get_recent_assignments,
 )
+from services.schedule import format_today_classes
 from services.watcher import CATEGORY_LABELS, VALID_CATEGORIES, _escape_html, _format_deadline_display
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,26 @@ async def run_morning_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
     sent: list[str] = []
     skipped: list[str] = []
     previews: dict[str, str] = {}
+
+    # Today's classes (from timetable emails) — send to Deadlines group + owner
+    classes_text = format_today_classes(today.date())
+    if classes_text:
+        previews["classes"] = classes_text
+        if not dry_run:
+            settings = get_settings()
+            class_chats: list[str] = []
+            for chat_id in (
+                settings.telegram_chat_deadlines or "",
+                settings.telegram_owner_chat_id,
+            ):
+                if chat_id and chat_id not in class_chats:
+                    class_chats.append(chat_id)
+            for chat_id in class_chats:
+                try:
+                    await bot.send_message(chat_id=chat_id, text=classes_text, parse_mode="HTML")
+                except Exception as exc:
+                    logger.warning("Failed sending today's classes to %s: %s", chat_id, exc)
+            sent.append("classes")
 
     for category in VALID_CATEGORIES:
         today_items = get_assignments_due_on(today.date(), IST, category=category)

@@ -1,27 +1,31 @@
-ASSISTANT_PROMPT = """You are Mailbot, an MBA student's personal email assistant on Telegram.
-You are given tracked items, matching Gmail messages, and sometimes text the
-student pasted from an email. Answer using ONLY this data.
+ASSISTANT_PROMPT = """You are Mailbot, an MBA student's personal email + Gmail assistant on Telegram.
+You are given:
+1) mailbox_stats (counts / queries),
+2) matching Gmail messages (subject, sender, received_at, often body),
+3) tracked deadline items,
+4) sometimes pasted email text.
 
 Timezone: Asia/Kolkata (IST). Today is {today}. Current time: {now}.
 
-Rules:
-- Be concise but complete. If multiple deadlines match, list ALL of them.
-- Always show times in IST using each item's due_ist / due_day_ist fields.
-  NEVER print raw ISO timestamps like 2026-07-16T04:15:00+00:00.
-- For "today" / "tomorrow" questions, filter by due_day_ist against Today ({today}).
-  Tomorrow = the next IST calendar day after {today}.
-- For each email cited, include when it was received (received_at field, already IST).
-- For tracked items, trust due_ist. Relative words in deadline_text were relative to
-  when the email was received — do NOT reinterpret them as ask-time.
-- If Gmail emails include readings/cases/prep for a session, include those actions
-  even if not yet in tracked items.
-- If the student pasted email text, treat it as real mail and answer from it.
-  Resolve that paste's "tomorrow" from the email's Date / received_at, not ask-time.
-- Use tracked items for saved deadlines; use Gmail emails for full mail content.
-- If emails are provided in the JSON, NEVER say "no emails were received".
-- If pasted email text is provided, NEVER say no emails were found.
-- If data is partial, say what you found and what is missing.
+CRITICAL:
+- Answer the student's EXACT question. You are a real assistant for ALL mail questions,
+  not only deadlines.
+- Mailbox questions you must handle using mailbox_stats + Gmail messages:
+  how many mails today, from whom, mails from a person, what an email said, summaries, etc.
+- If mailbox_stats.count is provided, use that number. List senders/subjects from the
+  Gmail messages JSON. Do not invent senders or counts.
+- Do not paste a generic "today/tomorrow deadlines" summary unless they asked for deadlines.
+- If they ask for tasks with no / unspecified deadlines, list ONLY items where
+  has_concrete_deadline is false.
+- Follow-ups must answer the follow-up — never repeat an unrelated previous dump.
+
+Other rules:
+- Be concise but complete. Prefer clear bullets.
+- Times in IST (due_ist / received_at). NEVER print raw UTC ISO.
+- Quote or paraphrase email body content when asked what someone said / what a mail contains.
+- If emails/pasted text are provided, NEVER say "no emails were received/found".
 - Do not invent senders, dates, or tasks not in the data.
+- If data is partial (count capped), say so.
 """
 
 GMAIL_QUERY_PROMPT = """Convert the student's question into Gmail search queries.
@@ -61,14 +65,17 @@ Today's date: {today}
 Current time: {now}
 
 Categories (pick exactly one):
-- "deadline" — assignments, projects, cases, quizzes, exams, submissions
+- "deadline" — assignments, projects, cases, quizzes, exams, submissions, class prep
 - "placement" — shortlists, CV/resume deadlines, company PPTs, interview slots, internships
-- "admin" — fees, registration, forms, ID/library/hostel, official notices
+- "admin" — fees, registration, forms, ID/library/hostel, official notices, timetables
 - "other" — clubs, events, newsletters, FYI-only mail with no action required
 
 Rules:
+- You may receive email body PLUS extracted attachment text (PDF/Excel/Word). Use both.
+- Set "is_schedule" true when the mail/attachment is a class timetable / weekly schedule
+  (days, times, rooms, courses). Timetables are actionable; category usually "admin".
 - Set "is_actionable" true when the student must do something: submit, register,
-attend, respond, pay, OR prepare/read a case/chapter for an upcoming class/session.
+attend, respond, pay, prepare/read for class, OR note a new timetable/schedule.
 Reading prep for "tomorrow's session" is actionable (category "deadline").
 Newsletters and pure FYI mail are not actionable.
 - "category" must match the email's primary purpose even when not actionable.
@@ -115,6 +122,7 @@ Email: Long mail with buried line "...please submit the Engineering Project repo
 Respond ONLY with strict JSON, no markdown fences, no preamble:
 {{
 "is_actionable": true/false,
+"is_schedule": true/false,
 "category": "deadline|placement|admin|other",
 "course_or_topic": "string or null",
 "task": "string or null",
@@ -131,6 +139,7 @@ Today: {today}. Now: {now}.
 
 {{
 "is_actionable": true/false,
+"is_schedule": true/false,
 "category": "deadline|placement|admin|other",
 "course_or_topic": "string or null",
 "task": "string or null",
@@ -140,6 +149,37 @@ Today: {today}. Now: {now}.
 "summary": "string or null",
 "confidence": "high|medium|low"
 }}"""
+
+SCHEDULE_PROMPT = """Extract class timetable sessions from a college email and/or attachment text.
+
+Timezone: Asia/Kolkata (IST).
+Email received / reference date: {today}
+Week hint (if any): use the dates mentioned; if only weekdays are given for "next week",
+resolve them to concrete calendar dates relative to {today}.
+
+Return ONLY strict JSON:
+{{
+"week_start": "YYYY-MM-DD or null (Monday of that week if known)",
+"sessions": [
+  {{
+    "course_or_topic": "string",
+    "session_date": "YYYY-MM-DD",
+    "start_time": "HH:MM (24h IST)",
+    "end_time": "HH:MM or null",
+    "room": "string or null",
+    "faculty": "string or null",
+    "notes": "string or null"
+  }}
+]
+}}
+
+Rules:
+- Include every class/session you can confidently extract.
+- Prefer room / venue / classroom fields when present.
+- Skip empty slots and breaks.
+- If a cell only has a course code, still include it.
+- If dates cannot be resolved, omit that session rather than inventing.
+"""
 
 SUBMISSION_MATCHER_PROMPT = """You match a file a student just uploaded to Telegram against a list of
 their currently-open assignment deadlines, to figure out which one

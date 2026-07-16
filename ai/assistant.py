@@ -6,7 +6,12 @@ from typing import Any
 
 from ai.client import call_json, call_text, get_last_groq_error
 from ai.prompts import ASSISTANT_PROMPT, GMAIL_QUERY_PROMPT
-from gmail_api.client import get_message_details, search_message_ids
+from gmail_api.client import (
+    count_messages,
+    get_message_details,
+    list_message_summaries,
+    search_message_ids,
+)
 from services.timeutil import (
     IST,
     format_deadline_display,
@@ -19,17 +24,20 @@ from services.timeutil import (
 logger = logging.getLogger(__name__)
 
 _MAX_EMAILS = 8
+_MAX_MAILBOX_EMAILS = 25
 _BODY_CHARS = 1500
-_MAX_USER_CHARS = 6000
+_MAILBOX_BODY_CHARS = 1800
+_MAX_USER_CHARS = 9000
 _PASTED_CHARS = 1800
 _MAX_ITEMS = 20
 
 _STOPWORDS = {
     "a", "an", "the", "is", "are", "was", "were", "for", "on", "in", "at", "to",
     "of", "and", "or", "me", "my", "all", "give", "tell", "what", "when", "why",
-    "how", "any", "about", "also", "date", "mail", "email", "received", "deadline",
-    "deadlines", "tomorrow", "today", "see", "there", "this", "that", "with",
-    "from", "did", "you", "miss", "reading", "task", "class", "july", "imt",
+    "how", "any", "about", "also", "date", "mail", "email", "emails", "mails",
+    "received", "deadline", "deadlines", "tomorrow", "today", "see", "there",
+    "this", "that", "with", "from", "did", "you", "miss", "reading", "task",
+    "class", "july", "imt", "many", "total", "count", "whom", "got", "have",
 }
 
 
@@ -74,19 +82,367 @@ def _queries_from_pasted_email(text: str) -> list[str]:
     return queries
 
 
-def _is_simple_deadline_question(question: str) -> bool:
+def _asks_undated_tasks(question: str) -> bool:
+    q = question.lower()
+    return any(
+        phrase in q
+        for phrase in (
+            "no specific deadline",
+            "no deadline",
+            "without deadline",
+            "without a deadline",
+            "unspecified deadline",
+            "missing deadline",
+            "no due date",
+            "without due",
+            "tasks with no",
+            "no specific due",
+        )
+    )
+
+
+_PERSON_STOP = {
+    "today",
+    "yesterday",
+    "mail",
+    "email",
+    "emails",
+    "mails",
+    "the",
+    "a",
+    "an",
+    "whom",
+    "who",
+    "what",
+    "which",
+    "where",
+    "when",
+    "how",
+    "many",
+    "all",
+    "anyone",
+    "someone",
+    "professor",
+}
+
+
+def _is_mailbox_question(question: str) -> bool:
+    """General Gmail questions: counts, senders, content — not pure deadline refreshes."""
+    q = question.lower().strip()
+    if _asks_undated_tasks(q):
+        return False
+    if _is_due_list_question(q) and not any(w in q for w in ("mail", "email", "inbox")):
+        return False
+    mailish = any(w in q for w in ("mail", "email", "inbox", "sender", "received"))
+    intent = any(
+        w in q
+        for w in (
+            "how many",
+            "count",
+            "total",
+            "from whom",
+            "who sent",
+            "who all",
+            "list",
+            "summar",
+            "what did",
+            "said",
+            "about",
+            "content",
+            "subject",
+            "unread",
+            "got today",
+            "received today",
+            "mails today",
+            "emails today",
+            "mails from",
+            "emails from",
+            "from ",
+        )
+    )
+    if mailish and intent:
+        return True
+    if any(
+        p in q
+        for p in (
+            "how many mail",
+            "how many email",
+            "mails i got",
+            "emails i got",
+            "from whom",
+            "mails from",
+            "emails from",
+            "total mails",
+            "total emails",
+        )
+    ):
+        return True
+    # "what did Saleena say about Brady" / "Saleena Khan email"
+    if re.search(r"\bwhat did\b.+\b(say|write|mention)\b", q):
+        return True
+    if re.search(r"\b(from|by)\s+[a-z]", q):
+        return True
+    if _extract_person_query(question) and any(
+        w in q for w in ("say", "said", "about", "mail", "email", "wrote", "sent")
+    ):
+        return True
+    return False
+
+
+def _extract_person_query(question: str) -> str | None:
+    """Pull a person/email fragment for Gmail from: search."""
+    q = question.strip()
+    m = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", q)
+    if m:
+        return m.group(1)
+
+    m = re.search(
+        r"(?:from|by)\s+([A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.']*){0,3})",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        name = m.group(1).strip(" .,?!")
+        parts = [p for p in name.split() if p.lower() not in _PERSON_STOP]
+        if parts:
+            return " ".join(parts)
+
+    # "what did Saleena Khan say" / "Saleena's mail"
+    m = re.search(
+        r"(?:what did|did)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:say|write|mention|send)",
+        q,
+    )
+    if m:
+        return m.group(1).strip()
+
+    m = re.search(
+        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)(?:'s)?\s+(?:mail|email|message)",
+        q,
+    )
+    if m:
+        return m.group(1).strip()
+
+    return None
+
+
+def _gmail_day_bounds_query(day: datetime | None = None) -> str:
+    """Gmail after:/before: window for an IST calendar day."""
+    d = (day or now_ist()).astimezone(IST).date()
+    nxt = d + timedelta(days=1)
+    return f"after:{d.year}/{d.month:02d}/{d.day:02d} before:{nxt.year}/{nxt.month:02d}/{nxt.day:02d}"
+
+
+def _build_mailbox_queries(question: str) -> list[str]:
+    q = question.lower()
+    person = _extract_person_query(question)
+    queries: list[str] = []
+
+    if "today" in q or "got today" in q or "received today" in q:
+        day_q = _gmail_day_bounds_query()
+        if person:
+            queries.append(f'from:("{person}") {day_q}')
+            queries.append(f"from:({person}) {day_q}")
+        queries.append(day_q)
+        queries.append(f"(in:inbox OR in:spam) {day_q}")
+    elif "yesterday" in q:
+        day_q = _gmail_day_bounds_query(now_ist() - timedelta(days=1))
+        if person:
+            queries.append(f'from:("{person}") {day_q}')
+        queries.append(day_q)
+    elif person:
+        queries.append(f'from:("{person}") newer_than:90d')
+        queries.append(f"from:({person.split()[-1]}) newer_than:90d")
+        keywords = _extract_keywords(question, max_words=4)
+        if keywords:
+            queries.append(f'from:("{person}") {" ".join(keywords)} newer_than:90d')
+    else:
+        today = today_ist().isoformat()
+        system = GMAIL_QUERY_PROMPT.format(today=today)
+        result = call_json(system, f"Question:\n{question}")
+        if result and isinstance(result.get("queries"), list):
+            queries.extend(
+                x.strip() for x in result["queries"] if isinstance(x, str) and x.strip()
+            )
+        keywords = _extract_keywords(question, max_words=5)
+        if keywords:
+            queries.append(f"{' '.join(keywords)} newer_than:30d")
+
+    if not queries:
+        queries.append(_gmail_day_bounds_query())
+
+    # unique preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in queries:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out[:4]
+
+
+def _wants_mail_bodies(question: str) -> bool:
     q = question.lower()
     return any(
         w in q
         for w in (
-            "deadline",
-            "due",
-            "tomorrow",
-            "today",
+            "said",
+            "say",
+            "content",
+            "about",
+            "summar",
+            "what did",
+            "meaning",
+            "detail",
+            "body",
+            "wrote",
+            "mention",
+            "reading",
+            "case",
+            "attachment",
+        )
+    )
+
+
+def _gather_mailbox_context(question: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Stats + message list for mailbox Q&A."""
+    queries = _build_mailbox_queries(question)
+    primary = queries[0]
+    wants_bodies = _wants_mail_bodies(question) or "whom" in question.lower() or "who" in question.lower()
+
+    try:
+        stats = count_messages(primary, hard_cap=300)
+    except Exception as exc:
+        logger.warning("count_messages failed for %r: %s", primary, exc)
+        stats = {"query": primary, "count": 0, "capped": False, "error": str(exc)}
+
+    emails: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for query in queries:
+        try:
+            batch = list_message_summaries(
+                query,
+                max_results=_MAX_MAILBOX_EMAILS,
+                include_body=wants_bodies or "how many" not in question.lower(),
+                body_chars=_MAILBOX_BODY_CHARS if wants_bodies else 400,
+            )
+        except Exception as exc:
+            logger.warning("list_message_summaries failed for %r: %s", query, exc)
+            continue
+        for mail in batch:
+            mid = mail.get("message_id")
+            if mid and mid in seen:
+                continue
+            if mid:
+                seen.add(mid)
+            emails.append(mail)
+            if len(emails) >= _MAX_MAILBOX_EMAILS:
+                break
+        if len(emails) >= _MAX_MAILBOX_EMAILS:
+            break
+
+    # Sender breakdown for "from whom" / how many today
+    senders: dict[str, int] = {}
+    for mail in emails:
+        sender = (mail.get("sender") or "unknown").strip()
+        senders[sender] = senders.get(sender, 0) + 1
+
+    stats = {
+        **stats,
+        "queries_tried": queries,
+        "listed": len(emails),
+        "senders": [
+            {"sender": s, "count": c}
+            for s, c in sorted(senders.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
+        "person_filter": _extract_person_query(question),
+    }
+    return stats, emails
+
+
+def _format_mailbox_fallback(stats: dict[str, Any], emails: list[dict[str, Any]], question: str) -> str:
+    """Deterministic mailbox answer when LLM is down."""
+    person = stats.get("person_filter")
+    count = stats.get("count", 0)
+    capped = stats.get("capped")
+    lines = []
+    if person:
+        lines.append(f"Mails from {person}: {count}" + ("+ (count capped)" if capped else ""))
+    else:
+        lines.append(f"Matching mails: {count}" + ("+ (count capped)" if capped else ""))
+    lines.append(f"Query: {stats.get('query')}")
+    lines.append("")
+    if stats.get("senders"):
+        lines.append("From whom (in listed sample):")
+        for row in stats["senders"][:15]:
+            lines.append(f"• {row['sender']} — {row['count']}")
+        lines.append("")
+    if emails:
+        lines.append(f"Recent messages ({min(len(emails), 15)}):")
+        for i, mail in enumerate(emails[:15], start=1):
+            lines.append(f"{i}. {mail.get('subject') or '(no subject)'}")
+            lines.append(f"   From: {mail.get('sender') or 'unknown'}")
+            lines.append(f"   Received: {mail.get('received_at') or 'unknown'}")
+            if mail.get("body") and _wants_mail_bodies(question):
+                snippet = re.sub(r"\s+", " ", str(mail["body"]))[:220]
+                lines.append(f"   Snippet: {snippet}")
+            lines.append("")
+    lines.append("(AI unavailable — showing Gmail stats/list directly.)")
+    return "\n".join(lines).strip()
+
+
+def _is_due_list_question(question: str) -> bool:
+    """True only for clear 'what's due' refreshes — not every mention of 'deadline'."""
+    q = question.lower().strip()
+    if _asks_undated_tasks(q):
+        return False
+    # Follow-ups / analytical questions should go to full AI, not the due-list shortcut
+    if any(
+        w in q
+        for w in (
+            "why",
+            "which",
+            "what are",
+            "what's that",
+            "explain",
+            "miss",
+            "email",
+            "from ",
+            "who",
+            "how",
+            "detail",
+        )
+    ):
+        # Still allow pure due-list phrasing like "what are my deadlines today"
+        if not any(w in q for w in ("today", "tomorrow", "this week", "due", "refresh")):
+            return False
+    return any(
+        w in q
+        for w in (
             "what's due",
             "what is due",
+            "what are my deadline",
             "any deadline",
+            "refresh the deadline",
+            "refresh deadline",
+            "due today",
+            "due tomorrow",
+            "deadlines today",
+            "deadlines tomorrow",
+            "deadlines for",
+            "need to do today",
+            "need to do tomorrow",
         )
+    ) or (
+        ("deadline" in q or "due" in q)
+        and ("today" in q or "tomorrow" in q or "refresh" in q)
+    )
+
+
+def _is_simple_deadline_question(question: str) -> bool:
+    """Backward-compatible alias used by Gmail query heuristics."""
+    return _is_due_list_question(question) or (
+        any(w in question.lower() for w in ("tomorrow", "today"))
+        and "deadline" in question.lower()
     )
 
 
@@ -216,11 +572,41 @@ def _item_deadline_dt(item: dict[str, Any]) -> datetime | None:
     return item_effective_deadline_dt(item)
 
 
+def _item_has_concrete_deadline(item: dict[str, Any]) -> bool:
+    return item_effective_deadline_dt(item) is not None
+
+
+def _deterministic_undated_answer(items: list[dict[str, Any]]) -> str:
+    matched = [
+        i
+        for i in items
+        if (not i.get("status") or i.get("status") == "open")
+        and not _item_has_concrete_deadline(i)
+    ]
+    if not matched:
+        return "No open tracked tasks without a concrete deadline right now."
+
+    lines = [f"Open tasks with no concrete deadline ({len(matched)}):", ""]
+    for i, item in enumerate(matched[:20], start=1):
+        task = item.get("task") or item.get("summary") or "Untitled"
+        course = item.get("course_or_topic") or "—"
+        text = item.get("deadline_text") or "—"
+        lines.append(f"{i}. {task}")
+        lines.append(f"   Course: {course}")
+        lines.append(f"   Deadline text: {text}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -> str | None:
-    """Answer deadline questions from DB without Groq when AI is unavailable."""
+    """Structured DB answers for clear due-list / undated-task questions."""
     q = question.lower()
-    if not _is_simple_deadline_question(question) and _parse_target_date(question) is None:
-        if not any(w in q for w in ("need to do", "to do", "anything", "tasks")):
+
+    if _asks_undated_tasks(question):
+        return _deterministic_undated_answer(items)
+
+    if not _is_due_list_question(question) and _parse_target_date(question) is None:
+        if not any(w in q for w in ("need to do today", "need to do tomorrow", "what's due", "refresh")):
             return None
 
     target = _parse_target_date(question)
@@ -231,8 +617,10 @@ def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -
     elif target is not None:
         day_set = {target.astimezone(IST).date()}
         label = target.strftime("%d %b %Y")
-    elif any(w in q for w in ("deadline", "due", "need to do", "to do", "anything", "tasks")):
-        label = "upcoming"
+    elif _is_due_list_question(question):
+        # Default refresh → today + tomorrow, not an unfiltered dump
+        day_set = {today_ist(), today_ist() + timedelta(days=1)}
+        label = "today and tomorrow (IST)"
     else:
         return None
 
@@ -263,18 +651,20 @@ def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -
 
 def _slim_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     """Give the LLM IST display times — never raw UTC ISO for user-facing answers."""
-    due_ist = format_deadline_display(
-        item.get("deadline_date"),
-        item.get("deadline_text"),
-        tz=IST,
-    )
     dt = item_effective_deadline_dt(item)
     due_day_ist = dt.astimezone(IST).strftime("%Y-%m-%d") if dt else None
+    has_concrete = dt is not None
+    due_ist = (
+        format_deadline_display(item.get("deadline_date"), item.get("deadline_text"), tz=IST)
+        if has_concrete
+        else "No concrete deadline"
+    )
     return {
         "category": item.get("category"),
         "course_or_topic": item.get("course_or_topic"),
         "task": item.get("task"),
         "deadline_text": item.get("deadline_text"),
+        "has_concrete_deadline": has_concrete,
         "due_ist": due_ist,
         "due_day_ist": due_day_ist,
         "summary": item.get("summary"),
@@ -289,6 +679,7 @@ def _build_user_prompt(
     emails: list[dict[str, Any]],
     category: str | None,
     pasted_email: str | None,
+    mailbox_stats: dict[str, Any] | None = None,
 ) -> str:
     scope = f"Category hint: {category}" if category else "Category hint: none"
     slim_items = [_slim_item_for_prompt(i) for i in items[:_MAX_ITEMS]]
@@ -299,7 +690,15 @@ def _build_user_prompt(
         parts.append(pasted_email[:_PASTED_CHARS])
         parts.append("")
 
-    parts.append(f"Tracked items (JSON):\n{json.dumps(slim_items, default=str)}")
+    if mailbox_stats:
+        parts.append(f"Mailbox stats (JSON):\n{json.dumps(mailbox_stats, default=str)}")
+        parts.append("")
+
+    # For pure mailbox questions, keep tracked items short to leave room for mail bodies
+    item_limit = 8 if mailbox_stats else _MAX_ITEMS
+    parts.append(
+        f"Tracked items (JSON):\n{json.dumps(slim_items[:item_limit], default=str)}"
+    )
     parts.append(f"\nMatching Gmail emails (JSON):\n{json.dumps(emails, default=str)}")
     parts.append(f"\nStudent question:\n{question}")
 
@@ -355,6 +754,18 @@ def _paste_fallback_answer(pasted: str) -> str:
     return "\n".join(lines)
 
 
+def _answer_looks_generic_due_dump(answer: str, question: str) -> bool:
+    """Detect when the model ignored a specific question and spat a due-list template."""
+    if not _asks_undated_tasks(question) and "what are" not in question.lower():
+        return False
+    a = answer.lower()
+    return (
+        "for today" in a
+        and "for tomorrow" in a
+        and "do not have specified deadlines" in a
+    )
+
+
 def answer_question(
     question: str,
     items: list[dict[str, Any]],
@@ -368,19 +779,45 @@ def answer_question(
     now_str = ref.strftime("%Y-%m-%d %H:%M %Z")
     system = ASSISTANT_PROMPT.format(today=today, now=now_str)
 
-    if _is_simple_deadline_question(question) or _parse_target_date(question):
+    # General mailbox brain: counts, senders, content (before deadline shortcuts)
+    if scan_gmail and _is_mailbox_question(question) and not pasted_email:
+        try:
+            stats, emails = _gather_mailbox_context(question)
+        except Exception as exc:
+            logger.exception("Mailbox context failed: %s", exc)
+            stats, emails = {"count": 0, "error": str(exc)}, []
+        user = _build_user_prompt(
+            question, items, emails, category, pasted_email, mailbox_stats=stats
+        )
+        answer = call_text(system, user)
+        if answer and not _answer_looks_generic_due_dump(answer, question):
+            if "no emails were received" in answer.lower() and emails:
+                return _format_mailbox_fallback(stats, emails, question)
+            return answer
+        return _format_mailbox_fallback(stats, emails, question)
+
+    # Undated-tasks questions: prefer precise DB list; still try AI once for wording
+    if _asks_undated_tasks(question):
+        undated = _deterministic_undated_answer(items)
+        emails = _fetch_relevant_emails(question, pasted_email=pasted_email) if scan_gmail else []
+        user = _build_user_prompt(question, items, emails, category, pasted_email)
+        answer = call_text(system, user)
+        if answer and not _answer_looks_generic_due_dump(answer, question):
+            return answer
+        return undated
+
+    if _is_due_list_question(question) or _parse_target_date(question):
         deterministic = _deterministic_deadline_answer(question, items)
         if deterministic and not pasted_email:
             emails = _fetch_relevant_emails(question, pasted_email=pasted_email) if scan_gmail else []
             user = _build_user_prompt(question, items, emails, category, pasted_email)
             answer = call_text(system, user)
-            if answer:
+            if answer and not _answer_looks_generic_due_dump(answer, question):
                 if emails and "no emails were received" in answer.lower():
                     return deterministic + "\n\n(Gmail results were found but omitted by AI; showing tracked items.)"
                 return answer
             if emails:
-                det_with_mail = deterministic + f"\n\n(Found {len(emails)} matching Gmail message(s) — AI unavailable for full synthesis.)"
-                return det_with_mail
+                return deterministic + f"\n\n(Found {len(emails)} matching Gmail message(s) — AI unavailable for full synthesis.)"
             return deterministic
 
     emails = _fetch_relevant_emails(question, pasted_email=pasted_email) if scan_gmail else []
@@ -388,6 +825,8 @@ def answer_question(
 
     answer = call_text(system, user)
     if answer:
+        if _answer_looks_generic_due_dump(answer, question):
+            return _deterministic_undated_answer(items) if _asks_undated_tasks(question) else answer
         if (emails or pasted_email) and "no emails were received" in answer.lower():
             deterministic = _deterministic_deadline_answer(question, items)
             if deterministic:
@@ -395,6 +834,14 @@ def answer_question(
         return answer
 
     _, status = get_last_groq_error()
+    # If this looks mail-related, try mailbox fallback before deadline dump
+    if scan_gmail and any(w in question.lower() for w in ("mail", "email", "from ", "inbox")):
+        try:
+            stats, mail_emails = _gather_mailbox_context(question)
+            return _format_mailbox_fallback(stats, mail_emails, question)
+        except Exception:
+            pass
+
     deterministic = _deterministic_deadline_answer(question, items)
     if deterministic:
         suffix = ""

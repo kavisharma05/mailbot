@@ -107,6 +107,65 @@ def search_message_ids(query: str, max_results: int = 8) -> list[str]:
     return [m["id"] for m in response.get("messages", [])]
 
 
+def count_messages(query: str, *, hard_cap: int = 500) -> dict[str, Any]:
+    """Count messages matching a Gmail query (paginated, capped)."""
+    service = get_gmail_service()
+    total = 0
+    page_token = None
+    estimate = None
+    while total < hard_cap:
+        kwargs: dict[str, Any] = {
+            "userId": "me",
+            "q": query,
+            "maxResults": min(100, hard_cap - total),
+            "includeSpamTrash": True,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = service.users().messages().list(**kwargs).execute()
+        if estimate is None:
+            estimate = response.get("resultSizeEstimate")
+        batch = response.get("messages") or []
+        total += len(batch)
+        page_token = response.get("nextPageToken")
+        if not page_token or not batch:
+            break
+    return {
+        "query": query,
+        "count": total,
+        "capped": bool(page_token),
+        "estimate": estimate,
+    }
+
+
+def list_message_summaries(
+    query: str,
+    *,
+    max_results: int = 40,
+    include_body: bool = False,
+    body_chars: int = 1200,
+) -> list[dict[str, Any]]:
+    """List recent matching messages with sender/subject/time (optional body)."""
+    ids = search_message_ids(query, max_results=max_results)
+    summaries: list[dict[str, Any]] = []
+    for message_id in ids:
+        try:
+            details = get_message_details(message_id, load_attachments=False)
+        except Exception as exc:
+            logger.warning("Failed loading message %s: %s", message_id, exc)
+            continue
+        item: dict[str, Any] = {
+            "message_id": details.get("message_id"),
+            "subject": details.get("subject"),
+            "sender": details.get("sender"),
+            "received_at": details.get("received_at"),
+        }
+        if include_body:
+            item["body"] = (details.get("body") or "")[:body_chars]
+        summaries.append(item)
+    return summaries
+
+
 def _decode_body_data(data: str) -> str:
     padded = data + "=" * (-len(data) % 4)
     return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
@@ -149,7 +208,48 @@ def _extract_text_from_payload(payload: dict[str, Any]) -> str:
     return ""
 
 
-def get_message_details(message_id: str) -> dict[str, str]:
+def _walk_attachment_parts(payload: dict[str, Any], out: list[dict[str, Any]]) -> None:
+    filename = payload.get("filename") or ""
+    body = payload.get("body") or {}
+    att_id = body.get("attachmentId")
+    size = int(body.get("size") or 0)
+    mime = payload.get("mimeType") or "application/octet-stream"
+    if filename and att_id:
+        out.append(
+            {
+                "filename": filename,
+                "mime_type": mime,
+                "attachment_id": att_id,
+                "size": size,
+            }
+        )
+    for part in payload.get("parts") or []:
+        _walk_attachment_parts(part, out)
+
+
+def list_message_attachments(message_id: str) -> list[dict[str, Any]]:
+    service = get_gmail_service()
+    msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    attachments: list[dict[str, Any]] = []
+    _walk_attachment_parts(msg.get("payload") or {}, attachments)
+    return attachments
+
+
+def download_attachment(message_id: str, attachment_id: str) -> bytes:
+    service = get_gmail_service()
+    att = (
+        service.users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=message_id, id=attachment_id)
+        .execute()
+    )
+    data = att.get("data") or ""
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded)
+
+
+def get_message_details(message_id: str, *, load_attachments: bool = True) -> dict[str, Any]:
     service = get_gmail_service()
     msg = service.users().messages().get(userId="me", id=message_id, format="full").execute()
 
@@ -172,6 +272,31 @@ def get_message_details(message_id: str) -> dict[str, str]:
         except (TypeError, ValueError, OSError):
             received_at = headers.get("date", "")
 
+    attachments: list[dict[str, Any]] = []
+    attachment_text = ""
+    if load_attachments:
+        from services.attachments import (
+            combine_attachment_text,
+            extract_text_from_bytes,
+            should_forward_attachment,
+        )
+
+        meta = []
+        _walk_attachment_parts(msg.get("payload") or {}, meta)
+        for item in meta[:8]:
+            try:
+                raw = download_attachment(message_id, item["attachment_id"])
+            except Exception as exc:
+                logger.warning("Attachment download failed %s: %s", item.get("filename"), exc)
+                continue
+            item = {**item, "data": raw, "size": len(raw)}
+            item["extracted_text"] = extract_text_from_bytes(
+                item["filename"], item["mime_type"], raw
+            )
+            item["forward"] = should_forward_attachment(item)
+            attachments.append(item)
+        attachment_text = combine_attachment_text(attachments)
+
     return {
         "message_id": message_id,
         "thread_id": msg.get("threadId", ""),
@@ -180,6 +305,8 @@ def get_message_details(message_id: str) -> dict[str, str]:
         "received_at": received_at,
         "received_at_iso": received_at_iso,
         "body": body[:8000],
+        "attachments": attachments,
+        "attachment_text": attachment_text,
     }
 
 

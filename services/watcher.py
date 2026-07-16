@@ -1,3 +1,4 @@
+import io
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -18,6 +19,12 @@ from services.db import (
     log_low_confidence,
     mark_email_processed,
     update_watch_state,
+)
+from services.schedule import (
+    format_schedule_share,
+    looks_like_schedule,
+    parse_schedule_sessions,
+    store_schedule_sessions,
 )
 from services.timeutil import (
     IST,
@@ -92,6 +99,17 @@ def format_alert_message(
     return "\n".join(lines)
 
 
+def _alert_chat_ids(category: str, settings: Settings) -> list[str]:
+    """Send to category group AND owner DM (both), de-duplicated."""
+    chats: list[str] = []
+    group = _resolve_chat_id(category, settings)
+    owner = settings.telegram_owner_chat_id
+    for chat_id in (group, owner):
+        if chat_id and chat_id not in chats:
+            chats.append(chat_id)
+    return chats
+
+
 async def send_telegram_alert(
     bot,
     category: str,
@@ -102,9 +120,9 @@ async def send_telegram_alert(
     deadline_text: str | None = None,
     summary: str | None = None,
     sender: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> None:
     settings = get_settings()
-    chat_id = _resolve_chat_id(category, settings)
     text = format_alert_message(
         category=category,
         course_or_topic=course_or_topic,
@@ -114,7 +132,57 @@ async def send_telegram_alert(
         summary=summary,
         sender=sender,
     )
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    for chat_id in _alert_chat_ids(category, settings):
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        await _forward_attachments(bot, chat_id, attachments or [], caption_prefix=summary or task)
+
+
+async def _forward_attachments(
+    bot,
+    chat_id: str,
+    attachments: list[dict[str, Any]],
+    *,
+    caption_prefix: str | None = None,
+) -> int:
+    sent = 0
+    for att in attachments:
+        if not att.get("forward"):
+            continue
+        data = att.get("data")
+        filename = att.get("filename") or "attachment"
+        if not data:
+            continue
+        caption = filename
+        if caption_prefix:
+            caption = f"{str(caption_prefix)[:80]}\n{filename}"
+        try:
+            from telegram import InputFile
+
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(io.BytesIO(data), filename=filename),
+                caption=caption[:1000],
+            )
+            sent += 1
+        except Exception as exc:
+            logger.warning("Failed sending attachment %s to %s: %s", filename, chat_id, exc)
+    return sent
+
+
+async def share_schedule(
+    bot,
+    *,
+    sessions: list[dict[str, Any]],
+    summary: str | None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> None:
+    settings = get_settings()
+    text = format_schedule_share(sessions)
+    if summary:
+        text = f"{text}\n\n<i>{_escape_html(summary)}</i>"
+    for chat_id in _alert_chat_ids("admin", settings):
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        await _forward_attachments(bot, chat_id, attachments or [], caption_prefix="Class schedule")
 
 
 def _normalize_category(value: str | None) -> str:
@@ -150,13 +218,17 @@ async def _process_message(
     *,
     skip_past_deadlines: bool = False,
 ) -> dict[str, Any]:
-    """Classify one email, persist results, optionally alert."""
-    details = get_message_details(message_id)
+    """Classify one email, persist results, optionally alert + forward attachments."""
+    details = get_message_details(message_id, load_attachments=True)
+    attachments = details.get("attachments") or []
+    attachment_text = details.get("attachment_text") or ""
+
     result = classify_email(
         details["subject"],
         details["body"],
         details["sender"],
         received_at=details.get("received_at_iso") or details.get("received_at"),
+        attachment_text=attachment_text,
     )
 
     if result is None:
@@ -172,6 +244,49 @@ async def _process_message(
     deadline_date = result.get("deadline_date")
     assignment_id = None
     alerts = 0
+
+    # Timetable / weekly schedule path
+    if looks_like_schedule(
+        details["subject"],
+        details["body"],
+        attachment_text,
+        result,
+    ) and confidence in ("high", "medium"):
+        sessions = parse_schedule_sessions(
+            subject=details["subject"],
+            body=details["body"],
+            attachment_text=attachment_text,
+            received_at=details.get("received_at_iso"),
+        )
+        if sessions:
+            stored = store_schedule_sessions(sessions, gmail_message_id=message_id)
+            await share_schedule(
+                bot,
+                sessions=stored or sessions,
+                summary=result.get("summary"),
+                attachments=attachments,
+            )
+            alerts = 1
+            # Also keep a lightweight assignment so /due shows the schedule notice
+            if is_actionable:
+                assignment = insert_assignment(
+                    {
+                        "source": "email",
+                        "category": "admin",
+                        "course_or_topic": result.get("course_or_topic") or "Class schedule",
+                        "task": result.get("task") or "New class timetable received",
+                        "deadline_text": result.get("deadline_text"),
+                        "deadline_date": deadline_date,
+                        "gmail_thread_id": details["thread_id"],
+                        "gmail_message_id": details["message_id"],
+                        "summary": result.get("summary"),
+                        "confidence": confidence,
+                        "status": "open",
+                    }
+                )
+                assignment_id = assignment["id"]
+            mark_email_processed(message_id, True, confidence, assignment_id)
+            return {"processed": 1, "alerts": alerts}
 
     if is_actionable and confidence in ("high", "medium"):
         assignment = insert_assignment(
@@ -207,6 +322,7 @@ async def _process_message(
                 deadline_text=result.get("deadline_text"),
                 summary=summary,
                 sender=result.get("sender") or details.get("sender"),
+                attachments=attachments,
             )
             alerts = 1
     elif is_actionable or confidence == "low":

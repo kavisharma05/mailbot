@@ -7,6 +7,8 @@ A Telegram bot that helps MBA/college students manage academic email: compose po
 - **`/send`** — Turn rough instructions into a polished email draft, approve, and send via Gmail
 - **Email watcher** — Polls Gmail every 15 minutes, classifies emails with Groq (Llama 3.3), routes alerts to category-specific Telegram groups
 - **Scheduled digests** — Morning (7:00 IST) and evening (19:00 IST) summaries per category group
+- **Attachments** — Downloads mail attachments, reads PDF/Excel/Word text for classification, and forwards files to the category Telegram group **and** your DM
+- **Class timetable** — Parses weekly schedules from body or attachments; morning digest + `/classes` show today's courses, times, and rooms
 - **14-day backfill** — One-time scan of recent inbox mail via `POST /tasks/backfill`
 
 Email categories: `deadline`, `placement`, `admin`, `other`.
@@ -164,7 +166,8 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `/start` | Welcome + help |
 | `/due` or `/list` | Show numbered open items for this chat's category |
 | `/done <n>` | Mark item #n from the last `/due` list as complete |
-| `/ask <question>` | Ask about tracked deadlines/placements/admin |
+| `/classes` | Today's classes with time and room (from timetable emails) |
+| `/ask <question>` | Ask about deadlines, today's mails, senders, or email content |
 | `/send` | Compose and send an email |
 | `/cancel` | Cancel the current `/send` flow |
 
@@ -186,3 +189,6 @@ For free-text in groups without mentioning, disable privacy in BotFather: `/setp
 - **Deadlines resolve in IST (Asia/Kolkata):** relative phrases like "tomorrow 9:45" are normalized server-side; date-only deadlines default to 23:59 IST
 - If email classification fails (LLM/JSON error), the message is **not** marked processed and will retry on the next watcher run (~15 min)
 - `/ask` uses stronger Gmail retrieval for date/topic questions and falls back to structured extracts when AI is unavailable
+- Actionable alerts forward attachments to the category group **and** owner DM (skips tiny signature images; max ~20MB)
+- Attachment text (PDF/Excel/DOCX) is read and fed into classification — useful for buried deadlines and timetables
+- Run `supabase/migration_class_sessions.sql` once in Supabase for class timetable storage
