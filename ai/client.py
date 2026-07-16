@@ -65,6 +65,7 @@ def _call_cerebras(
     json_mode: bool,
     max_tokens: int,
     model: str | None = None,
+    temperature: float = 0.3,
 ) -> str | None:
     """OpenAI-compatible Cerebras chat completion. Returns message content or None."""
     settings = get_settings()
@@ -82,7 +83,7 @@ def _call_cerebras(
             {"role": "user", "content": user},
         ],
         "max_tokens": max_tokens,
-        "temperature": 0.3,
+        "temperature": temperature,
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -137,6 +138,7 @@ def _call_groq(
     json_mode: bool,
     max_tokens: int,
     model: str | None = None,
+    temperature: float = 0.3,
 ) -> str | None:
     if _groq_daily_limit_hit:
         logger.info("Skipping Groq (daily limit already hit this process)")
@@ -155,7 +157,7 @@ def _call_groq(
                     {"role": "user", "content": user},
                 ],
                 "max_tokens": max_tokens,
-                "temperature": 0.3,
+                "temperature": temperature,
             }
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
@@ -195,6 +197,7 @@ def _complete(
     json_mode: bool,
     max_tokens: int,
     model: str | None = None,
+    temperature: float = 0.3,
 ) -> str | None:
     """Try Groq first (unless daily-limited); fall back to Cerebras."""
     _set_last_error(None, None, None)
@@ -203,7 +206,12 @@ def _complete(
     if _groq_daily_limit_hit:
         logger.info("Using Cerebras (Groq daily limit active)")
         return _call_cerebras(
-            system, user, json_mode=json_mode, max_tokens=max_tokens, model=None
+            system,
+            user,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+            model=None,
+            temperature=temperature,
         )
 
     text = _call_groq(
@@ -212,6 +220,7 @@ def _complete(
         json_mode=json_mode,
         max_tokens=max_tokens,
         model=model,
+        temperature=temperature,
     )
     if text:
         return text
@@ -223,6 +232,7 @@ def _complete(
         json_mode=json_mode,
         max_tokens=max_tokens,
         model=None,
+        temperature=temperature,
     )
 
 
@@ -254,7 +264,9 @@ def _parse_json_text(text: str) -> dict[str, Any] | None:
 
 def call_json(system: str, user: str, model: str | None = None) -> dict[str, Any] | None:
     """Call LLM and parse strict JSON from the response (Groq → Cerebras)."""
-    text = _complete(system, user, json_mode=True, max_tokens=512, model=model)
+    text = _complete(
+        system, user, json_mode=True, max_tokens=512, model=model, temperature=0.2
+    )
     if not text:
         return None
 
@@ -264,6 +276,20 @@ def call_json(system: str, user: str, model: str | None = None) -> dict[str, Any
     return parsed
 
 
-def call_text(system: str, user: str, model: str | None = None) -> str | None:
+def call_text(
+    system: str,
+    user: str,
+    model: str | None = None,
+    *,
+    temperature: float = 0.55,
+    max_tokens: int = 1000,
+) -> str | None:
     """Call LLM and return plain text (Groq → Cerebras)."""
-    return _complete(system, user, json_mode=False, max_tokens=900, model=model)
+    return _complete(
+        system,
+        user,
+        json_mode=False,
+        max_tokens=max_tokens,
+        model=model,
+        temperature=temperature,
+    )

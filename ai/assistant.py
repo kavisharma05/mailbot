@@ -401,20 +401,22 @@ def _is_due_list_question(question: str) -> bool:
         for w in (
             "why",
             "which",
-            "what are",
             "what's that",
             "explain",
             "miss",
             "email",
             "from ",
             "who",
-            "how",
+            "how many",
             "detail",
         )
     ):
         # Still allow pure due-list phrasing like "what are my deadlines today"
-        if not any(w in q for w in ("today", "tomorrow", "this week", "due", "refresh")):
+        if not any(w in q for w in ("today", "tomorrow", "this week", "due", "refresh", "pending")):
             return False
+    # "what are ... deadlines today/tomorrow" is a due list
+    if "what are" in q and ("deadline" in q or "due" in q):
+        return True
     return any(
         w in q
         for w in (
@@ -422,6 +424,9 @@ def _is_due_list_question(question: str) -> bool:
             "what is due",
             "what are my deadline",
             "any deadline",
+            "pending deadline",
+            "check deadline",
+            "check pending",
             "refresh the deadline",
             "refresh deadline",
             "due today",
@@ -429,12 +434,16 @@ def _is_due_list_question(question: str) -> bool:
             "deadlines today",
             "deadlines tomorrow",
             "deadlines for",
+            "deadline for today",
+            "deadline for tomorrow",
             "need to do today",
             "need to do tomorrow",
+            "tasks for today",
+            "tasks for tomorrow",
         )
     ) or (
-        ("deadline" in q or "due" in q)
-        and ("today" in q or "tomorrow" in q or "refresh" in q)
+        ("deadline" in q or "due" in q or "pending" in q)
+        and ("today" in q or "tomorrow" in q or "refresh" in q or "check" in q)
     )
 
 
@@ -766,6 +775,97 @@ def _answer_looks_generic_due_dump(answer: str, question: str) -> bool:
     )
 
 
+def _llm_answer_is_useless(answer: str | None) -> bool:
+    """Catch empty / confused model replies that ignore the user's real ask."""
+    if not answer or not answer.strip():
+        return True
+    a = answer.lower().strip()
+    needles = (
+        "haven't asked a question",
+        "have not asked a question",
+        "you haven't asked",
+        "please go ahead and ask",
+        "what would you like to know",
+        "ask your question",
+        "ask a question",
+        "please ask a question",
+        "i'm ready when you are",
+        "how can i help",
+        "send me a question",
+    )
+    if any(n in a for n in needles):
+        return True
+    # Very short non-answers
+    if len(a) < 40 and "?" in a and "deadline" not in a and "due" not in a:
+        return True
+    return False
+
+
+def _looks_like_real_due_answer(answer: str) -> bool:
+    a = answer.lower()
+    return any(
+        w in a
+        for w in (
+            "due",
+            "deadline",
+            "today",
+            "tomorrow",
+            "no open",
+            "nothing due",
+            "tracked",
+            "course",
+        )
+    )
+
+
+def _gather_context_for_question(
+    question: str,
+    *,
+    scan_gmail: bool,
+    pasted_email: str | None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Pull the richest useful Gmail context; heuristics only choose WHAT to fetch."""
+    if not scan_gmail:
+        return None, []
+
+    q = question.lower()
+    stats: dict[str, Any] | None = None
+    emails: list[dict[str, Any]] = []
+
+    wants_mailbox = (
+        _is_mailbox_question(question)
+        or bool(_extract_person_query(question))
+        or any(w in q for w in ("mail", "email", "inbox", "sender", "whom", "who sent", "said", "wrote"))
+    )
+    wants_due = _is_due_list_question(question) or any(
+        w in q for w in ("deadline", "due", "pending", "tomorrow", "today")
+    )
+
+    if wants_mailbox:
+        try:
+            stats, emails = _gather_mailbox_context(question)
+        except Exception as exc:
+            logger.warning("Mailbox context failed: %s", exc)
+            stats, emails = {"count": 0, "error": str(exc)}, []
+    else:
+        try:
+            emails = _fetch_relevant_emails(question, pasted_email=pasted_email)
+        except Exception as exc:
+            logger.warning("Relevant email fetch failed: %s", exc)
+            emails = []
+
+    # For due/today questions, also attach a light today-mail count so the model has mailbox awareness
+    if wants_due and stats is None:
+        try:
+            day_q = _gmail_day_bounds_query()
+            stats = count_messages(day_q, hard_cap=100)
+            stats["note"] = "today_mail_count_for_context"
+        except Exception:
+            pass
+
+    return stats, emails
+
+
 def answer_question(
     question: str,
     items: list[dict[str, Any]],
@@ -774,93 +874,63 @@ def answer_question(
     scan_gmail: bool = True,
     pasted_email: str | None = None,
 ) -> str:
+    """LLM-first: always ask the model; keyword heuristics only gather context / fallback."""
     ref = now_ist()
     today = today_ist().isoformat()
     now_str = ref.strftime("%Y-%m-%d %H:%M %Z")
     system = ASSISTANT_PROMPT.format(today=today, now=now_str)
 
-    # General mailbox brain: counts, senders, content (before deadline shortcuts)
-    if scan_gmail and _is_mailbox_question(question) and not pasted_email:
-        try:
-            stats, emails = _gather_mailbox_context(question)
-        except Exception as exc:
-            logger.exception("Mailbox context failed: %s", exc)
-            stats, emails = {"count": 0, "error": str(exc)}, []
-        user = _build_user_prompt(
-            question, items, emails, category, pasted_email, mailbox_stats=stats
-        )
-        answer = call_text(system, user)
-        if answer and not _answer_looks_generic_due_dump(answer, question):
-            if "no emails were received" in answer.lower() and emails:
+    stats, emails = _gather_context_for_question(
+        question, scan_gmail=scan_gmail, pasted_email=pasted_email
+    )
+    user = _build_user_prompt(
+        question,
+        items,
+        emails,
+        category,
+        pasted_email,
+        mailbox_stats=stats,
+    )
+
+    # Primary path: let the LLM understand any natural wording
+    answer = call_text(system, user, temperature=0.55, max_tokens=1100)
+    if answer and not _llm_answer_is_useless(answer):
+        if _asks_undated_tasks(question) and _answer_looks_generic_due_dump(answer, question):
+            return _deterministic_undated_answer(items)
+        if emails and "no emails were received" in answer.lower():
+            if stats:
                 return _format_mailbox_fallback(stats, emails, question)
-            return answer
-        return _format_mailbox_fallback(stats, emails, question)
-
-    # Undated-tasks questions: prefer precise DB list; still try AI once for wording
-    if _asks_undated_tasks(question):
-        undated = _deterministic_undated_answer(items)
-        emails = _fetch_relevant_emails(question, pasted_email=pasted_email) if scan_gmail else []
-        user = _build_user_prompt(question, items, emails, category, pasted_email)
-        answer = call_text(system, user)
-        if answer and not _answer_looks_generic_due_dump(answer, question):
-            return answer
-        return undated
-
-    if _is_due_list_question(question) or _parse_target_date(question):
-        deterministic = _deterministic_deadline_answer(question, items)
-        if deterministic and not pasted_email:
-            emails = _fetch_relevant_emails(question, pasted_email=pasted_email) if scan_gmail else []
-            user = _build_user_prompt(question, items, emails, category, pasted_email)
-            answer = call_text(system, user)
-            if answer and not _answer_looks_generic_due_dump(answer, question):
-                if emails and "no emails were received" in answer.lower():
-                    return deterministic + "\n\n(Gmail results were found but omitted by AI; showing tracked items.)"
-                return answer
-            if emails:
-                return deterministic + f"\n\n(Found {len(emails)} matching Gmail message(s) — AI unavailable for full synthesis.)"
-            return deterministic
-
-    emails = _fetch_relevant_emails(question, pasted_email=pasted_email) if scan_gmail else []
-    user = _build_user_prompt(question, items, emails, category, pasted_email)
-
-    answer = call_text(system, user)
-    if answer:
-        if _answer_looks_generic_due_dump(answer, question):
-            return _deterministic_undated_answer(items) if _asks_undated_tasks(question) else answer
-        if (emails or pasted_email) and "no emails were received" in answer.lower():
-            deterministic = _deterministic_deadline_answer(question, items)
-            if deterministic:
-                return deterministic
         return answer
 
+    # ---- Fallbacks only when the model fails / refuses ----
     _, status = get_last_groq_error()
-    # If this looks mail-related, try mailbox fallback before deadline dump
-    if scan_gmail and any(w in question.lower() for w in ("mail", "email", "from ", "inbox")):
-        try:
-            stats, mail_emails = _gather_mailbox_context(question)
-            return _format_mailbox_fallback(stats, mail_emails, question)
-        except Exception:
-            pass
 
-    deterministic = _deterministic_deadline_answer(question, items)
-    if deterministic:
-        suffix = ""
-        if emails:
-            suffix = f"\n\n(Found {len(emails)} Gmail message(s); showing tracked items because AI is unavailable.)"
-        if status == 429:
-            return deterministic + "\n\n(Note: AI is temporarily rate-limited; this list is from tracked items only.)" + suffix
-        return deterministic + suffix
+    if _asks_undated_tasks(question):
+        return _deterministic_undated_answer(items)
 
-    if status == 429:
-        if pasted_email:
-            return _paste_fallback_answer(pasted_email)
-        return (
-            "Groq AI rate limit hit for today (token quota). "
-            "Try again later, or use /due to see tracked deadlines without AI."
-        )
+    if _is_due_list_question(question) or any(
+        w in question.lower() for w in ("deadline", "due", "pending", "today", "tomorrow")
+    ):
+        deterministic = _deterministic_deadline_answer(question, items)
+        if deterministic:
+            note = ""
+            if status == 429:
+                note = "\n\n(AI rate-limited — list is from tracked items.)"
+            return deterministic + note
+
+    if stats is not None or (
+        scan_gmail and any(w in question.lower() for w in ("mail", "email", "from ", "inbox", "whom"))
+    ):
+        if stats is None:
+            try:
+                stats, emails = _gather_mailbox_context(question)
+            except Exception:
+                stats, emails = {"count": 0}, emails
+        return _format_mailbox_fallback(stats or {}, emails, question)
 
     if pasted_email:
         return _paste_fallback_answer(pasted_email)
+
     if emails:
         lines = [f"Found {len(emails)} matching email(s):", ""]
         for i, mail in enumerate(emails[:8], start=1):
@@ -868,8 +938,14 @@ def answer_question(
             lines.append(f"   From: {mail.get('sender') or 'unknown'}")
             lines.append(f"   Received: {mail.get('received_at') or 'unknown'}")
             lines.append("")
-        lines.append("(AI was unavailable — listing Gmail matches only.)")
+        lines.append("(AI unavailable — listing Gmail matches only.)")
         return "\n".join(lines).strip()
+
+    if status == 429:
+        return (
+            "AI rate limit hit for now. Try /due for tracked deadlines, "
+            "or ask again in a few minutes."
+        )
     return "I couldn't generate an answer right now. Try /due, or ask again in a few minutes."
 
 
