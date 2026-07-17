@@ -9,7 +9,7 @@ from services.db import (
     get_assignments_due_on,
     get_recent_assignments,
 )
-from services.schedule import format_today_classes
+from services.schedule import classes_command_text
 from services.watcher import CATEGORY_LABELS, VALID_CATEGORIES, _escape_html, _format_deadline_display
 
 logger = logging.getLogger(__name__)
@@ -158,9 +158,14 @@ async def run_morning_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
     skipped: list[str] = []
     previews: dict[str, str] = {}
 
-    # Today's classes (from timetable emails) — send to Deadlines group + owner
-    classes_text = format_today_classes(today.date())
-    if classes_text:
+    # Today's classes — refresh from latest timetable mail/PDF, then send
+    try:
+        classes_text = classes_command_text(refresh=True)
+    except Exception as exc:
+        logger.warning("Morning classes refresh failed: %s", exc)
+        classes_text = ""
+    # Digest only sends a real schedule list, not the soft error copy from /classes
+    if classes_text and "📚" in classes_text:
         previews["classes"] = classes_text
         if not dry_run:
             settings = get_settings()

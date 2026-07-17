@@ -195,6 +195,11 @@ def delete_class_sessions_for_week(week_start: str) -> None:
     db.table("class_sessions").delete().eq("week_start", week_start).execute()
 
 
+def delete_class_sessions_for_message(gmail_message_id: str) -> None:
+    db = get_db()
+    db.table("class_sessions").delete().eq("gmail_message_id", gmail_message_id).execute()
+
+
 def get_classes_on(session_date: str) -> list[dict[str, Any]]:
     db = get_db()
     result = (
@@ -203,6 +208,22 @@ def get_classes_on(session_date: str) -> list[dict[str, Any]]:
             "id, course_or_topic, session_date, start_time, end_time, room, faculty, notes, week_start"
         )
         .eq("session_date", session_date)
+        .order("start_time")
+        .execute()
+    )
+    return result.data or []
+
+
+def get_classes_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
+    db = get_db()
+    result = (
+        db.table("class_sessions")
+        .select(
+            "id, course_or_topic, session_date, start_time, end_time, room, faculty, notes, week_start"
+        )
+        .gte("session_date", start_date)
+        .lte("session_date", end_date)
+        .order("session_date")
         .order("start_time")
         .execute()
     )

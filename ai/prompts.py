@@ -153,10 +153,11 @@ Today: {today}. Now: {now}.
 }}"""
 
 SCHEDULE_PROMPT = """Extract class timetable sessions from a college email and/or attachment text.
+The attachment text (PDF/Excel/Word) is usually the real timetable — prefer it over the email body.
 
 Timezone: Asia/Kolkata (IST).
 Email received / reference date: {today}
-Week hint (if any): use the dates mentioned; if only weekdays are given for "next week",
+Week hint (if any): use the dates mentioned; if only weekdays are given for "this week" / "next week",
 resolve them to concrete calendar dates relative to {today}.
 
 Return ONLY strict JSON:
@@ -176,10 +177,11 @@ Return ONLY strict JSON:
 }}
 
 Rules:
-- Include every class/session you can confidently extract.
-- Prefer room / venue / classroom fields when present.
-- Skip empty slots and breaks.
+- Include every class/session you can confidently extract from body OR attachment.
+- Prefer room / venue / classroom / LH / CR fields when present.
+- Skip empty slots, lunch, and breaks.
 - If a cell only has a course code, still include it.
+- PDF text may be messy/column-jumbled — still recover course + time + room when possible.
 - If dates cannot be resolved, omit that session rather than inventing.
 """
 

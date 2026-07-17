@@ -9,7 +9,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_MAX_TEXT_CHARS = 6000
+_MAX_TEXT_CHARS = 12000
 _MAX_FILE_BYTES = 20 * 1024 * 1024  # 20 MB Telegram-friendly limit
 _SKIP_NAME_RE = re.compile(
     r"(logo|signature|spacer|untitled|image0|footer|header)",
@@ -58,8 +58,18 @@ def _extract_pdf(data: bytes) -> str:
 
     reader = PdfReader(io.BytesIO(data))
     chunks: list[str] = []
-    for page in reader.pages[:20]:
-        text = page.extract_text() or ""
+    for page in reader.pages[:30]:
+        text = ""
+        try:
+            # Layout mode keeps timetable columns closer together
+            text = page.extract_text(extraction_mode="layout") or ""
+        except TypeError:
+            text = page.extract_text() or ""
+        except Exception:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
         if text.strip():
             chunks.append(text.strip())
     return "\n".join(chunks)[:_MAX_TEXT_CHARS]

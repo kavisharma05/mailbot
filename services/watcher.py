@@ -245,13 +245,13 @@ async def _process_message(
     assignment_id = None
     alerts = 0
 
-    # Timetable / weekly schedule path
+    # Timetable / weekly schedule path (keyword/PDF match — don't require AI confidence)
     if looks_like_schedule(
         details["subject"],
         details["body"],
         attachment_text,
         result,
-    ) and confidence in ("high", "medium"):
+    ):
         sessions = parse_schedule_sessions(
             subject=details["subject"],
             body=details["body"],
@@ -268,7 +268,7 @@ async def _process_message(
             )
             alerts = 1
             # Also keep a lightweight assignment so /due shows the schedule notice
-            if is_actionable:
+            if is_actionable and confidence in ("high", "medium"):
                 assignment = insert_assignment(
                     {
                         "source": "email",
@@ -285,7 +285,7 @@ async def _process_message(
                     }
                 )
                 assignment_id = assignment["id"]
-            mark_email_processed(message_id, True, confidence, assignment_id)
+            mark_email_processed(message_id, True, confidence or "medium", assignment_id)
             return {"processed": 1, "alerts": alerts}
 
     if is_actionable and confidence in ("high", "medium"):

@@ -23,7 +23,7 @@ from services.db import (
     log_low_confidence,
     mark_assignment_done,
 )
-from services.schedule import format_today_classes
+from services.schedule import classes_command_text
 from services.timeutil import IST, format_deadline_display, today_ist
 
 logger = logging.getLogger(__name__)
@@ -125,12 +125,13 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not _is_owner(update) or not update.message:
         return
 
-    text = format_today_classes(today_ist())
-    if not text:
+    await update.message.chat.send_action("typing")
+    try:
+        text = classes_command_text(refresh=True)
+    except Exception as exc:
+        logger.exception("/classes failed: %s", exc)
         await update.message.reply_text(
-            "No classes stored for today yet.\n"
-            "When college sends a timetable (body or PDF/Excel), I'll parse it and "
-            "show rooms/times here + in the morning digest."
+            "Couldn't load the class schedule right now. Try again in a minute."
         )
         return
     await update.message.reply_text(text, parse_mode="HTML")
