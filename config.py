@@ -16,10 +16,20 @@ class Settings(BaseSettings):
 
     groq_api_key: str
     groq_model: str = "llama-3.3-70b-versatile"
+    # Optional second Groq free account for rotation
+    groq_api_key_2: str = ""
 
     # Fallback when Groq hits rate limits (https://cloud.cerebras.ai)
     cerebras_api_key: str = ""
     cerebras_model: str = "gemma-4-31b"
+
+    # Free provider pool extras
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
+    github_models_token: str = ""
+    github_models_model: str = "openai/gpt-4o-mini"
+    openrouter_api_key: str = ""
+    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
 
     gmail_client_id: str
     gmail_client_secret: str

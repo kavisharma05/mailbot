@@ -228,3 +228,18 @@ def get_classes_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
         .execute()
     )
     return result.data or []
+
+
+def get_class_sessions_for_message(gmail_message_id: str) -> list[dict[str, Any]]:
+    db = get_db()
+    result = (
+        db.table("class_sessions")
+        .select(
+            "id, course_or_topic, session_date, start_time, end_time, room, faculty, notes, week_start, gmail_message_id"
+        )
+        .eq("gmail_message_id", gmail_message_id)
+        .order("session_date")
+        .order("start_time")
+        .execute()
+    )
+    return result.data or []

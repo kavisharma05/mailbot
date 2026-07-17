@@ -31,7 +31,9 @@ app = FastAPI(title="Mailbot", lifespan=lifespan)
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    from ai.client import get_llm_status
+
+    return {"status": "ok", "llm": get_llm_status()}
 
 
 @app.post(f"/telegram/webhook/{{secret}}")

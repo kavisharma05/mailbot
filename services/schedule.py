@@ -13,6 +13,7 @@ from gmail_api.client import get_message_details, search_message_ids
 from services.db import (
     delete_class_sessions_for_message,
     delete_class_sessions_for_week,
+    get_class_sessions_for_message,
     get_classes_between,
     get_classes_on,
     insert_class_sessions,
@@ -20,6 +21,9 @@ from services.db import (
 from services.timeutil import IST, today_ist
 
 logger = logging.getLogger(__name__)
+
+# In-process cache: avoid re-calling the LLM for the same timetable mail
+_parse_cache: dict[str, dict[str, Any]] = {}
 
 # Newest-first Gmail searches for timetable mails (incl. PDF attachments)
 _SCHEDULE_QUERIES = (
@@ -157,10 +161,37 @@ def find_latest_schedule_message_ids(*, max_candidates: int = 8) -> list[str]:
     return seen
 
 
+def _cached_or_stored_sessions(message_id: str) -> dict[str, Any] | None:
+    """Reuse prior parse for the same Gmail message (no LLM)."""
+    cached = _parse_cache.get(message_id)
+    if cached and cached.get("sessions"):
+        return cached
+    try:
+        stored = get_class_sessions_for_message(message_id)
+    except Exception as exc:
+        logger.warning("DB lookup for schedule message %s failed: %s", message_id, exc)
+        stored = []
+    if stored:
+        info = {
+            "ok": True,
+            "message_id": message_id,
+            "subject": cached.get("subject") if cached else None,
+            "received_at": cached.get("received_at") if cached else None,
+            "attachments": (cached or {}).get("attachments") or [],
+            "had_attachment_text": True,
+            "sessions": stored,
+            "from_cache": True,
+        }
+        _parse_cache[message_id] = info
+        return info
+    return None
+
+
 def refresh_schedule_from_gmail() -> dict[str, Any]:
     """
     Find the latest timetable mail, read body + PDF/Excel, parse sessions, store them.
     Returns metadata + sessions (even if DB insert fails).
+    Skips LLM when this message was already parsed successfully.
     """
     candidates = find_latest_schedule_message_ids()
     if not candidates:
@@ -168,6 +199,11 @@ def refresh_schedule_from_gmail() -> dict[str, Any]:
 
     last_error = ""
     for message_id in candidates:
+        reused = _cached_or_stored_sessions(message_id)
+        if reused:
+            logger.info("Reusing cached schedule parse for message %s", message_id)
+            return reused
+
         try:
             details = get_message_details(message_id, load_attachments=True)
         except Exception as exc:
@@ -206,7 +242,7 @@ def refresh_schedule_from_gmail() -> dict[str, Any]:
             continue
 
         stored = store_schedule_sessions(sessions, gmail_message_id=message_id)
-        return {
+        info = {
             "ok": True,
             "message_id": message_id,
             "subject": subject,
@@ -214,7 +250,10 @@ def refresh_schedule_from_gmail() -> dict[str, Any]:
             "attachments": att_names,
             "had_attachment_text": bool(attachment_text.strip()),
             "sessions": stored or sessions,
+            "from_cache": False,
         }
+        _parse_cache[message_id] = info
+        return info
 
     reason = last_error or "no_parse"
     return {"ok": False, "reason": reason, "sessions": []}

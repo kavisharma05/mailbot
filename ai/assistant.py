@@ -256,16 +256,19 @@ def _build_mailbox_queries(question: str) -> list[str]:
         if keywords:
             queries.append(f'from:("{person}") {" ".join(keywords)} newer_than:90d')
     else:
-        today = today_ist().isoformat()
-        system = GMAIL_QUERY_PROMPT.format(today=today)
-        result = call_json(system, f"Question:\n{question}")
-        if result and isinstance(result.get("queries"), list):
-            queries.extend(
-                x.strip() for x in result["queries"] if isinstance(x, str) and x.strip()
-            )
         keywords = _extract_keywords(question, max_words=5)
         if keywords:
             queries.append(f"{' '.join(keywords)} newer_than:30d")
+            queries.append(f"({' OR '.join(keywords)}) newer_than:60d")
+        # LLM query builder only if heuristics are empty (saves free-tier tokens)
+        if not keywords and _should_use_llm_queries(question):
+            today = today_ist().isoformat()
+            system = GMAIL_QUERY_PROMPT.format(today=today)
+            result = call_json(system, f"Question:\n{question}")
+            if result and isinstance(result.get("queries"), list):
+                queries.extend(
+                    x.strip() for x in result["queries"] if isinstance(x, str) and x.strip()
+                )
 
     if not queries:
         queries.append(_gmail_day_bounds_query())
@@ -386,7 +389,7 @@ def _format_mailbox_fallback(stats: dict[str, Any], emails: list[dict[str, Any]]
                 snippet = re.sub(r"\s+", " ", str(mail["body"]))[:220]
                 lines.append(f"   Snippet: {snippet}")
             lines.append("")
-    lines.append("(AI unavailable — showing Gmail stats/list directly.)")
+    lines.append("(Offline format — free AI quota resting; data is live from Gmail.)")
     return "\n".join(lines).strip()
 
 
@@ -456,16 +459,15 @@ def _is_simple_deadline_question(question: str) -> bool:
 
 
 def _should_use_llm_queries(question: str) -> bool:
-    """Use LLM query builder for date-specific or topic-rich questions."""
-    if _parse_target_date(question):
-        return True
+    """Rarely use LLM for Gmail query building — heuristics save free-tier tokens."""
+    # Only when heuristics look weak: long topical ask with no keywords extracted
     keywords = _extract_keywords(question, max_words=8)
-    if len(keywords) >= 3:
-        return True
+    if keywords:
+        return False
     q = question.lower()
-    if any(w in q for w in ("email", "mail", "received", "from", "professor", "reading", "case", "chapter", "why", "miss")):
-        return True
-    return not _is_simple_deadline_question(question)
+    if any(w in q for w in ("deadline", "due", "today", "tomorrow", "mail", "email", "from")):
+        return False
+    return len(question.split()) >= 8
 
 
 def build_gmail_queries(
@@ -759,7 +761,7 @@ def _paste_fallback_answer(pasted: str) -> str:
         lines.append(f"Resolved deadline (IST): {shown}")
 
     lines.append("")
-    lines.append("(AI was temporarily unavailable — this is extracted from your paste.)")
+    lines.append("(Offline format — extracted from your paste.)")
     return "\n".join(lines)
 
 
@@ -913,9 +915,7 @@ def answer_question(
     ):
         deterministic = _deterministic_deadline_answer(question, items)
         if deterministic:
-            note = ""
-            if status == 429:
-                note = "\n\n(AI rate-limited — list is from tracked items.)"
+            note = "\n\n(Offline format — tracked items from your DB.)"
             return deterministic + note
 
     if stats is not None or (
@@ -938,15 +938,17 @@ def answer_question(
             lines.append(f"   From: {mail.get('sender') or 'unknown'}")
             lines.append(f"   Received: {mail.get('received_at') or 'unknown'}")
             lines.append("")
-        lines.append("(AI unavailable — listing Gmail matches only.)")
+        lines.append("(Offline format — listing Gmail matches.)")
         return "\n".join(lines).strip()
 
-    if status == 429:
-        return (
-            "AI rate limit hit for now. Try /due for tracked deadlines, "
-            "or ask again in a few minutes."
-        )
-    return "I couldn't generate an answer right now. Try /due, or ask again in a few minutes."
+    deterministic = _deterministic_deadline_answer(question, items)
+    if deterministic:
+        return deterministic + "\n\n(Offline format — tracked items.)"
+
+    return (
+        "Couldn't reach any free AI provider right now, and I don't have matching "
+        "mail/deadline data for that. Try /due or /classes, or ask again shortly."
+    )
 
 
 def split_question_and_paste(text: str) -> tuple[str, str | None]:
