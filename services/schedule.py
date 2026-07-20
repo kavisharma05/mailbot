@@ -25,16 +25,59 @@ from services.timeutil import IST, today_ist
 logger = logging.getLogger(__name__)
 
 
-def _session_section(course_or_topic: str) -> str | None:
-    m = re.search(r"sec\.?\s*([A-Za-z])\b", course_or_topic or "", re.IGNORECASE)
-    return m.group(1).upper() if m else None
+_SECTION_RE = re.compile(
+    r"(?:sec(?:tion)?\.?\s*[-:]?\s*|sec\s*)([A-Za-z])\b"
+    r"|\b([A-Za-z])\s*section\b"
+    r"|\(\s*([A-Za-z])\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _session_section(course_or_topic: str, *extra_fields: str | None) -> str | None:
+    """Pull section letter from course title / notes / room (e.g. Sec. C, Section A)."""
+    blob = " ".join(str(x) for x in (course_or_topic, *extra_fields) if x)
+    if not blob.strip():
+        return None
+    m = _SECTION_RE.search(blob)
+    if not m:
+        return None
+    letter = next((g for g in m.groups() if g), None)
+    return letter.upper() if letter else None
+
+
+def _session_section_from_row(session: dict) -> str | None:
+    return _session_section(
+        session.get("course_or_topic") or "",
+        session.get("notes"),
+        session.get("room"),
+        session.get("faculty"),
+    )
 
 
 def filter_by_section(sessions: list[dict], section: str | None) -> list[dict]:
+    """Keep sessions for the preferred section.
+
+    Unlabeled rows (no Sec. X in the text) are kept — many timetables only
+    label the sheet header, not every cell. If every labeled row is a different
+    section and the filter would empty the list, fall back to all sessions.
+    """
     if not section:
         return sessions
     target = section.strip().upper()[:1]
-    return [s for s in sessions if _session_section(s.get("course_or_topic") or "") == target]
+    matched: list[dict] = []
+    unlabeled: list[dict] = []
+    for s in sessions:
+        sec = _session_section_from_row(s)
+        if sec is None:
+            unlabeled.append(s)
+        elif sec == target:
+            matched.append(s)
+    if matched:
+        return matched + unlabeled
+    if unlabeled and not any(_session_section_from_row(s) for s in sessions):
+        # No rows carry a section tag at all — don't hide the timetable
+        return sessions
+    return matched  # may be empty when only other sections are labeled
 
 # In-process cache: avoid re-calling the LLM for the same timetable mail
 _parse_cache: dict[str, dict[str, Any]] = {}
