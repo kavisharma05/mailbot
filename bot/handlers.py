@@ -54,6 +54,17 @@ GREETINGS = {"hi", "hey", "hello", "yo", "sup", "hii", "hiii", "heya"}
 
 SCHEDULE_KEYWORDS = ("class", "classes", "schedule", "timetable", "time table", "lecture")
 
+REFRESH_KEYWORDS = (
+    "check again",
+    "look again",
+    "try again",
+    "refresh",
+    "recheck",
+    "update",
+    "reload",
+    "why not check",
+)
+
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
 
@@ -116,28 +127,126 @@ def _section_buttons(sections: list[str]) -> InlineKeyboardMarkup:
 def _available_sections() -> list[str]:
     info = refresh_schedule_from_gmail()
     sessions = info.get("sessions") or get_classes_on(today_ist().isoformat())
-    return sorted(
-        {
-            sec
-            for s in sessions
-            if (sec := _session_section(s.get("course_or_topic") or ""))
-        }
-    )
+    found: set[str] = set()
+    for s in sessions:
+        sec = _session_section(
+            s.get("course_or_topic") or "",
+            s.get("notes"),
+            s.get("room"),
+            s.get("faculty"),
+        )
+        if sec:
+            found.add(sec)
+    return sorted(found)
 
 
-def _resolve_target_day(question: str):
+def _resolve_target_day(question: str, *, fallback_iso: str | None = None):
+    from datetime import date as date_cls
+
     q = question.lower()
     day = today_ist()
     if "tomorrow" in q:
         return day + timedelta(days=1)
     if "today" in q:
         return day
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", q)
+    if m:
+        try:
+            return date_cls(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
     for i, name in enumerate(WEEKDAYS):
         if name in q:
             days_ahead = (i - day.weekday()) % 7
             days_ahead = days_ahead or 7  # "monday" said on a Monday means next Monday
             return day + timedelta(days=days_ahead)
+    if fallback_iso:
+        try:
+            return date_cls.fromisoformat(fallback_iso)
+        except ValueError:
+            pass
     return day
+
+
+def _wants_schedule_refresh(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in REFRESH_KEYWORDS)
+
+
+def _is_schedule_question(question: str, *, last_intent: str | None = None) -> bool:
+    q = question.lower()
+    if any(k in q for k in SCHEDULE_KEYWORDS):
+        return True
+    # Follow-up like "why not check again" after a schedule answer
+    if last_intent == "schedule" and _wants_schedule_refresh(question):
+        return True
+    return False
+
+
+def _sessions_for_day(day_iso: str, section: str | None) -> list[dict]:
+    return filter_by_section(get_classes_on(day_iso), section)
+
+
+async def _reply_schedule_for_question(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    question: str,
+) -> None:
+    """Answer class/schedule questions from class_sessions; refresh Gmail when needed."""
+    await update.message.chat.send_action("typing")
+    target_day = _resolve_target_day(
+        question, fallback_iso=context.user_data.get("last_schedule_day")
+    )
+    section = get_preferred_section()
+    force_refresh = _wants_schedule_refresh(question)
+
+    sessions = _sessions_for_day(target_day.isoformat(), section)
+    refreshed = False
+    if not sessions or force_refresh:
+        try:
+            info = refresh_schedule_from_gmail()
+            refreshed = True
+            # Prefer freshly parsed in-memory rows for the target day when DB lags
+            fresh = [
+                s
+                for s in (info.get("sessions") or [])
+                if str(s.get("session_date") or "") == target_day.isoformat()
+            ]
+            sessions = filter_by_section(fresh, section) if fresh else _sessions_for_day(
+                target_day.isoformat(), section
+            )
+            if not sessions:
+                sessions = _sessions_for_day(target_day.isoformat(), section)
+        except Exception as exc:
+            logger.exception("Schedule refresh failed during chat Q&A: %s", exc)
+
+    context.user_data["last_intent"] = "schedule"
+    context.user_data["last_schedule_day"] = target_day.isoformat()
+
+    if not sessions:
+        # If section filter hid rows that exist unlabeled-or-other, say so clearly
+        raw = get_classes_on(target_day.isoformat())
+        label = target_day.strftime("%a, %d %b")
+        if raw and section:
+            await update.message.reply_text(
+                f"No Section {section} classes found for {label}.\n"
+                f"There are {len(raw)} session(s) that day without a matching Sec. {section} label.\n"
+                "Try /section to change section, or /classes to refresh the timetable."
+            )
+            return
+        tip = " I re-checked Gmail for the latest timetable." if refreshed else ""
+        await update.message.reply_text(
+            f"No classes found for {label}.{tip}\n"
+            "Run /classes to pull the latest timetable PDF, or /section if your section isn't set."
+        )
+        return
+
+    label = target_day.strftime("%a, %d %b %Y")
+    title = f"<b>📚 Classes — {label}</b>"
+    if section:
+        title = f"<b>📚 Classes — {label} (Sec. {section})</b>"
+    text = _format_session_block(sessions, title)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -333,22 +442,12 @@ async def _answer_chat_question(
     context: ContextTypes.DEFAULT_TYPE,
     question: str,
 ) -> None:
-    q_lower = question.lower()
-    if any(k in q_lower for k in SCHEDULE_KEYWORDS):
-        await update.message.chat.send_action("typing")
-        target_day = _resolve_target_day(question)
-        section = get_preferred_section()
-        sessions = filter_by_section(get_classes_on(target_day.isoformat()), section)
-        if not sessions:
-            await update.message.reply_text(
-                f"No classes found for {target_day.strftime('%a, %d %b')}."
-            )
-            return
-        label = target_day.strftime("%a, %d %b %Y")
-        text = _format_session_block(sessions, f"<b>📚 Classes — {label}</b>")
-        await update.message.reply_text(text, parse_mode="HTML")
+    last_intent = context.user_data.get("last_intent")
+    if _is_schedule_question(question, last_intent=last_intent):
+        await _reply_schedule_for_question(update, context, question)
         return
 
+    context.user_data["last_intent"] = "qa"
     await update.message.chat.send_action("typing")
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
 
