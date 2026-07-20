@@ -110,6 +110,18 @@ def _alert_chat_ids(category: str, settings: Settings) -> list[str]:
     return chats
 
 
+async def send_mail_briefing(bot, *, subject: str | None, sender: str | None) -> None:
+    settings = get_settings()
+    chat_id = settings.telegram_owner_chat_id
+    if not chat_id:
+        return
+    text = (
+        f"📩 New mail — <b>{_escape_html(sender or 'Unknown sender')}</b>\n"
+        f"{_escape_html(subject or '(no subject)')}"
+    )
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
+
 async def send_telegram_alert(
     bot,
     category: str,
@@ -220,6 +232,7 @@ async def _process_message(
 ) -> dict[str, Any]:
     """Classify one email, persist results, optionally alert + forward attachments."""
     details = get_message_details(message_id, load_attachments=True)
+    await send_mail_briefing(bot, subject=details.get("subject"), sender=details.get("sender"))
     attachments = details.get("attachments") or []
     attachment_text = details.get("attachment_text") or ""
 

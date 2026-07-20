@@ -1,0 +1,26 @@
+name: Mailbot Scheduler
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # watch-gmail — every 15 min
+    - cron: '30 1 * * *'     # morning digest — 07:00 IST
+    - cron: '30 14 * * *'    # evening digest — 20:00 IST (8pm)
+  workflow_dispatch:
+
+jobs:
+  watch:
+    if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -X POST "${{ secrets.RENDER_URL }}/tasks/watch-gmail" -H "x-task-secret: ${{ secrets.TASK_SECRET }}"
+
+  morning_digest:
+    if: github.event.schedule == '30 1 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -X POST "${{ secrets.RENDER_URL }}/tasks/digest-morning" -H "x-task-secret: ${{ secrets.TASK_SECRET }}"
+
+  evening_digest:
+    if: github.event.schedule == '30 14 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -X POST "${{ secrets.RENDER_URL }}/tasks/digest-evening" -H "x-task-secret: ${{ secrets.TASK_SECRET }}"
