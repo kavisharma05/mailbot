@@ -19,13 +19,18 @@ from config import get_settings
 from gmail_api.client import send_email
 from services.db import (
     get_assignments_for_qa,
+    get_classes_on,
     get_open_assignments,
     get_preferred_section,
     log_low_confidence,
     mark_assignment_done,
     set_preferred_section,
 )
-from services.schedule import classes_command_text
+from services.schedule import (
+    _session_section,
+    classes_command_text,
+    refresh_schedule_from_gmail,
+)
 from services.timeutil import IST, format_deadline_display, today_ist
 
 logger = logging.getLogger(__name__)
@@ -97,6 +102,24 @@ def _strip_bot_mention(text: str, bot_username: str | None) -> str:
     return cleaned.strip()
 
 
+def _section_buttons(sections: list[str]) -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(f"Section {s}", callback_data=f"section:{s}") for s in sections]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(rows)
+
+
+def _available_sections() -> list[str]:
+    info = refresh_schedule_from_gmail()
+    sessions = info.get("sessions") or get_classes_on(today_ist().isoformat())
+    return sorted(
+        {
+            sec
+            for s in sessions
+            if (sec := _session_section(s.get("course_or_topic") or ""))
+        }
+    )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update):
         return
@@ -107,8 +130,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/due — open items for this chat/category\n"
         "/list — same as /due\n"
         "/done <n> — mark item #n from /due as complete\n"
-        "/classes — today's classes (time + room)\n"
-        "/section <letter> — set your section (e.g. /section C)\n"
+        "/classes — today's classes for your section (tap to set it first time)\n"
+        "/section — change or check your section\n"
         "/ask <question> — ask about deadlines, mails today, senders, or email content\n"
         "/send — compose and send an email (DM preferred)\n"
         "/cancel — cancel the current /send flow\n\n"
@@ -135,7 +158,15 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.chat.send_action("typing")
     section = get_preferred_section()
     if not section:
-        await update.message.reply_text("Which section should I show? Reply with e.g. /section C")
+        available = _available_sections()
+        if not available:
+            await update.message.reply_text(
+                "Couldn't find any sections in the latest timetable yet — try again shortly."
+            )
+            return
+        await update.message.reply_text(
+            "Which section are you in?", reply_markup=_section_buttons(available)
+        )
         return
     try:
         text = classes_command_text(refresh=True, section=section)
@@ -151,14 +182,22 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def section_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update) or not update.message:
         return
-    if not context.args:
-        current = get_preferred_section()
-        msg = f"Current section: {current}" if current else "No section set yet."
-        await update.message.reply_text(f"{msg}\nUsage: /section C")
+    current = get_preferred_section()
+    label = f"Current: Section {current}\n\n" if current else ""
+    available = _available_sections() or ["A", "B", "C", "D"]
+    await update.message.reply_text(f"{label}Pick your section:", reply_markup=_section_buttons(available))
+
+
+async def section_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
         return
-    section = context.args[0]
+    query = update.callback_query
+    await query.answer()
+    section = query.data.split(":", 1)[1]
     set_preferred_section(section)
-    await update.message.reply_text(f"Got it — showing Section {section.upper()[:1]} from now on.")
+    await query.edit_message_text(
+        f"Got it — showing Section {section} from now on. Run /classes anytime."
+    )
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -408,6 +447,7 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("done", done_command))
     application.add_handler(CommandHandler("classes", classes_command))
     application.add_handler(CommandHandler("section", section_command))
+    application.add_handler(CallbackQueryHandler(section_button, pattern=r"^section:"))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(build_conversation_handler())
     # Free-text Q&A after conversation handler so /send flow keeps priority
