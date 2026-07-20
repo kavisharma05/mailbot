@@ -451,21 +451,32 @@ async def _answer_chat_question(
     await update.message.chat.send_action("typing")
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
 
-    # Keep payload small for Groq free-tier TPD limits
-    items = get_assignments_for_qa(category=None, limit=25)
-    if category:
-        cat_items = get_assignments_for_qa(category=category, limit=15)
-        seen = {i["id"] for i in cat_items}
-        items = cat_items + [i for i in items if i["id"] not in seen]
+    try:
+        items = get_assignments_for_qa(category=None, limit=25)
+        if category:
+            cat_items = get_assignments_for_qa(category=category, limit=15)
+            seen = {i["id"] for i in cat_items}
+            items = cat_items + [i for i in items if i["id"] not in seen]
 
-    question_text, pasted = split_question_and_paste(question)
-    answer = answer_question(
-        question_text,
-        items,
-        category=category,
-        pasted_email=pasted,
-    )
-    await update.message.reply_text(answer)
+        question_text, pasted = split_question_and_paste(question)
+        answer = answer_question(
+            question_text,
+            items,
+            category=category,
+            pasted_email=pasted,
+        )
+    except Exception as exc:
+        logger.exception("Q&A failed: %s", exc)
+        answer = (
+            "Something went wrong while answering that. "
+            "Try /due, /classes, or ask again in a moment."
+        )
+
+    if not answer or not answer.strip():
+        answer = "I couldn't find a clear answer. Try /due or rephrase your question."
+
+    # Plain text avoids Telegram HTML parse errors from LLM output
+    await update.message.reply_text(answer[:4096])
 
 
 async def send_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

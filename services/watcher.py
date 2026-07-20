@@ -1,3 +1,4 @@
+import asyncio
 import io
 import logging
 from datetime import datetime, timezone
@@ -35,6 +36,9 @@ from services.timeutil import (
 
 logger = logging.getLogger(__name__)
 
+WATCHER_INTERVAL_SECONDS = 60
+watcher_lock = asyncio.Lock()
+
 VALID_CATEGORIES = ("deadline", "placement", "admin", "other")
 
 CATEGORY_LABELS = {
@@ -68,6 +72,66 @@ def _format_deadline_display(deadline_date: str | None, deadline_text: str | Non
     return format_deadline_display(deadline_date, deadline_text, tz=IST)
 
 
+def _category_group_chat_id(category: str, settings: Settings) -> str | None:
+    """Category group only — no owner fallback."""
+    mapping = {
+        "deadline": settings.telegram_chat_deadlines,
+        "placement": settings.telegram_chat_placements,
+        "admin": settings.telegram_chat_admin,
+        "other": settings.telegram_chat_other,
+    }
+    chat_id = mapping.get(category, "") or ""
+    return chat_id or None
+
+
+def format_incoming_mail_message(
+    *,
+    subject: str | None,
+    sender: str | None,
+    category: str,
+    course_or_topic: str | None = None,
+    task: str | None = None,
+    deadline_date: str | None = None,
+    deadline_text: str | None = None,
+    summary: str | None = None,
+) -> str:
+    label = CATEGORY_LABELS.get(category, "Mail")
+    lines = ["📩 <b>New mail</b>"]
+    lines.append(f"<b>From:</b> {_escape_html(sender or 'Unknown sender')}")
+    lines.append(f"<b>Subject:</b> {_escape_html(subject or '(no subject)')}")
+    lines.append(f"<b>Category:</b> {_escape_html(label)}")
+
+    if course_or_topic:
+        lines.append(f"<b>Course:</b> {_escape_html(str(course_or_topic))}")
+    if task:
+        lines.append(f"<b>Task:</b> {_escape_html(str(task))}")
+
+    due = _format_deadline_display(deadline_date, deadline_text)
+    if due and due not in ("—", "Not specified", "Unknown"):
+        lines.append(f"<b>Due:</b> {_escape_html(due)}")
+
+    if summary:
+        lines.append("")
+        lines.append(_escape_html(str(summary)))
+
+    return "\n".join(lines)
+
+
+async def send_owner_mail_update(
+    bot,
+    text: str,
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+) -> None:
+    settings = get_settings()
+    chat_id = settings.telegram_owner_chat_id
+    if not chat_id:
+        return
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    if attachments:
+        await _forward_attachments(bot, chat_id, attachments, caption_prefix=None)
+
+
 def format_alert_message(
     *,
     category: str,
@@ -99,27 +163,45 @@ def format_alert_message(
     return "\n".join(lines)
 
 
-def _alert_chat_ids(category: str, settings: Settings) -> list[str]:
-    """Send to category group AND owner DM (both), de-duplicated."""
+def _alert_chat_ids(category: str, settings: Settings, *, include_owner: bool = True) -> list[str]:
+    """Send to category group and optionally owner DM, de-duplicated."""
     chats: list[str] = []
     group = _resolve_chat_id(category, settings)
-    owner = settings.telegram_owner_chat_id
+    owner = settings.telegram_owner_chat_id if include_owner else ""
     for chat_id in (group, owner):
         if chat_id and chat_id not in chats:
             chats.append(chat_id)
     return chats
 
 
-async def send_mail_briefing(bot, *, subject: str | None, sender: str | None) -> None:
+async def send_category_alert(
+    bot,
+    category: str,
+    *,
+    course_or_topic: str | None = None,
+    task: str | None = None,
+    deadline_date: str | None = None,
+    deadline_text: str | None = None,
+    summary: str | None = None,
+    sender: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> None:
+    """Actionable alert to category group only (owner gets separate rich update)."""
     settings = get_settings()
-    chat_id = settings.telegram_owner_chat_id
+    chat_id = _category_group_chat_id(category, settings)
     if not chat_id:
         return
-    text = (
-        f"📩 New mail — <b>{_escape_html(sender or 'Unknown sender')}</b>\n"
-        f"{_escape_html(subject or '(no subject)')}"
+    text = format_alert_message(
+        category=category,
+        course_or_topic=course_or_topic,
+        task=task,
+        deadline_date=deadline_date,
+        deadline_text=deadline_text,
+        summary=summary,
+        sender=sender,
     )
     await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    await _forward_attachments(bot, chat_id, attachments or [], caption_prefix=summary or task)
 
 
 async def send_telegram_alert(
@@ -192,7 +274,8 @@ async def share_schedule(
     text = format_schedule_share(sessions)
     if summary:
         text = f"{text}\n\n<i>{_escape_html(summary)}</i>"
-    for chat_id in _alert_chat_ids("admin", settings):
+    chat_id = _category_group_chat_id("admin", settings)
+    if chat_id:
         await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
         await _forward_attachments(bot, chat_id, attachments or [], caption_prefix="Class schedule")
 
@@ -232,7 +315,6 @@ async def _process_message(
 ) -> dict[str, Any]:
     """Classify one email, persist results, optionally alert + forward attachments."""
     details = get_message_details(message_id, load_attachments=True)
-    await send_mail_briefing(bot, subject=details.get("subject"), sender=details.get("sender"))
     attachments = details.get("attachments") or []
     attachment_text = details.get("attachment_text") or ""
 
@@ -257,6 +339,19 @@ async def _process_message(
     deadline_date = result.get("deadline_date")
     assignment_id = None
     alerts = 0
+    sender = result.get("sender") or details.get("sender")
+    summary = result.get("summary")
+
+    owner_text = format_incoming_mail_message(
+        subject=details.get("subject"),
+        sender=sender,
+        category=category,
+        course_or_topic=result.get("course_or_topic"),
+        task=result.get("task"),
+        deadline_date=deadline_date,
+        deadline_text=result.get("deadline_text"),
+        summary=summary,
+    )
 
     # Timetable / weekly schedule path (keyword/PDF match — don't require AI confidence)
     if looks_like_schedule(
@@ -273,10 +368,15 @@ async def _process_message(
         )
         if sessions:
             stored = store_schedule_sessions(sessions, gmail_message_id=message_id)
+            await send_owner_mail_update(
+                bot,
+                owner_text,
+                attachments=attachments if is_actionable else None,
+            )
             await share_schedule(
                 bot,
                 sessions=stored or sessions,
-                summary=result.get("summary"),
+                summary=summary,
                 attachments=attachments,
             )
             alerts = 1
@@ -297,9 +397,16 @@ async def _process_message(
                         "status": "open",
                     }
                 )
-                assignment_id = assignment["id"]
+                if assignment:
+                    assignment_id = assignment["id"]
             mark_email_processed(message_id, True, confidence or "medium", assignment_id)
             return {"processed": 1, "alerts": alerts}
+
+    await send_owner_mail_update(
+        bot,
+        owner_text,
+        attachments=attachments if is_actionable and confidence in ("high", "medium") else None,
+    )
 
     if is_actionable and confidence in ("high", "medium"):
         assignment = insert_assignment(
@@ -317,16 +424,16 @@ async def _process_message(
                 "status": "open",
             }
         )
-        assignment_id = assignment["id"]
+        if assignment:
+            assignment_id = assignment["id"]
 
-        summary = result.get("summary")
         if _should_alert(
             is_actionable,
             confidence,
             deadline_date,
             skip_past_deadlines=skip_past_deadlines,
         ):
-            await send_telegram_alert(
+            await send_category_alert(
                 bot,
                 category,
                 course_or_topic=result.get("course_or_topic"),
@@ -334,7 +441,7 @@ async def _process_message(
                 deadline_date=deadline_date,
                 deadline_text=result.get("deadline_text"),
                 summary=summary,
-                sender=result.get("sender") or details.get("sender"),
+                sender=sender,
                 attachments=attachments,
             )
             alerts = 1

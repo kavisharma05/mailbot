@@ -1,6 +1,7 @@
 import logging
 from datetime import date, datetime, timezone
-from typing import Any
+from functools import wraps
+from typing import Any, Callable, TypeVar
 
 from supabase import Client, create_client
 
@@ -8,6 +9,8 @@ from config import get_settings
 from services.timeutil import item_effective_deadline_dt, parse_iso_deadline
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 _ASSIGNMENT_COLUMNS = (
     "id, category, course_or_topic, task, deadline_text, deadline_date, "
@@ -20,6 +23,47 @@ def get_db() -> Client:
     return create_client(settings.supabase_url, settings.supabase_service_key)
 
 
+def check_db_health() -> dict[str, Any]:
+    """Lightweight ping for /healthz — does not raise."""
+    try:
+        db = get_db()
+        result = db.table("watch_state").select("id").eq("id", 1).limit(1).execute()
+        if result.data is None:
+            return {"ok": False, "error": "empty response"}
+        return {"ok": True}
+    except Exception as exc:
+        logger.warning("DB health check failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
+def _safe_read(default: T) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    def decorator(fn: Callable[..., T]) -> Callable[..., T]:
+        @wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                logger.exception("%s failed: %s", fn.__name__, exc)
+                return default
+
+        return wrapper
+
+    return decorator
+
+
+def _safe_write(fn: Callable[..., T]) -> Callable[..., T | None]:
+    @wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> T | None:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            logger.exception("%s failed: %s", fn.__name__, exc)
+            return None
+
+    return wrapper
+
+
+@_safe_read(None)
 def get_watch_state() -> dict[str, Any] | None:
     db = get_db()
     result = db.table("watch_state").select("*").eq("id", 1).limit(1).execute()
@@ -27,6 +71,7 @@ def get_watch_state() -> dict[str, Any] | None:
     return rows[0] if rows else None
 
 
+@_safe_write
 def update_watch_state(last_history_id: str | None = None, last_checked_at: datetime | None = None) -> None:
     db = get_db()
     payload: dict[str, Any] = {}
@@ -38,6 +83,7 @@ def update_watch_state(last_history_id: str | None = None, last_checked_at: date
         db.table("watch_state").update(payload).eq("id", 1).execute()
 
 
+@_safe_read(False)
 def is_email_processed(message_id: str) -> bool:
     db = get_db()
     result = db.table("processed_emails").select("message_id").eq("message_id", message_id).limit(1).execute()
@@ -50,23 +96,31 @@ def mark_email_processed(
     confidence: str | None,
     assignment_id: str | None = None,
 ) -> None:
-    db = get_db()
-    db.table("processed_emails").insert(
-        {
-            "message_id": message_id,
-            "is_actionable": is_actionable,
-            "confidence": confidence,
-            "assignment_id": assignment_id,
-        }
-    ).execute()
+    try:
+        db = get_db()
+        db.table("processed_emails").insert(
+            {
+                "message_id": message_id,
+                "is_actionable": is_actionable,
+                "confidence": confidence,
+                "assignment_id": assignment_id,
+            }
+        ).execute()
+    except Exception as exc:
+        logger.exception("mark_email_processed failed for %s: %s", message_id, exc)
 
 
-def insert_assignment(data: dict[str, Any]) -> dict[str, Any]:
-    db = get_db()
-    result = db.table("assignments").insert(data).execute()
-    return result.data[0]
+def insert_assignment(data: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        db = get_db()
+        result = db.table("assignments").insert(data).execute()
+        return result.data[0]
+    except Exception as exc:
+        logger.exception("insert_assignment failed: %s", exc)
+        return None
 
 
+@_safe_read([])
 def get_open_assignments(category: str | None = None, limit: int = 40) -> list[dict[str, Any]]:
     db = get_db()
     query = (
@@ -82,6 +136,7 @@ def get_open_assignments(category: str | None = None, limit: int = 40) -> list[d
     return result.data or []
 
 
+@_safe_read([])
 def get_assignments_for_qa(category: str | None = None, limit: int = 60) -> list[dict[str, Any]]:
     """Recent tracked items for Q&A — open first, includes recently created items."""
     db = get_db()
@@ -109,12 +164,14 @@ def _deadline_on_local_day(item: dict[str, Any], day: date, tz) -> bool:
     return local.date() == day
 
 
+@_safe_read([])
 def get_assignments_due_on(day: date, tz, category: str | None = None) -> list[dict[str, Any]]:
     """Open assignments whose deadline_date falls on the given local calendar day."""
     items = get_open_assignments(category=category, limit=200)
     return [i for i in items if _deadline_on_local_day(i, day, tz)]
 
 
+@_safe_read([])
 def get_assignments_due_between(
     start_day: date,
     end_day: date,
@@ -134,6 +191,7 @@ def get_assignments_due_between(
     return matched
 
 
+@_safe_read([])
 def get_recent_assignments(since: datetime, category: str | None = None) -> list[dict[str, Any]]:
     """Assignments created since `since` (typically last 18h for morning digest)."""
     db = get_db()
@@ -150,6 +208,7 @@ def get_recent_assignments(since: datetime, category: str | None = None) -> list
     return result.data or []
 
 
+@_safe_read(None)
 def mark_assignment_done(assignment_id: str) -> dict[str, Any] | None:
     db = get_db()
     result = (
@@ -163,6 +222,7 @@ def mark_assignment_done(assignment_id: str) -> dict[str, Any] | None:
     return rows[0] if rows else None
 
 
+@_safe_read(None)
 def get_assignment_by_id(assignment_id: str) -> dict[str, Any] | None:
     db = get_db()
     result = (
@@ -177,29 +237,39 @@ def get_assignment_by_id(assignment_id: str) -> dict[str, Any] | None:
 
 
 def log_low_confidence(kind: str, payload: dict[str, Any]) -> None:
-    db = get_db()
-    db.table("low_confidence_log").insert({"kind": kind, "payload": payload}).execute()
-    logger.info("Logged low-confidence %s output", kind)
+    try:
+        db = get_db()
+        db.table("low_confidence_log").insert({"kind": kind, "payload": payload}).execute()
+        logger.info("Logged low-confidence %s output", kind)
+    except Exception as exc:
+        logger.exception("log_low_confidence failed: %s", exc)
 
 
 def insert_class_sessions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not rows:
         return []
-    db = get_db()
-    result = db.table("class_sessions").insert(rows).execute()
-    return result.data or []
+    try:
+        db = get_db()
+        result = db.table("class_sessions").insert(rows).execute()
+        return result.data or []
+    except Exception as exc:
+        logger.exception("insert_class_sessions failed: %s", exc)
+        return []
 
 
+@_safe_write
 def delete_class_sessions_for_week(week_start: str) -> None:
     db = get_db()
     db.table("class_sessions").delete().eq("week_start", week_start).execute()
 
 
+@_safe_write
 def delete_class_sessions_for_message(gmail_message_id: str) -> None:
     db = get_db()
     db.table("class_sessions").delete().eq("gmail_message_id", gmail_message_id).execute()
 
 
+@_safe_read([])
 def get_classes_on(session_date: str) -> list[dict[str, Any]]:
     db = get_db()
     result = (
@@ -214,6 +284,7 @@ def get_classes_on(session_date: str) -> list[dict[str, Any]]:
     return result.data or []
 
 
+@_safe_read([])
 def get_classes_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
     db = get_db()
     result = (
@@ -230,6 +301,7 @@ def get_classes_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
     return result.data or []
 
 
+@_safe_read([])
 def get_class_sessions_for_message(gmail_message_id: str) -> list[dict[str, Any]]:
     db = get_db()
     result = (
@@ -245,6 +317,7 @@ def get_class_sessions_for_message(gmail_message_id: str) -> list[dict[str, Any]
     return result.data or []
 
 
+@_safe_read(None)
 def get_preferred_section() -> str | None:
     result = get_db().table("user_prefs").select("preferred_section").eq("id", 1).execute()
     if result.data:
@@ -252,6 +325,7 @@ def get_preferred_section() -> str | None:
     return None
 
 
+@_safe_write
 def set_preferred_section(section: str) -> None:
     get_db().table("user_prefs").upsert(
         {

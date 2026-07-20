@@ -5,10 +5,10 @@ A Telegram bot that helps MBA/college students manage academic email: compose po
 ## Features (core)
 
 - **`/send`** — Turn rough instructions into a polished email draft, approve, and send via Gmail
-- **Email watcher** — Polls Gmail every 15 minutes, classifies emails with Groq (Llama 3.3), routes alerts to category-specific Telegram groups
-- **Scheduled digests** — Morning (7:00 IST) and evening (20:00 IST) summaries per category group
-- **Per-mail briefing** — Owner DM when the watcher sees new mail (sender + subject), before classification
-- **Attachments** — Downloads mail attachments, reads PDF/Excel/Word text for classification, and forwards files to the category Telegram group **and** your DM
+- **Email watcher** — Polls Gmail every ~60s in-app (plus GitHub Actions every 5 min as backup), classifies with Groq, sends rich owner alerts (sender, subject, summary, deadline)
+- **Scheduled digests** — Morning 7:00 IST: today's classes + due items to owner DM. Evening 20:00 IST: tomorrow's classes + due items to owner DM
+- **Incoming mail alerts** — Owner DM after classification with sender, subject, content summary, and deadline when present; actionable items also go to category groups
+- **Attachments** — Downloads mail attachments, reads PDF/Excel/Word text for classification, and forwards files to category groups and owner DM for actionable mail
 - **Class timetable** — Parses weekly schedules from body or attachments; morning digest + `/classes` show today's courses, times, and rooms
 - **14-day backfill** — One-time scan of recent inbox mail via `POST /tasks/backfill`
 
@@ -18,8 +18,8 @@ Scaffolded for later: submission matcher (#3), manual reminder parser (#4).
 
 ## Architecture
 
-- **FastAPI** app on Render (free tier) with Telegram webhook
-- **GitHub Actions** cron hits `/tasks/watch-gmail` every 15 min, plus digest endpoints at 7:00 and 20:00 IST
+- **FastAPI** app on Render (free tier) with Telegram webhook and a 60s in-process Gmail poll loop
+- **GitHub Actions** cron hits `/tasks/watch-gmail` every 5 min (cold-start safety net), plus digest endpoints at 7:00 and 20:00 IST
 - **Supabase** Postgres for assignments, processed emails, watch state
 - **Gmail API** (OAuth2) for read + send
 - **Groq API** (free tier, Llama 3.3 70B) for structured JSON classification/composition
@@ -110,7 +110,7 @@ The `.github/workflows/scheduler.yml` workflow will:
 
 | Schedule (UTC) | IST | Endpoint |
 |----------------|-----|----------|
-| `*/15 * * * *` | every 15 min | `/tasks/watch-gmail` |
+| `*/5 * * * *` | every 5 min | `/tasks/watch-gmail` |
 | `30 1 * * *` | 7:00 | `/tasks/digest-morning` |
 | `30 14 * * *` | 20:00 | `/tasks/digest-evening` |
 
@@ -179,17 +179,17 @@ For free-text in groups without mentioning, disable privacy in BotFather: `/setp
 
 - Verify `GROQ_MODEL` matches a model available on the Groq free tier
 - Low-confidence classifier outputs are logged to `low_confidence_log` in Supabase
-- Only `medium` and `high` confidence actionable emails trigger real-time Telegram alerts (every ~15 min)
-- **Morning digest (7:00 IST):** today's due items + recently tracked assignments per category group
-- **Evening digest (20:00 IST):** overdue, today, and tomorrow due items per category group
-- If a category group has nothing due, that group is skipped; if all groups are empty, a short note goes to owner DM only
-- Alerts route to category-specific groups when chat IDs are configured
+- Only `medium` and `high` confidence actionable emails trigger category-group alerts (owner always gets a rich summary after classify)
+- **Morning digest (7:00 IST):** consolidated owner DM — today's classes, due today, recently tracked items
+- **Evening digest (20:00 IST):** consolidated owner DM — overdue (if any), tomorrow's classes, due tomorrow
+- Category groups receive actionable real-time alerts only; digests go to owner DM
+- Watcher polls every **~60s** while the app is awake, plus GitHub Actions every **5 min** as backup
+- If email classification fails (LLM/JSON error), the message is **not** marked processed and will retry on the next watcher run (~60s)
+- `/ask` uses LLM + DB + Gmail; replies are plain text with safe fallbacks when AI is unavailable
 - Watcher only processes **new** mail after first run; use `/tasks/backfill` for older mail
 - Both the watcher and backfill scan the **Inbox and Spam** folders (important emails sometimes land in spam)
 - LLM calls use **Groq first**, then **Cerebras** if Groq fails / rate-limits
 - **Deadlines resolve in IST (Asia/Kolkata):** relative phrases like "tomorrow 9:45" are normalized server-side; date-only deadlines default to 23:59 IST
-- If email classification fails (LLM/JSON error), the message is **not** marked processed and will retry on the next watcher run (~15 min)
-- `/ask` uses stronger Gmail retrieval for date/topic questions and falls back to structured extracts when AI is unavailable
-- Actionable alerts forward attachments to the category group **and** owner DM (skips tiny signature images; max ~20MB)
+- `/healthz` reports LLM and Supabase connectivity status
 - Attachment text (PDF/Excel/DOCX) is read and fed into classification — useful for buried deadlines and timetables
 - Run `supabase/migration_class_sessions.sql` once in Supabase for class timetable storage
