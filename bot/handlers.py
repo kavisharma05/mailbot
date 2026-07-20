@@ -20,8 +20,10 @@ from gmail_api.client import send_email
 from services.db import (
     get_assignments_for_qa,
     get_open_assignments,
+    get_preferred_section,
     log_low_confidence,
     mark_assignment_done,
+    set_preferred_section,
 )
 from services.schedule import classes_command_text
 from services.timeutil import IST, format_deadline_display, today_ist
@@ -39,6 +41,10 @@ CATEGORY_TITLES = {
     "admin": "Admin",
     "other": "Other",
 }
+
+GREETINGS = {"hi", "hey", "hello", "yo", "sup", "hii", "hiii", "heya"}
+
+SCHEDULE_KEYWORDS = ("class", "classes", "schedule", "timetable", "time table", "lecture")
 
 
 def _is_owner(update: Update) -> bool:
@@ -102,6 +108,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/list — same as /due\n"
         "/done <n> — mark item #n from /due as complete\n"
         "/classes — today's classes (time + room)\n"
+        "/section <letter> — set your section (e.g. /section C)\n"
         "/ask <question> — ask about deadlines, mails today, senders, or email content\n"
         "/send — compose and send an email (DM preferred)\n"
         "/cancel — cancel the current /send flow\n\n"
@@ -126,8 +133,12 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await update.message.chat.send_action("typing")
+    section = get_preferred_section()
+    if not section:
+        await update.message.reply_text("Which section should I show? Reply with e.g. /section C")
+        return
     try:
-        text = classes_command_text(refresh=True)
+        text = classes_command_text(refresh=True, section=section)
     except Exception as exc:
         logger.exception("/classes failed: %s", exc)
         await update.message.reply_text(
@@ -135,6 +146,19 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def section_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+    if not context.args:
+        current = get_preferred_section()
+        msg = f"Current section: {current}" if current else "No section set yet."
+        await update.message.reply_text(f"{msg}\nUsage: /section C")
+        return
+    section = context.args[0]
+    set_preferred_section(section)
+    await update.message.reply_text(f"Got it — showing Section {section.upper()[:1]} from now on.")
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -233,6 +257,11 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     question = _strip_bot_mention(text, bot_username)
+
+    if question.strip().lower().rstrip("!.?") in GREETINGS:
+        await update.message.reply_text("Hey — ask me about deadlines, mail, or /classes.")
+        return
+
     if not question:
         await update.message.reply_text("Ask me about your deadlines, placements, or admin items.")
         return
@@ -245,6 +274,13 @@ async def _answer_chat_question(
     context: ContextTypes.DEFAULT_TYPE,
     question: str,
 ) -> None:
+    q_lower = question.lower()
+    if any(k in q_lower for k in SCHEDULE_KEYWORDS):
+        await update.message.chat.send_action("typing")
+        text = classes_command_text(refresh=False)
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+
     await update.message.chat.send_action("typing")
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
 
@@ -371,6 +407,7 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("list", due_command))
     application.add_handler(CommandHandler("done", done_command))
     application.add_handler(CommandHandler("classes", classes_command))
+    application.add_handler(CommandHandler("section", section_command))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(build_conversation_handler())
     # Free-text Q&A after conversation handler so /send flow keeps priority
