@@ -62,6 +62,14 @@ create table if not exists class_sessions (
 create index if not exists idx_class_sessions_date on class_sessions (session_date);
 create index if not exists idx_class_sessions_week on class_sessions (week_start);
 
+create table if not exists user_prefs (
+    id int primary key default 1 check (id = 1),
+    preferred_section text,
+    updated_at timestamptz not null default now()
+);
+
+insert into user_prefs (id) values (1) on conflict (id) do nothing;
+
 -- Migration for existing projects (run once in Supabase SQL editor):
 -- alter table assignments add column if not exists category text
 --   check (category in ('deadline', 'placement', 'admin', 'other'));

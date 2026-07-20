@@ -1,5 +1,5 @@
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 from supabase import Client, create_client
@@ -243,3 +243,20 @@ def get_class_sessions_for_message(gmail_message_id: str) -> list[dict[str, Any]
         .execute()
     )
     return result.data or []
+
+
+def get_preferred_section() -> str | None:
+    result = get_db().table("user_prefs").select("preferred_section").eq("id", 1).execute()
+    if result.data:
+        return result.data[0].get("preferred_section")
+    return None
+
+
+def set_preferred_section(section: str) -> None:
+    get_db().table("user_prefs").upsert(
+        {
+            "id": 1,
+            "preferred_section": section.strip().upper()[:1],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ).execute()

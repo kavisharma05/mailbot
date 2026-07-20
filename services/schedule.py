@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -16,11 +17,24 @@ from services.db import (
     get_class_sessions_for_message,
     get_classes_between,
     get_classes_on,
+    get_preferred_section,
     insert_class_sessions,
 )
 from services.timeutil import IST, today_ist
 
 logger = logging.getLogger(__name__)
+
+
+def _session_section(course_or_topic: str) -> str | None:
+    m = re.search(r"sec\.?\s*([A-Za-z])\b", course_or_topic or "", re.IGNORECASE)
+    return m.group(1).upper() if m else None
+
+
+def filter_by_section(sessions: list[dict], section: str | None) -> list[dict]:
+    if not section:
+        return sessions
+    target = section.strip().upper()[:1]
+    return [s for s in sessions if _session_section(s.get("course_or_topic") or "") == target]
 
 # In-process cache: avoid re-calling the LLM for the same timetable mail
 _parse_cache: dict[str, dict[str, Any]] = {}
@@ -313,20 +327,23 @@ def _format_session_block(sessions: list[dict[str, Any]], title: str) -> str:
     return "\n".join(lines).strip()
 
 
-def format_today_classes(day: date | None = None) -> str:
+def format_today_classes(day: date | None = None, *, section: str | None = None) -> str:
     day = day or today_ist()
-    sessions = get_classes_on(day.isoformat())
+    sessions = filter_by_section(get_classes_on(day.isoformat()), section)
     if not sessions:
         return ""
     label = day.strftime("%a, %d %b %Y")
     return _format_session_block(sessions, f"<b>📚 Today's classes — {label}</b>")
 
 
-def format_upcoming_classes(day: date | None = None, *, days: int = 7) -> str:
+def format_upcoming_classes(day: date | None = None, *, days: int = 7, section: str | None = None) -> str:
     day = day or today_ist()
     end = day + timedelta(days=days)
     try:
-        sessions = get_classes_between(day.isoformat(), end.isoformat())
+        sessions = filter_by_section(
+            get_classes_between(day.isoformat(), end.isoformat()),
+            section,
+        )
     except Exception as exc:
         logger.warning("Upcoming classes query failed: %s", exc)
         return ""
@@ -354,12 +371,13 @@ def _source_footer(info: dict[str, Any]) -> str:
     return "\n\n<i>" + " · ".join(parts) + "</i>"
 
 
-def classes_command_text(*, refresh: bool = True) -> str:
+def classes_command_text(*, refresh: bool = True, section: str | None = None) -> str:
     """
     Power /classes: loads the latest timetable mail (PDF/body), stores sessions,
     then returns today's list (or upcoming if nothing today).
     """
     day = today_ist()
+    section = section or get_preferred_section()
     info: dict[str, Any] = {}
     if refresh:
         try:
@@ -370,7 +388,7 @@ def classes_command_text(*, refresh: bool = True) -> str:
 
     today_text = ""
     try:
-        today_text = format_today_classes(day)
+        today_text = format_today_classes(day, section=section)
     except Exception as exc:
         logger.warning("format_today_classes failed: %s", exc)
 
@@ -378,20 +396,26 @@ def classes_command_text(*, refresh: bool = True) -> str:
         return today_text + _source_footer(info)
 
     # Prefer in-memory sessions from the refresh if DB is empty/broken
-    sessions = info.get("sessions") or []
+    sessions = filter_by_section(info.get("sessions") or [], section)
     if sessions:
         today_key = day.isoformat()
-        today_sessions = [s for s in sessions if s.get("session_date") == today_key]
+        today_sessions = filter_by_section(
+            [s for s in sessions if s.get("session_date") == today_key],
+            section,
+        )
         if today_sessions:
             label = day.strftime("%a, %d %b %Y")
             return _format_session_block(
                 today_sessions, f"<b>📚 Today's classes — {label}</b>"
             ) + _source_footer(info)
-        upcoming = [
-            s
-            for s in sessions
-            if str(s.get("session_date") or "") >= today_key
-        ][:20]
+        upcoming = filter_by_section(
+            [
+                s
+                for s in sessions
+                if str(s.get("session_date") or "") >= today_key
+            ][:20],
+            section,
+        )
         if upcoming:
             return _format_session_block(
                 upcoming, "<b>📚 Upcoming classes (from latest timetable)</b>"
@@ -399,7 +423,7 @@ def classes_command_text(*, refresh: bool = True) -> str:
         return format_schedule_share(sessions) + _source_footer(info)
 
     try:
-        upcoming_text = format_upcoming_classes(day, days=7)
+        upcoming_text = format_upcoming_classes(day, days=7, section=section)
     except Exception:
         upcoming_text = ""
     if upcoming_text:
