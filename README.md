@@ -6,7 +6,8 @@ A Telegram bot that helps MBA/college students manage academic email: compose po
 
 - **`/send`** — Turn rough instructions into a polished email draft, approve, and send via Gmail
 - **Email watcher** — Polls Gmail every 15 minutes, classifies emails with Groq (Llama 3.3), routes alerts to category-specific Telegram groups
-- **Scheduled digests** — Morning (7:00 IST) and evening (19:00 IST) summaries per category group
+- **Scheduled digests** — Morning (7:00 IST) and evening (20:00 IST) summaries per category group
+- **Per-mail briefing** — Owner DM when the watcher sees new mail (sender + subject), before classification
 - **Attachments** — Downloads mail attachments, reads PDF/Excel/Word text for classification, and forwards files to the category Telegram group **and** your DM
 - **Class timetable** — Parses weekly schedules from body or attachments; morning digest + `/classes` show today's courses, times, and rooms
 - **14-day backfill** — One-time scan of recent inbox mail via `POST /tasks/backfill`
@@ -18,7 +19,7 @@ Scaffolded for later: submission matcher (#3), manual reminder parser (#4).
 ## Architecture
 
 - **FastAPI** app on Render (free tier) with Telegram webhook
-- **GitHub Actions** cron hits `/tasks/watch-gmail` every 15 min, plus digest endpoints at 7:00 and 19:00 IST
+- **GitHub Actions** cron hits `/tasks/watch-gmail` every 15 min, plus digest endpoints at 7:00 and 20:00 IST
 - **Supabase** Postgres for assignments, processed emails, watch state
 - **Gmail API** (OAuth2) for read + send
 - **Groq API** (free tier, Llama 3.3 70B) for structured JSON classification/composition
@@ -105,15 +106,15 @@ python scripts/set_webhook.py
    - `RENDER_URL` — your Render app URL (e.g. `https://mailbot-abc.onrender.com`)
    - `TASK_SECRET` — same value as in Render env
 
-The `.github/workflows/watcher.yml` workflow will:
+The `.github/workflows/scheduler.yml` workflow will:
 
 | Schedule (UTC) | IST | Endpoint |
 |----------------|-----|----------|
 | `*/15 * * * *` | every 15 min | `/tasks/watch-gmail` |
 | `30 1 * * *` | 7:00 | `/tasks/digest-morning` |
-| `30 13 * * *` | 19:00 | `/tasks/digest-evening` |
+| `30 14 * * *` | 20:00 | `/tasks/digest-evening` |
 
-Use **Actions → Gmail Deadline Watcher → Run workflow** to manually trigger the watcher or either digest.
+Use **Actions → Mailbot Scheduler → Run workflow** to manually trigger the watcher or either digest.
 
 ### One-time 14-day backfill
 
@@ -180,7 +181,7 @@ For free-text in groups without mentioning, disable privacy in BotFather: `/setp
 - Low-confidence classifier outputs are logged to `low_confidence_log` in Supabase
 - Only `medium` and `high` confidence actionable emails trigger real-time Telegram alerts (every ~15 min)
 - **Morning digest (7:00 IST):** today's due items + recently tracked assignments per category group
-- **Evening digest (19:00 IST):** overdue, today, and tomorrow due items per category group
+- **Evening digest (20:00 IST):** overdue, today, and tomorrow due items per category group
 - If a category group has nothing due, that group is skipped; if all groups are empty, a short note goes to owner DM only
 - Alerts route to category-specific groups when chat IDs are configured
 - Watcher only processes **new** mail after first run; use `/tasks/backfill` for older mail

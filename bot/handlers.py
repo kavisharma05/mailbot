@@ -1,6 +1,7 @@
 import html
 import logging
 import re
+from datetime import timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
@@ -27,8 +28,10 @@ from services.db import (
     set_preferred_section,
 )
 from services.schedule import (
+    _format_session_block,
     _session_section,
     classes_command_text,
+    filter_by_section,
     refresh_schedule_from_gmail,
 )
 from services.timeutil import IST, format_deadline_display, today_ist
@@ -50,6 +53,8 @@ CATEGORY_TITLES = {
 GREETINGS = {"hi", "hey", "hello", "yo", "sup", "hii", "hiii", "heya"}
 
 SCHEDULE_KEYWORDS = ("class", "classes", "schedule", "timetable", "time table", "lecture")
+
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
 
 def _is_owner(update: Update) -> bool:
@@ -118,6 +123,21 @@ def _available_sections() -> list[str]:
             if (sec := _session_section(s.get("course_or_topic") or ""))
         }
     )
+
+
+def _resolve_target_day(question: str):
+    q = question.lower()
+    day = today_ist()
+    if "tomorrow" in q:
+        return day + timedelta(days=1)
+    if "today" in q:
+        return day
+    for i, name in enumerate(WEEKDAYS):
+        if name in q:
+            days_ahead = (i - day.weekday()) % 7
+            days_ahead = days_ahead or 7  # "monday" said on a Monday means next Monday
+            return day + timedelta(days=days_ahead)
+    return day
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -316,7 +336,16 @@ async def _answer_chat_question(
     q_lower = question.lower()
     if any(k in q_lower for k in SCHEDULE_KEYWORDS):
         await update.message.chat.send_action("typing")
-        text = classes_command_text(refresh=False)
+        target_day = _resolve_target_day(question)
+        section = get_preferred_section()
+        sessions = filter_by_section(get_classes_on(target_day.isoformat()), section)
+        if not sessions:
+            await update.message.reply_text(
+                f"No classes found for {target_day.strftime('%a, %d %b')}."
+            )
+            return
+        label = target_day.strftime("%a, %d %b %Y")
+        text = _format_session_block(sessions, f"<b>📚 Classes — {label}</b>")
         await update.message.reply_text(text, parse_mode="HTML")
         return
 
