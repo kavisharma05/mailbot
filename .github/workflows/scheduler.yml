@@ -11,16 +11,34 @@ jobs:
     if: github.event.schedule == '*/5 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - run: curl -X POST "${{ secrets.RENDER_URL }}/tasks/watch-gmail" -H "x-task-secret: ${{ secrets.TASK_SECRET }}"
+      - name: Watch Gmail
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          TASK_SECRET: ${{ secrets.TASK_SECRET }}
+        run: |
+          curl -fsS -X POST "${RENDER_URL}/tasks/watch-gmail" \
+            -H "x-task-secret: ${TASK_SECRET}"
 
   morning_digest:
     if: github.event.schedule == '30 1 * * *'
     runs-on: ubuntu-latest
     steps:
-      - run: curl -X POST "${{ secrets.RENDER_URL }}/tasks/digest-morning" -H "x-task-secret: ${{ secrets.TASK_SECRET }}"
+      - name: Morning digest
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          TASK_SECRET: ${{ secrets.TASK_SECRET }}
+        run: |
+          curl -fsS -X POST "${RENDER_URL}/tasks/digest-morning" \
+            -H "x-task-secret: ${TASK_SECRET}"
 
   evening_digest:
     if: github.event.schedule == '30 14 * * *'
     runs-on: ubuntu-latest
     steps:
-      - run: curl -X POST "${{ secrets.RENDER_URL }}/tasks/digest-evening" -H "x-task-secret: ${{ secrets.TASK_SECRET }}"
+      - name: Evening digest
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          TASK_SECRET: ${{ secrets.TASK_SECRET }}
+        run: |
+          curl -fsS -X POST "${RENDER_URL}/tasks/digest-evening" \
+            -H "x-task-secret: ${TASK_SECRET}"
