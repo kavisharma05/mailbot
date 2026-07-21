@@ -165,7 +165,7 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SERVICE_KEY` | Supabase service role key |
 | `TASK_SECRET` | Protects `/tasks/watch-gmail`, `/tasks/backfill`, and digest endpoints |
-| `STUDENT_NAME` | Sign-off name for composed emails |
+| `STUDENT_NAME` | Sign-off name for composed emails; also used to find your row on marksheets in chat Q&A (set this to match how your name appears on grade PDFs/Excel) |
 | `RENDER_URL` | Public URL (for set_webhook.py) |
 | `OWNER_DM_ALL_MAIL` | `true` to DM owner for every email including newsletters (default: false) |
 | `REMIND_AGAIN_HOURS` | Hours until REMIND AGAIN re-alerts (default: 4) |

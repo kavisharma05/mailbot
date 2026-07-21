@@ -11,6 +11,7 @@ from bot.telegram_app import build_telegram_application, register_bot_commands
 from config import get_settings
 from services.db import check_db_health
 from services.digest import run_evening_digest, run_morning_digest
+from services.telegram_dedupe import should_process_update
 from services.watcher import (
     WATCHER_INTERVAL_SECONDS,
     run_due_reminders,
@@ -160,6 +161,9 @@ async def telegram_webhook(secret: str, request: Request) -> Response:
 
     data = await request.json()
     update = Update.de_json(data, ptb_app.bot)
+    if not await should_process_update(update.update_id):
+        logger.info("Skipping duplicate Telegram update_id=%s", update.update_id)
+        return Response(status_code=200)
     await ptb_app.process_update(update)
     return Response(status_code=200)
 

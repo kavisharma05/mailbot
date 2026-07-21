@@ -149,13 +149,15 @@ def list_message_summaries(
     max_results: int = 40,
     include_body: bool = False,
     body_chars: int = 1200,
+    load_attachments: bool = False,
+    attachment_chars: int = 6000,
 ) -> list[dict[str, Any]]:
-    """List recent matching messages with sender/subject/time (optional body)."""
+    """List recent matching messages with sender/subject/time (optional body/attachments)."""
     ids = search_message_ids(query, max_results=max_results)
     summaries: list[dict[str, Any]] = []
     for message_id in ids:
         try:
-            details = get_message_details(message_id, load_attachments=False)
+            details = get_message_details(message_id, load_attachments=load_attachments)
         except Exception as exc:
             logger.warning("Failed loading message %s: %s", message_id, exc)
             continue
@@ -167,6 +169,15 @@ def list_message_summaries(
         }
         if include_body:
             item["body"] = (details.get("body") or "")[:body_chars]
+        if load_attachments:
+            attachments = details.get("attachments") or []
+            if attachments:
+                item["attachment_filenames"] = [
+                    a.get("filename") for a in attachments if a.get("filename")
+                ]
+            attach_text = (details.get("attachment_text") or "").strip()
+            if attach_text:
+                item["attachment_text"] = attach_text[:attachment_chars]
         summaries.append(item)
     return summaries
 

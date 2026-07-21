@@ -6,6 +6,7 @@ from typing import Any
 
 from ai.client import call_json, call_text, get_last_groq_error
 from ai.prompts import ASSISTANT_PROMPT, GMAIL_QUERY_PROMPT, VERIFIED_ASSISTANT_PROMPT
+from config import get_settings
 from gmail_api.client import (
     count_messages,
     get_message_details,
@@ -27,7 +28,10 @@ _MAX_EMAILS = 8
 _MAX_MAILBOX_EMAILS = 25
 _BODY_CHARS = 1500
 _MAILBOX_BODY_CHARS = 1800
-_MAX_USER_CHARS = 9000
+_ATTACHMENT_CHARS = 6000
+_ATTACHMENT_CHARS_PER_EMAIL = 3500
+_MAX_ATTACHMENT_EMAILS = 3
+_MAX_USER_CHARS = 14000
 _PASTED_CHARS = 1800
 _MAX_ITEMS = 20
 
@@ -123,6 +127,10 @@ _PERSON_STOP = {
     "anyone",
     "someone",
     "professor",
+    "mam",
+    "sir",
+    "ma'am",
+    "maam",
 }
 
 
@@ -207,6 +215,23 @@ def _extract_person_query(question: str) -> str | None:
         if parts:
             return " ".join(parts)
 
+    # Casual professor forms: "shanthi mam", "marks from santhi mam", "in shanthi mam's class"
+    m = re.search(
+        r"\b([A-Za-z][A-Za-z.'-]+)\s+(?:mam|ma'am|maam|sir)\b",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+
+    m = re.search(
+        r"\b(?:in|from|for)\s+([A-Za-z][A-Za-z.'-]+)(?:'s)?\s+(?:class|course|subject|mail|email)\b",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+
     # "what did Saleena Khan say" / "Saleena's mail"
     m = re.search(
         r"(?:what did|did)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:say|write|mention|send)",
@@ -223,6 +248,41 @@ def _extract_person_query(question: str) -> str | None:
         return m.group(1).strip()
 
     return None
+
+
+def _wants_attachment_text(question: str) -> bool:
+    """True when the answer likely lives in PDF/Excel attachments (marks, results, etc.)."""
+    q = question.lower()
+    return any(
+        w in q
+        for w in (
+            "mark",
+            "marks",
+            "marksheet",
+            "grade",
+            "grades",
+            "score",
+            "scores",
+            "result",
+            "results",
+            "cgpa",
+            "sgpa",
+            "gpa",
+            "percentile",
+            "rank",
+            "attachment",
+            "attached",
+            "pdf",
+            "excel",
+            "sheet",
+            "what did i get",
+            "what i got",
+            "my score",
+            "my grade",
+            "my marks",
+            "my result",
+        )
+    )
 
 
 def _gmail_day_bounds_query(day: datetime | None = None) -> str:
@@ -285,7 +345,7 @@ def _build_mailbox_queries(question: str) -> list[str]:
 
 def _wants_mail_bodies(question: str) -> bool:
     q = question.lower()
-    return any(
+    return _wants_attachment_text(question) or any(
         w in q
         for w in (
             "said",
@@ -306,6 +366,71 @@ def _wants_mail_bodies(question: str) -> bool:
     )
 
 
+def _email_for_prompt(
+    details: dict[str, Any],
+    *,
+    body_chars: int = _BODY_CHARS,
+    attachment_chars: int = _ATTACHMENT_CHARS,
+    include_attachments: bool = True,
+) -> dict[str, Any]:
+    """Build a slim email dict for LLM context, optionally including attachment text."""
+    item: dict[str, Any] = {
+        "message_id": details.get("message_id"),
+        "subject": details.get("subject"),
+        "sender": details.get("sender"),
+        "received_at": details.get("received_at"),
+        "body": (details.get("body") or "")[:body_chars],
+    }
+    if include_attachments:
+        attachments = details.get("attachments") or []
+        if attachments:
+            item["attachment_filenames"] = [
+                a.get("filename") for a in attachments if a.get("filename")
+            ]
+        attach_text = (details.get("attachment_text") or "").strip()
+        if attach_text:
+            item["attachment_text"] = attach_text[:attachment_chars]
+    return item
+
+
+def _apply_attachment_budget(
+    emails: list[dict[str, Any]],
+    *,
+    wants_attachments: bool,
+) -> list[dict[str, Any]]:
+    """Keep attachment text on top-N emails only; cap chars per email."""
+    if not wants_attachments or not emails:
+        return emails
+
+    out: list[dict[str, Any]] = []
+    for i, mail in enumerate(emails):
+        m = dict(mail)
+        if i < _MAX_ATTACHMENT_EMAILS:
+            mid = m.get("message_id")
+            attach_text = (m.get("attachment_text") or "").strip()
+            if mid and not attach_text:
+                try:
+                    details = get_message_details(mid, load_attachments=True)
+                    enriched = _email_for_prompt(
+                        details,
+                        body_chars=max(len(m.get("body") or ""), _BODY_CHARS),
+                        attachment_chars=_ATTACHMENT_CHARS_PER_EMAIL,
+                        include_attachments=True,
+                    )
+                    if m.get("body"):
+                        enriched["body"] = m["body"]
+                    m.update(enriched)
+                except Exception as exc:
+                    logger.warning("Attachment enrich failed for %s: %s", mid, exc)
+            elif attach_text:
+                m["attachment_text"] = attach_text[:_ATTACHMENT_CHARS_PER_EMAIL]
+        else:
+            m.pop("attachment_text", None)
+            m.pop("attachment_filenames", None)
+        out.append(m)
+    return out
+
+
 def _gather_mailbox_context(
     question: str,
     *,
@@ -315,6 +440,7 @@ def _gather_mailbox_context(
     queries = _build_mailbox_queries(question)
     primary = queries[0]
     wants_bodies = force_bodies or _wants_mail_bodies(question) or "whom" in question.lower() or "who" in question.lower()
+    wants_attachments = force_bodies or _wants_attachment_text(question)
 
     try:
         stats = count_messages(primary, hard_cap=300)
@@ -331,6 +457,8 @@ def _gather_mailbox_context(
                 max_results=_MAX_MAILBOX_EMAILS,
                 include_body=force_bodies or wants_bodies or "how many" not in question.lower(),
                 body_chars=_MAILBOX_BODY_CHARS if wants_bodies or force_bodies else 400,
+                load_attachments=False,
+                attachment_chars=_ATTACHMENT_CHARS_PER_EMAIL,
             )
         except Exception as exc:
             logger.warning("list_message_summaries failed for %r: %s", query, exc)
@@ -363,6 +491,8 @@ def _gather_mailbox_context(
         ],
         "person_filter": _extract_person_query(question),
     }
+    if wants_attachments:
+        emails = _apply_attachment_budget(emails, wants_attachments=True)
     return stats, emails
 
 
@@ -573,6 +703,7 @@ def _fetch_relevant_emails(question: str, pasted_email: str | None = None) -> li
     queries = build_gmail_queries(question, pasted_email=pasted_email)
     seen_ids: set[str] = set()
     emails: list[dict[str, Any]] = []
+    wants_attachments = _wants_attachment_text(question)
 
     for query in queries:
         if len(emails) >= _MAX_EMAILS:
@@ -588,21 +719,24 @@ def _fetch_relevant_emails(question: str, pasted_email: str | None = None) -> li
                 continue
             seen_ids.add(message_id)
             try:
-                details = get_message_details(message_id)
+                load_attach = wants_attachments and len(emails) < _MAX_ATTACHMENT_EMAILS
+                details = get_message_details(message_id, load_attachments=load_attach)
             except Exception as exc:
                 logger.warning("Fetching message %s failed: %s", message_id, exc)
                 continue
             emails.append(
-                {
-                    "subject": details.get("subject"),
-                    "sender": details.get("sender"),
-                    "received_at": details.get("received_at"),
-                    "body": (details.get("body") or "")[:_BODY_CHARS],
-                }
+                _email_for_prompt(
+                    details,
+                    body_chars=_BODY_CHARS,
+                    attachment_chars=_ATTACHMENT_CHARS_PER_EMAIL,
+                    include_attachments=load_attach,
+                )
             )
             if len(emails) >= _MAX_EMAILS:
                 break
 
+    if wants_attachments:
+        emails = _apply_attachment_budget(emails, wants_attachments=True)
     return emails
 
 
@@ -743,11 +877,17 @@ def _build_user_prompt(
         )
 
     parts.append(f"\nMatching Gmail emails (JSON):\n{json.dumps(emails, default=str)}")
-    parts.append(f"\nStudent question:\n{question}")
 
-    text = "\n".join(parts)
+    header = "\n".join(parts)
+    tail = f"\nStudent question:\n{question}"
+    text = header + tail
     if len(text) > _MAX_USER_CHARS:
-        text = text[:_MAX_USER_CHARS] + "\n...[truncated]"
+        truncate_note = "\n...[truncated]"
+        budget = _MAX_USER_CHARS - len(tail) - len(truncate_note)
+        if budget < 200:
+            budget = 200
+        header = header[:budget] + truncate_note
+        text = header + tail
     return text
 
 
@@ -866,9 +1006,11 @@ def _gather_context_for_question(
     stats: dict[str, Any] | None = None
     emails: list[dict[str, Any]] = []
 
+    wants_marks = _wants_attachment_text(question)
     wants_mailbox = (
         _is_mailbox_question(question)
         or bool(_extract_person_query(question))
+        or wants_marks
         or any(w in q for w in ("mail", "email", "inbox", "sender", "whom", "who sent", "said", "wrote"))
     )
     wants_due = _is_due_list_question(question) or any(
@@ -915,7 +1057,9 @@ def answer_question(
     now_str = ref.strftime("%Y-%m-%d %H:%M %Z")
 
     if verified:
-        system = VERIFIED_ASSISTANT_PROMPT.format(today=today, now=now_str)
+        system = VERIFIED_ASSISTANT_PROMPT.format(
+            today=today, now=now_str, student_name=get_settings().student_name
+        )
         try:
             stats, emails = _gather_mailbox_context(question, force_bodies=True)
         except Exception as exc:
@@ -938,7 +1082,9 @@ def answer_question(
             return answer.strip()
         return _format_mailbox_fallback(stats or {}, emails, question)
 
-    system = ASSISTANT_PROMPT.format(today=today, now=now_str)
+    system = ASSISTANT_PROMPT.format(
+        today=today, now=now_str, student_name=get_settings().student_name
+    )
 
     stats, emails = _gather_context_for_question(
         question, scan_gmail=scan_gmail, pasted_email=pasted_email
