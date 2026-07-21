@@ -180,6 +180,7 @@ Today: {today}. Now: {now}.
 
 SCHEDULE_PROMPT = """Extract class timetable sessions from a college email and/or attachment text.
 The attachment text (PDF/Excel/Word) is usually the real timetable — prefer it over the email body.
+PDF text is extracted in LAYOUT mode: horizontal position = time column.
 
 Timezone: Asia/Kolkata (IST).
 Email received / reference date: {today}
@@ -205,10 +206,14 @@ Return ONLY strict JSON:
 Rules:
 - Include EVERY class/session for EVERY day in the timetable (Mon through Sat if present).
 - Never stop after the first day — a Term-I grid usually spans several calendar dates.
-- Prefer room / venue / classroom / LH / CR fields when present.
+- TIME COLUMNS (left → right). Assign start/end from the column the course sits under:
+  09:45–11:15 | 11:30–13:00 | 14:00–15:30 | 15:45–17:15 | 18:00–19:30
+- If a cell shows a shorter override (e.g. 11:30–12:30 or 15:45–16:45), use THAT exact range.
+- Courses further RIGHT on the same line are LATER columns — never give two far-apart
+  courses the same start time.
+- Prefer room / venue (Arthum#N, AEC Hall, Tiered#N) from the Venue column or same row.
+- Faculty initials are usually in parentheses under the course, e.g. (SK), (SS).
 - Skip empty slots, lunch, and breaks.
-- If a cell only has a course code, still include it.
-- PDF text may be messy/column-jumbled — still recover course + time + room when possible.
 - Map day labels like "Mon 20.07.26" / "Tue 21.07.26" to session_date YYYY-MM-DD.
 - If the header shows a range like [20.07.2026 - 25.07.2026], cover that whole range.
 - If dates cannot be resolved, omit that session rather than inventing.

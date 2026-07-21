@@ -3,36 +3,10 @@
 from __future__ import annotations
 
 import html
-import json
 import logging
 import re
-import time
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any
-
-# #region agent log
-_DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent / "debug-d53dec.log"
-
-
-def _agent_log(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
-    try:
-        payload = {
-            "sessionId": "d53dec",
-            "runId": "pre-fix",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, default=str) + "\n")
-    except Exception:
-        pass
-
-
-# #endregion
 
 from ai.client import call_json
 from ai.prompts import SCHEDULE_PROMPT
@@ -138,37 +112,12 @@ def project_sessions_to_day(sessions: list[dict[str, Any]], target_day: date) ->
         if _session_date_value(s) == target_day
     ]
     if exact:
-        # #region agent log
-        _agent_log(
-            "B",
-            "schedule.py:project_sessions_to_day",
-            "exact date match",
-            {
-                "target": target_day.isoformat(),
-                "exact_count": len(exact),
-                "mode": "exact",
-            },
-        )
-        # #endregion
         return sorted(exact, key=lambda x: x.get("start_time") or "")
 
     stored_dates = _template_date_set(sessions)
     stored_weekdays = {d.weekday() for d in stored_dates}
     # Single-day (or single-weekday) dumps are dated snapshots — do not project
     if len(stored_weekdays) <= 1:
-        # #region agent log
-        _agent_log(
-            "A",
-            "schedule.py:project_sessions_to_day",
-            "skip weekday projection for single-day template",
-            {
-                "target": target_day.isoformat(),
-                "stored_dates": sorted(d.isoformat() for d in stored_dates),
-                "mode": "no_project",
-                "projected_count": 0,
-            },
-        )
-        # #endregion
         return []
 
     target_weekday = target_day.weekday()
@@ -178,21 +127,6 @@ def project_sessions_to_day(sessions: list[dict[str, Any]], target_day: date) ->
         if session_day is None or session_day.weekday() != target_weekday:
             continue
         projected.append({**session, "session_date": target_day.isoformat()})
-    # #region agent log
-    _agent_log(
-        "A",
-        "schedule.py:project_sessions_to_day",
-        "weekday projection",
-        {
-            "target": target_day.isoformat(),
-            "weekday": target_weekday,
-            "projected_count": len(projected),
-            "template_size": len(sessions),
-            "template_dates": sorted(d.isoformat() for d in stored_dates)[:20],
-            "mode": "weekday",
-        },
-    )
-    # #endregion
     return sorted(projected, key=lambda x: x.get("start_time") or "")
 
 
@@ -348,6 +282,240 @@ def _split_timetable_day_chunks(attachment_text: str) -> list[tuple[date, str]]:
     return chunks
 
 
+_TIME_RANGE_RE = re.compile(
+    r"(?P<h1>\d{1,2})[.:](?P<m1>\d{2})\s*(?P<p1>am|pm)"
+    r"\s*-\s*"
+    r"(?P<h2>\d{1,2})[.:](?P<m2>\d{2})\s*(?P<p2>am|pm)?",
+    re.IGNORECASE,
+)
+_COURSE_CELL_RE = re.compile(
+    r"(?P<course>[A-Z][A-Z0-9/-]{1,8})\s*-\s*Sec\.?\s*(?P<section>[A-Za-z])\s*-\s*(?P<slot>\d+)",
+    re.IGNORECASE,
+)
+_ROOM_RE = re.compile(
+    r"(Arthum\s*#?\s*\d+|Tiered\s*#?\s*\d+|AEC\s*Hall|LH\s*\d+|CR\s*\d+)",
+    re.IGNORECASE,
+)
+_FACULTY_RE = re.compile(r"\(\s*([A-Z]{1,4})\s*\)")
+
+
+def _to_hhmm(hour: int, minute: int, meridiem: str | None) -> str:
+    h = hour
+    mer = (meridiem or "").lower()
+    if mer == "pm" and h < 12:
+        h += 12
+    if mer == "am" and h == 12:
+        h = 0
+    return f"{h:02d}:{minute:02d}"
+
+
+def _parse_time_range(text: str) -> tuple[str, str] | None:
+    m = _TIME_RANGE_RE.search(text)
+    if not m:
+        return None
+    start = _to_hhmm(int(m.group("h1")), int(m.group("m1")), m.group("p1"))
+    end_mer = m.group("p2") or m.group("p1")
+    end = _to_hhmm(int(m.group("h2")), int(m.group("m2")), end_mer)
+    return start, end
+
+
+def _extract_time_columns(attachment_text: str) -> list[dict[str, Any]]:
+    """Read the PDF header row into ordered time columns with character anchors."""
+    defaults = [
+        {"start_col": 30, "start_time": "09:45", "end_time": "11:15"},
+        {"start_col": 59, "start_time": "11:30", "end_time": "13:00"},
+        {"start_col": 102, "start_time": "14:00", "end_time": "15:30"},
+        {"start_col": 134, "start_time": "15:45", "end_time": "17:15"},
+        {"start_col": 164, "start_time": "18:00", "end_time": "19:30"},
+    ]
+    header = ""
+    for line in (attachment_text or "").splitlines():
+        if re.search(r"\d{1,2}[.:]\d{2}\s*am", line, re.I) and (
+            "venue" in line.lower() or line.lower().count("am") + line.lower().count("pm") >= 3
+        ):
+            header = line
+            break
+    if not header:
+        return defaults
+
+    cols: list[dict[str, Any]] = []
+    for m in _TIME_RANGE_RE.finditer(header):
+        start = _to_hhmm(int(m.group("h1")), int(m.group("m1")), m.group("p1"))
+        end_mer = m.group("p2") or m.group("p1")
+        end = _to_hhmm(int(m.group("h2")), int(m.group("m2")), end_mer)
+        # Skip lunch / break fragments (e.g. 1.00pm–2.00pm)
+        if start == "13:00":
+            continue
+        cols.append({"start_col": m.start(), "start_time": start, "end_time": end})
+
+    # Header often splits "1.00pm -" / "2.00pm - 3.30pm"; ensure afternoon slot exists
+    if cols and not any(c["start_time"] == "14:00" for c in cols):
+        m2 = re.search(r"2[.:]00\s*pm\s*-\s*3[.:]30\s*pm", header, re.I)
+        if m2:
+            cols.append(
+                {"start_col": m2.start(), "start_time": "14:00", "end_time": "15:30"}
+            )
+    cols.sort(key=lambda c: c["start_col"])
+    return cols or defaults
+
+
+def _column_for_offset(columns: list[dict[str, Any]], col: int) -> dict[str, Any] | None:
+    if not columns:
+        return None
+    # Midpoints between column starts
+    best = columns[0]
+    best_dist = abs(col - int(best["start_col"]))
+    for c in columns[1:]:
+        dist = abs(col - int(c["start_col"]))
+        if dist < best_dist:
+            best = c
+            best_dist = dist
+    return best
+
+
+def _find_course_in_chunk(chunk: str, course: str) -> re.Match[str] | None:
+    cell = _COURSE_CELL_RE.search(course or "")
+    if cell:
+        pat = re.compile(
+            rf"{re.escape(cell.group('course'))}\s*-\s*Sec\.?\s*"
+            rf"{re.escape(cell.group('section'))}\s*-\s*{re.escape(cell.group('slot'))}",
+            re.IGNORECASE,
+        )
+        hit = pat.search(chunk)
+        if hit:
+            return hit
+    needle = re.sub(r"\s+", r"\\s*", re.escape((course or "").strip()[:40]))
+    if needle:
+        hit = re.search(needle, chunk, re.IGNORECASE)
+        if hit:
+            return hit
+    return None
+
+
+def _nearby_override_time(chunk: str, abs_pos: int, col: int) -> tuple[str, str] | None:
+    """Prefer a short override printed in the same column near the course."""
+    line_start = chunk.rfind("\n", 0, abs_pos) + 1
+    line_end = chunk.find("\n", abs_pos)
+    if line_end < 0:
+        line_end = len(chunk)
+    # Search this line and the next 2 lines in a column window
+    region_end = line_end
+    for _ in range(2):
+        nxt = chunk.find("\n", region_end + 1)
+        if nxt < 0:
+            region_end = len(chunk)
+            break
+        region_end = nxt
+    region = chunk[line_start:region_end]
+    best: tuple[str, str] | None = None
+    best_dist = 10**9
+    for m in _TIME_RANGE_RE.finditer(region):
+        # Approximate column within the multi-line region by position on its line
+        abs_m = line_start + m.start()
+        m_line_start = chunk.rfind("\n", 0, abs_m) + 1
+        m_col = abs_m - m_line_start
+        dist = abs(m_col - col)
+        if dist > 28:
+            continue
+        parsed = _parse_time_range(m.group(0))
+        if parsed and dist < best_dist:
+            best = parsed
+            best_dist = dist
+    return best
+
+
+def _nearby_room(chunk: str, abs_pos: int) -> str | None:
+    line_start = chunk.rfind("\n", 0, abs_pos) + 1
+    # Venue is usually on the same row or the next line, left side
+    line_end = chunk.find("\n", abs_pos)
+    if line_end < 0:
+        line_end = len(chunk)
+    window = chunk[max(0, line_start - 80) : min(len(chunk), line_end + 120)]
+    m = _ROOM_RE.search(window)
+    if not m:
+        return None
+    raw = re.sub(r"\s+", " ", m.group(1)).strip()
+    raw = re.sub(r"(Arthum|Tiered)\s*#\s*", r"\1#", raw, flags=re.I)
+    return raw
+
+
+def _correct_session_times_from_layout(
+    sessions: list[dict[str, Any]],
+    *,
+    chunk: str,
+    columns: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Snap LLM session times to PDF layout columns (character position)."""
+    if not sessions or not chunk or not columns:
+        return sessions
+    corrected: list[dict[str, Any]] = []
+    for session in sessions:
+        course = str(session.get("course_or_topic") or "")
+        hit = _find_course_in_chunk(chunk, course)
+        if not hit:
+            corrected.append(session)
+            continue
+        line_start = chunk.rfind("\n", 0, hit.start()) + 1
+        col = hit.start() - line_start
+        slot = _column_for_offset(columns, col)
+        override = _nearby_override_time(chunk, hit.start(), col)
+        start_time, end_time = override if override else (
+            (slot["start_time"], slot["end_time"]) if slot else (None, None)
+        )
+        updated = {**session}
+        if start_time:
+            updated["start_time"] = start_time
+        if end_time:
+            updated["end_time"] = end_time
+        if not updated.get("room"):
+            room = _nearby_room(chunk, hit.start())
+            if room:
+                updated["room"] = room
+        # Faculty under the course, same column
+        if not updated.get("faculty") or str(updated.get("faculty")).startswith("("):
+            line_end = chunk.find("\n", hit.start())
+            if line_end < 0:
+                line_end = len(chunk)
+            next_end = chunk.find("\n", line_end + 1)
+            if next_end < 0:
+                next_end = len(chunk)
+            under = chunk[line_end:next_end]
+            # faculty on next line near same column
+            for fm in _FACULTY_RE.finditer(under):
+                f_col = (line_end + 1 + fm.start()) - (line_end + 1)
+                # fm.start() relative to under; under starts at line_end
+                abs_f = line_end + fm.start()
+                f_line_start = chunk.rfind("\n", 0, abs_f) + 1
+                f_col = abs_f - f_line_start
+                if abs(f_col - col) <= 30:
+                    updated["faculty"] = fm.group(1)
+                    break
+        corrected.append(updated)
+    return corrected
+
+
+def _correct_sessions_against_pdf(
+    sessions: list[dict[str, Any]],
+    attachment_text: str,
+) -> list[dict[str, Any]]:
+    """Re-align all sessions to PDF column times using the full attachment text."""
+    if not sessions or not attachment_text:
+        return sessions
+    columns = _extract_time_columns(attachment_text)
+    day_chunks = {d: c for d, c in _split_timetable_day_chunks(attachment_text)}
+    out: list[dict[str, Any]] = []
+    for session in sessions:
+        day = _session_date_value(session)
+        chunk = day_chunks.get(day) if day else None
+        if not chunk:
+            chunk = attachment_text
+        fixed = _correct_session_times_from_layout(
+            [session], chunk=chunk, columns=columns
+        )[0]
+        out.append(fixed)
+    return out
+
+
 def _normalize_parsed_sessions(
     parsed: dict[str, Any] | None,
     *,
@@ -365,6 +533,9 @@ def _normalize_parsed_sessions(
         start = raw.get("start_time")
         if not session_date or not course or not start:
             continue
+        faculty = raw.get("faculty")
+        if isinstance(faculty, str):
+            faculty = faculty.strip().strip("()")
         sessions.append(
             {
                 "course_or_topic": str(course)[:200],
@@ -372,7 +543,7 @@ def _normalize_parsed_sessions(
                 "start_time": str(start)[:5],
                 "end_time": (str(raw["end_time"])[:5] if raw.get("end_time") else None),
                 "room": (str(raw["room"])[:120] if raw.get("room") else None),
-                "faculty": (str(raw["faculty"])[:120] if raw.get("faculty") else None),
+                "faculty": (str(faculty)[:120] if faculty else None),
                 "notes": (str(raw["notes"])[:300] if raw.get("notes") else None),
                 "week_start": (str(week_start)[:10] if week_start else None),
             }
@@ -387,6 +558,7 @@ def _llm_parse_schedule_chunk(
     chunk: str,
     ref: date,
     force_date: date | None = None,
+    columns: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     system = SCHEDULE_PROMPT.format(today=ref.isoformat())
     date_hint = (
@@ -395,18 +567,27 @@ def _llm_parse_schedule_chunk(
         if force_date
         else ""
     )
+    col_hint = ""
+    if columns:
+        parts = [
+            f"{c['start_time']}-{c['end_time']} (text col ~{c['start_col']})"
+            for c in columns
+        ]
+        col_hint = "Detected PDF time columns (left→right): " + " | ".join(parts) + "\n"
     user = (
         f"Subject: {subject}\n\n"
         f"Email body:\n{body[:2000]}\n"
-        f"{date_hint}\n"
-        "Typical Term-I columns (use these when the chunk is column-jumbled):\n"
-        "09:45-11:15, 11:30-13:00 (sometimes 11:30-12:30), 14:00-15:30 "
-        "(sometimes 14:00-15:00), 15:45-17:15 (sometimes 15:45-16:45), 18:00-19:30.\n"
-        "Map each course to the nearest matching column; include room (Arthum#N / AEC Hall) "
-        "and faculty initials in parentheses when present.\n\n"
-        f"Timetable text:\n{chunk[:8000]}"
+        f"{date_hint}"
+        f"{col_hint}\n"
+        "Use horizontal position in the layout text to pick the correct column times. "
+        "Courses on the right are later. Include room (Arthum#N / AEC Hall / Tiered#N) "
+        "and faculty initials.\n\n"
+        f"Timetable text (layout-preserved from PDF):\n{chunk[:8000]}"
     )
-    return _normalize_parsed_sessions(call_json(system, user), force_date=force_date)
+    sessions = _normalize_parsed_sessions(call_json(system, user), force_date=force_date)
+    return _correct_session_times_from_layout(
+        sessions, chunk=chunk, columns=columns or _extract_time_columns(chunk)
+    )
 
 
 def parse_schedule_sessions(
@@ -425,18 +606,7 @@ def parse_schedule_sessions(
             pass
 
     day_chunks = _split_timetable_day_chunks(attachment_text or "")
-    # #region agent log
-    _agent_log(
-        "F",
-        "schedule.py:parse_schedule_sessions",
-        "day chunks detected",
-        {
-            "chunk_count": len(day_chunks),
-            "chunk_dates": [d.isoformat() for d, _ in day_chunks],
-            "att_len": len(attachment_text or ""),
-        },
-    )
-    # #endregion
+    columns = _extract_time_columns(attachment_text or "")
 
     # Prefer per-day parse when the PDF clearly has multiple dated day blocks
     if len(day_chunks) >= 2:
@@ -448,27 +618,18 @@ def parse_schedule_sessions(
                 chunk=chunk,
                 ref=ref,
                 force_date=day,
+                columns=columns,
             )
             merged.extend(part)
-        # #region agent log
-        _agent_log(
-            "F",
-            "schedule.py:parse_schedule_sessions",
-            "per-day parse result",
-            {
-                "session_count": len(merged),
-                "dates": sorted({s.get("session_date") for s in merged if s.get("session_date")}),
-            },
-        )
-        # #endregion
         if merged:
-            return merged
+            return _correct_sessions_against_pdf(merged, attachment_text or "")
 
     sessions = _llm_parse_schedule_chunk(
         subject=subject,
         body=body,
         chunk=(attachment_text or "")[:10000] or body[:5000],
         ref=ref,
+        columns=columns,
     )
     unique_dates = {s.get("session_date") for s in sessions if s.get("session_date")}
     # Fallback: full parse collapsed to one day but PDF has more day markers
@@ -481,11 +642,12 @@ def parse_schedule_sessions(
                 chunk=chunk,
                 ref=ref,
                 force_date=day,
+                columns=columns,
             )
             merged.extend(part)
         if merged:
-            return merged
-    return sessions
+            return _correct_sessions_against_pdf(merged, attachment_text or "")
+    return _correct_sessions_against_pdf(sessions, attachment_text or "")
 
 
 def store_schedule_sessions(
@@ -567,11 +729,51 @@ def _cached_or_stored_sessions(message_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _session_time_fingerprint(sessions: list[dict[str, Any]]) -> set[tuple[str, str, str]]:
+    return {
+        (
+            str(s.get("session_date") or ""),
+            str(s.get("course_or_topic") or ""),
+            str(s.get("start_time") or ""),
+        )
+        for s in sessions
+    }
+
+
+def _realign_cached_with_pdf(message_id: str, info: dict[str, Any]) -> dict[str, Any]:
+    """Reload PDF layout and snap cached session times to columns (no LLM)."""
+    try:
+        details = get_message_details(message_id, load_attachments=True)
+    except Exception as exc:
+        logger.warning("Could not reload PDF for time realign %s: %s", message_id, exc)
+        return info
+    attachment_text = details.get("attachment_text") or ""
+    if not attachment_text:
+        return info
+    original = list(info.get("sessions") or [])
+    corrected = _correct_sessions_against_pdf(original, attachment_text)
+    if _session_time_fingerprint(corrected) != _session_time_fingerprint(original):
+        logger.info("Realigning schedule times from PDF layout for %s", message_id)
+        stored = store_schedule_sessions(corrected, gmail_message_id=message_id)
+        info = {
+            **info,
+            "sessions": stored or corrected,
+            "from_cache": False,
+            "times_realigned": True,
+            "subject": info.get("subject") or details.get("subject"),
+            "received_at": info.get("received_at") or details.get("received_at"),
+            "had_attachment_text": True,
+        }
+        _parse_cache[message_id] = info
+    return info
+
+
 def refresh_schedule_from_gmail() -> dict[str, Any]:
     """
     Find the latest timetable mail, read body + PDF/Excel, parse sessions, store them.
     Returns metadata + sessions (even if DB insert fails).
-    Skips LLM when this message was already parsed successfully.
+    Skips LLM when this message was already parsed successfully, but still
+    realigns times from the PDF layout columns.
     """
     candidates = find_latest_schedule_message_ids()
     if not candidates:
@@ -582,7 +784,7 @@ def refresh_schedule_from_gmail() -> dict[str, Any]:
         reused = _cached_or_stored_sessions(message_id)
         if reused:
             logger.info("Reusing cached schedule parse for message %s", message_id)
-            return reused
+            return _realign_cached_with_pdf(message_id, reused)
 
         try:
             details = get_message_details(message_id, load_attachments=True)
@@ -784,41 +986,6 @@ def classes_command_text(*, refresh: bool = True, section: str | None = None) ->
             info = {"ok": False, "reason": str(exc), "sessions": []}
 
     template = load_template_sessions(info if info.get("sessions") else None)
-    # #region agent log
-    _agent_log(
-        "D",
-        "schedule.py:classes_command_text",
-        "template loaded",
-        {
-            "today": day.isoformat(),
-            "section": section,
-            "refresh_ok": bool(info.get("ok")),
-            "refresh_reason": info.get("reason"),
-            "from_cache": info.get("from_cache"),
-            "message_id": info.get("message_id"),
-            "subject": (info.get("subject") or "")[:120],
-            "template_count": len(template),
-            "template_dates": sorted(
-                {str(s.get("session_date")) for s in template if s.get("session_date")}
-            )[:20],
-            "template_weekdays": sorted(
-                {
-                    _session_date_value(s).weekday()
-                    for s in template
-                    if _session_date_value(s) is not None
-                }
-            ),
-            "sample": [
-                {
-                    "date": s.get("session_date"),
-                    "course": (s.get("course_or_topic") or "")[:60],
-                    "start": s.get("start_time"),
-                }
-                for s in template[:8]
-            ],
-        },
-    )
-    # #endregion
 
     today_text = ""
     try:
@@ -827,27 +994,11 @@ def classes_command_text(*, refresh: bool = True, section: str | None = None) ->
         logger.warning("format_today_classes failed: %s", exc)
 
     if today_text:
-        # #region agent log
-        _agent_log(
-            "E",
-            "schedule.py:classes_command_text",
-            "returned today_text",
-            {"path": "today", "len": len(today_text)},
-        )
-        # #endregion
         return today_text + _source_footer(info)
 
     if template:
         upcoming_text = format_upcoming_classes(day, days=7, section=section, template=template)
         if upcoming_text:
-            # #region agent log
-            _agent_log(
-                "E",
-                "schedule.py:classes_command_text",
-                "returned upcoming_text",
-                {"path": "upcoming", "len": len(upcoming_text)},
-            )
-            # #endregion
             return upcoming_text + _source_footer(info)
 
         label = day.strftime("%a, %d %b %Y")
