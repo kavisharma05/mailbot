@@ -176,6 +176,29 @@ def _resolve_target_day(question: str, *, fallback_iso: str | None = None):
             return date_cls(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except ValueError:
             pass
+    # "21st", "21 Jul", "for 21"
+    m = re.search(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?(?:\s*(?:of\s+)?(jan|january|feb|february|mar|march|"
+        r"apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|"
+        r"nov|november|dec|december))?\b",
+        q,
+    )
+    if m and ("class" in q or "schedule" in q or "for" in q or m.group(2)):
+        try:
+            dom = int(m.group(1))
+            if m.group(2):
+                months = {
+                    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+                    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+                    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+                    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+                }
+                month = months[m.group(2)]
+            else:
+                month = day.month
+            return date_cls(day.year, month, dom)
+        except ValueError:
+            pass
     for i, name in enumerate(WEEKDAYS):
         if name in q:
             days_ahead = (i - day.weekday()) % 7
@@ -238,6 +261,27 @@ async def _reply_schedule_for_question(
             sessions = _sessions_for_day(target_day.isoformat(), section, template=template)
         except Exception as exc:
             logger.exception("Schedule refresh failed during chat Q&A: %s", exc)
+
+    # #region agent log
+    try:
+        from services.schedule import _agent_log
+
+        _agent_log(
+            "C",
+            "handlers.py:_reply_schedule_for_question",
+            "chat schedule answer",
+            {
+                "question": question[:120],
+                "target_day": target_day.isoformat(),
+                "section": section,
+                "session_count": len(sessions),
+                "template_count": len(template or []),
+                "refreshed": refreshed,
+            },
+        )
+    except Exception:
+        pass
+    # #endregion
 
     context.user_data["last_intent"] = "schedule"
     context.user_data["last_schedule_day"] = target_day.isoformat()

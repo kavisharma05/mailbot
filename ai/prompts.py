@@ -203,11 +203,14 @@ Return ONLY strict JSON:
 }}
 
 Rules:
-- Include every class/session you can confidently extract from body OR attachment.
+- Include EVERY class/session for EVERY day in the timetable (Mon through Sat if present).
+- Never stop after the first day — a Term-I grid usually spans several calendar dates.
 - Prefer room / venue / classroom / LH / CR fields when present.
 - Skip empty slots, lunch, and breaks.
 - If a cell only has a course code, still include it.
 - PDF text may be messy/column-jumbled — still recover course + time + room when possible.
+- Map day labels like "Mon 20.07.26" / "Tue 21.07.26" to session_date YYYY-MM-DD.
+- If the header shows a range like [20.07.2026 - 25.07.2026], cover that whole range.
 - If dates cannot be resolved, omit that session rather than inventing.
 """
 

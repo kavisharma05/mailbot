@@ -3,10 +3,36 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+# #region agent log
+_DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent / "debug-d53dec.log"
+
+
+def _agent_log(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    try:
+        payload = {
+            "sessionId": "d53dec",
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+
+
+# #endregion
 
 from ai.client import call_json
 from ai.prompts import SCHEDULE_PROMPT
@@ -88,10 +114,63 @@ def _session_date_value(session: dict[str, Any]) -> date | None:
         return None
 
 
+def _template_date_set(sessions: list[dict[str, Any]]) -> set[date]:
+    dates: set[date] = set()
+    for session in sessions:
+        day = _session_date_value(session)
+        if day is not None:
+            dates.add(day)
+    return dates
+
+
 def project_sessions_to_day(sessions: list[dict[str, Any]], target_day: date) -> list[dict[str, Any]]:
-    """Map a weekly timetable template onto a calendar day by weekday."""
+    """Resolve classes for a calendar day.
+
+    Prefer exact stored dates. Only remap by weekday when the template is a true
+    multi-day weekly pattern — never invent next-week Mondays from a one-day dump.
+    """
     if not sessions:
         return []
+
+    exact = [
+        {**s, "session_date": target_day.isoformat()}
+        for s in sessions
+        if _session_date_value(s) == target_day
+    ]
+    if exact:
+        # #region agent log
+        _agent_log(
+            "B",
+            "schedule.py:project_sessions_to_day",
+            "exact date match",
+            {
+                "target": target_day.isoformat(),
+                "exact_count": len(exact),
+                "mode": "exact",
+            },
+        )
+        # #endregion
+        return sorted(exact, key=lambda x: x.get("start_time") or "")
+
+    stored_dates = _template_date_set(sessions)
+    stored_weekdays = {d.weekday() for d in stored_dates}
+    # Single-day (or single-weekday) dumps are dated snapshots — do not project
+    if len(stored_weekdays) <= 1:
+        # #region agent log
+        _agent_log(
+            "A",
+            "schedule.py:project_sessions_to_day",
+            "skip weekday projection for single-day template",
+            {
+                "target": target_day.isoformat(),
+                "stored_dates": sorted(d.isoformat() for d in stored_dates),
+                "mode": "no_project",
+                "projected_count": 0,
+            },
+        )
+        # #endregion
+        return []
+
     target_weekday = target_day.weekday()
     projected: list[dict[str, Any]] = []
     for session in sessions:
@@ -99,6 +178,21 @@ def project_sessions_to_day(sessions: list[dict[str, Any]], target_day: date) ->
         if session_day is None or session_day.weekday() != target_weekday:
             continue
         projected.append({**session, "session_date": target_day.isoformat()})
+    # #region agent log
+    _agent_log(
+        "A",
+        "schedule.py:project_sessions_to_day",
+        "weekday projection",
+        {
+            "target": target_day.isoformat(),
+            "weekday": target_weekday,
+            "projected_count": len(projected),
+            "template_size": len(sessions),
+            "template_dates": sorted(d.isoformat() for d in stored_dates)[:20],
+            "mode": "weekday",
+        },
+    )
+    # #endregion
     return sorted(projected, key=lambda x: x.get("start_time") or "")
 
 
@@ -198,38 +292,75 @@ def _attachment_names_look_like_schedule(attachments: list[dict[str, Any]]) -> b
     return False
 
 
-def parse_schedule_sessions(
-    *,
-    subject: str,
-    body: str,
-    attachment_text: str,
-    received_at: str | None,
-) -> list[dict[str, Any]]:
-    ref = today_ist()
-    if received_at:
-        try:
-            dt = datetime.fromisoformat(str(received_at).replace("Z", "+00:00"))
-            ref = dt.astimezone(IST).date()
-        except ValueError:
-            pass
+_DATE_MARK_RE = re.compile(r"(?P<d1>\d{2})\.(?P<m1>\d{2})\.(?P<y1>\d{2,4})")
+_DAY_LABEL_RE = re.compile(r"\b(?P<label>Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b", re.IGNORECASE)
 
-    system = SCHEDULE_PROMPT.format(today=ref.isoformat())
-    user = (
-        f"Subject: {subject}\n\n"
-        f"Email body:\n{body[:5000]}\n\n"
-        f"Attachment text (PDF/Excel/Word — prefer this for rooms/times):\n"
-        f"{(attachment_text or '')[:10000]}"
-    )
-    parsed = call_json(system, user)
+
+def _parse_day_marker_date(d1: str, m1: str, y1: str) -> date | None:
+    try:
+        year = int(y1)
+        if year < 100:
+            year += 2000
+        return date(year, int(m1), int(d1))
+    except ValueError:
+        return None
+
+
+def _split_timetable_day_chunks(attachment_text: str) -> list[tuple[date, str]]:
+    """Split messy PDF timetable text into (calendar_date, chunk) pairs."""
+    if not attachment_text:
+        return []
+    # Prefer DD.MM.YY markers (more reliable than day-name spacing in PDF layout)
+    date_matches = list(_DATE_MARK_RE.finditer(attachment_text))
+    markers: list[tuple[int, date]] = []
+    for match in date_matches:
+        day = _parse_day_marker_date(match.group("d1"), match.group("m1"), match.group("y1"))
+        if day is None:
+            continue
+        # Keep dates that look like day-row markers (near Mon/Tue or venue lines)
+        window = attachment_text[max(0, match.start() - 220) : match.end() + 100]
+        if _DAY_LABEL_RE.search(window) or re.search(
+            r"Arthum|Tiered|AEC Hall", window, re.I
+        ):
+            markers.append((match.start(), day))
+
+    # Dedupe by date, keep first occurrence
+    seen_dates: set[date] = set()
+    unique_markers: list[tuple[int, date]] = []
+    for pos, day in markers:
+        if day in seen_dates:
+            continue
+        seen_dates.add(day)
+        unique_markers.append((pos, day))
+    unique_markers.sort(key=lambda x: x[0])
+
+    chunks: list[tuple[date, str]] = []
+    for i, (pos, day) in enumerate(unique_markers):
+        # Back up a bit to include the day label / venue column
+        start = max(0, pos - 120)
+        end = unique_markers[i + 1][0] if i + 1 < len(unique_markers) else len(attachment_text)
+        # Don't back up into the previous chunk
+        if i > 0:
+            start = max(start, unique_markers[i - 1][0])
+        chunk = attachment_text[start:end].strip()
+        if "sec" in chunk.lower():
+            chunks.append((day, chunk))
+    return chunks
+
+
+def _normalize_parsed_sessions(
+    parsed: dict[str, Any] | None,
+    *,
+    force_date: date | None = None,
+) -> list[dict[str, Any]]:
     if not parsed or not isinstance(parsed.get("sessions"), list):
         return []
-
     week_start = parsed.get("week_start")
     sessions: list[dict[str, Any]] = []
     for raw in parsed["sessions"]:
         if not isinstance(raw, dict):
             continue
-        session_date = raw.get("session_date")
+        session_date = force_date.isoformat() if force_date else raw.get("session_date")
         course = raw.get("course_or_topic")
         start = raw.get("start_time")
         if not session_date or not course or not start:
@@ -246,6 +377,114 @@ def parse_schedule_sessions(
                 "week_start": (str(week_start)[:10] if week_start else None),
             }
         )
+    return sessions
+
+
+def _llm_parse_schedule_chunk(
+    *,
+    subject: str,
+    body: str,
+    chunk: str,
+    ref: date,
+    force_date: date | None = None,
+) -> list[dict[str, Any]]:
+    system = SCHEDULE_PROMPT.format(today=ref.isoformat())
+    date_hint = (
+        f"\nThis chunk is ONLY for {force_date.isoformat()} "
+        f"({force_date.strftime('%A')}). Set every session_date to that day.\n"
+        if force_date
+        else ""
+    )
+    user = (
+        f"Subject: {subject}\n\n"
+        f"Email body:\n{body[:2000]}\n"
+        f"{date_hint}\n"
+        "Typical Term-I columns (use these when the chunk is column-jumbled):\n"
+        "09:45-11:15, 11:30-13:00 (sometimes 11:30-12:30), 14:00-15:30 "
+        "(sometimes 14:00-15:00), 15:45-17:15 (sometimes 15:45-16:45), 18:00-19:30.\n"
+        "Map each course to the nearest matching column; include room (Arthum#N / AEC Hall) "
+        "and faculty initials in parentheses when present.\n\n"
+        f"Timetable text:\n{chunk[:8000]}"
+    )
+    return _normalize_parsed_sessions(call_json(system, user), force_date=force_date)
+
+
+def parse_schedule_sessions(
+    *,
+    subject: str,
+    body: str,
+    attachment_text: str,
+    received_at: str | None,
+) -> list[dict[str, Any]]:
+    ref = today_ist()
+    if received_at:
+        try:
+            dt = datetime.fromisoformat(str(received_at).replace("Z", "+00:00"))
+            ref = dt.astimezone(IST).date()
+        except ValueError:
+            pass
+
+    day_chunks = _split_timetable_day_chunks(attachment_text or "")
+    # #region agent log
+    _agent_log(
+        "F",
+        "schedule.py:parse_schedule_sessions",
+        "day chunks detected",
+        {
+            "chunk_count": len(day_chunks),
+            "chunk_dates": [d.isoformat() for d, _ in day_chunks],
+            "att_len": len(attachment_text or ""),
+        },
+    )
+    # #endregion
+
+    # Prefer per-day parse when the PDF clearly has multiple dated day blocks
+    if len(day_chunks) >= 2:
+        merged: list[dict[str, Any]] = []
+        for day, chunk in day_chunks:
+            part = _llm_parse_schedule_chunk(
+                subject=subject,
+                body=body,
+                chunk=chunk,
+                ref=ref,
+                force_date=day,
+            )
+            merged.extend(part)
+        # #region agent log
+        _agent_log(
+            "F",
+            "schedule.py:parse_schedule_sessions",
+            "per-day parse result",
+            {
+                "session_count": len(merged),
+                "dates": sorted({s.get("session_date") for s in merged if s.get("session_date")}),
+            },
+        )
+        # #endregion
+        if merged:
+            return merged
+
+    sessions = _llm_parse_schedule_chunk(
+        subject=subject,
+        body=body,
+        chunk=(attachment_text or "")[:10000] or body[:5000],
+        ref=ref,
+    )
+    unique_dates = {s.get("session_date") for s in sessions if s.get("session_date")}
+    # Fallback: full parse collapsed to one day but PDF has more day markers
+    if len(unique_dates) <= 1 and len(day_chunks) >= 2:
+        merged = []
+        for day, chunk in day_chunks:
+            part = _llm_parse_schedule_chunk(
+                subject=subject,
+                body=body,
+                chunk=chunk,
+                ref=ref,
+                force_date=day,
+            )
+            merged.extend(part)
+        if merged:
+            return merged
     return sessions
 
 
@@ -286,17 +525,33 @@ def find_latest_schedule_message_ids(*, max_candidates: int = 8) -> list[str]:
     return seen
 
 
+def _sessions_look_complete(sessions: list[dict[str, Any]], attachment_text: str = "") -> bool:
+    """Reject one-day collapses when the PDF clearly spans multiple days."""
+    if not sessions:
+        return False
+    dates = _template_date_set(sessions)
+    if len(dates) >= 2:
+        return True
+    if attachment_text:
+        return len(_split_timetable_day_chunks(attachment_text)) < 2
+    # Without attachment text we cannot verify — treat single-date as incomplete
+    # so refresh reloads the PDF and re-parses.
+    return False
+
+
 def _cached_or_stored_sessions(message_id: str) -> dict[str, Any] | None:
     """Reuse prior parse for the same Gmail message (no LLM)."""
     cached = _parse_cache.get(message_id)
     if cached and cached.get("sessions"):
-        return cached
+        if _sessions_look_complete(cached["sessions"], ""):
+            return cached
+        _parse_cache.pop(message_id, None)
     try:
         stored = get_class_sessions_for_message(message_id)
     except Exception as exc:
         logger.warning("DB lookup for schedule message %s failed: %s", message_id, exc)
         stored = []
-    if stored:
+    if stored and _sessions_look_complete(stored, ""):
         info = {
             "ok": True,
             "message_id": message_id,
@@ -365,7 +620,15 @@ def refresh_schedule_from_gmail() -> dict[str, Any]:
         if not sessions:
             last_error = last_error or "parse_empty"
             continue
-
+        if not _sessions_look_complete(sessions, attachment_text):
+            last_error = "parse_incomplete"
+            logger.warning(
+                "Schedule parse for %s looks incomplete (%d sessions, dates=%s)",
+                message_id,
+                len(sessions),
+                sorted({s.get("session_date") for s in sessions}),
+            )
+            # Still store what we have, but prefer fuller re-parses next time
         stored = store_schedule_sessions(sessions, gmail_message_id=message_id)
         info = {
             "ok": True,
@@ -466,8 +729,19 @@ def format_upcoming_classes(
     end = day + timedelta(days=days)
     try:
         raw = template if template is not None else load_template_sessions()
-        projected = project_sessions_to_week(raw, day, days=days + 1)
-        sessions = filter_by_section(projected, section)
+        stored_dates = _template_date_set(raw)
+        # Dated multi-day timetables: show real upcoming calendar dates only
+        if len(stored_dates) > 1:
+            upcoming = [
+                s
+                for s in raw
+                if (_session_date_value(s) or day) >= day
+                and (_session_date_value(s) or end) <= end
+            ]
+            sessions = filter_by_section(upcoming, section)
+        else:
+            projected = project_sessions_to_week(raw, day, days=days + 1)
+            sessions = filter_by_section(projected, section)
     except Exception as exc:
         logger.warning("Upcoming classes projection failed: %s", exc)
         return ""
@@ -510,6 +784,41 @@ def classes_command_text(*, refresh: bool = True, section: str | None = None) ->
             info = {"ok": False, "reason": str(exc), "sessions": []}
 
     template = load_template_sessions(info if info.get("sessions") else None)
+    # #region agent log
+    _agent_log(
+        "D",
+        "schedule.py:classes_command_text",
+        "template loaded",
+        {
+            "today": day.isoformat(),
+            "section": section,
+            "refresh_ok": bool(info.get("ok")),
+            "refresh_reason": info.get("reason"),
+            "from_cache": info.get("from_cache"),
+            "message_id": info.get("message_id"),
+            "subject": (info.get("subject") or "")[:120],
+            "template_count": len(template),
+            "template_dates": sorted(
+                {str(s.get("session_date")) for s in template if s.get("session_date")}
+            )[:20],
+            "template_weekdays": sorted(
+                {
+                    _session_date_value(s).weekday()
+                    for s in template
+                    if _session_date_value(s) is not None
+                }
+            ),
+            "sample": [
+                {
+                    "date": s.get("session_date"),
+                    "course": (s.get("course_or_topic") or "")[:60],
+                    "start": s.get("start_time"),
+                }
+                for s in template[:8]
+            ],
+        },
+    )
+    # #endregion
 
     today_text = ""
     try:
@@ -518,11 +827,27 @@ def classes_command_text(*, refresh: bool = True, section: str | None = None) ->
         logger.warning("format_today_classes failed: %s", exc)
 
     if today_text:
+        # #region agent log
+        _agent_log(
+            "E",
+            "schedule.py:classes_command_text",
+            "returned today_text",
+            {"path": "today", "len": len(today_text)},
+        )
+        # #endregion
         return today_text + _source_footer(info)
 
     if template:
         upcoming_text = format_upcoming_classes(day, days=7, section=section, template=template)
         if upcoming_text:
+            # #region agent log
+            _agent_log(
+                "E",
+                "schedule.py:classes_command_text",
+                "returned upcoming_text",
+                {"path": "upcoming", "len": len(upcoming_text)},
+            )
+            # #endregion
             return upcoming_text + _source_footer(info)
 
         label = day.strftime("%a, %d %b %Y")
