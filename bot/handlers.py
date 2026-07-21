@@ -262,27 +262,6 @@ async def _reply_schedule_for_question(
         except Exception as exc:
             logger.exception("Schedule refresh failed during chat Q&A: %s", exc)
 
-    # #region agent log
-    try:
-        from services.schedule import _agent_log
-
-        _agent_log(
-            "C",
-            "handlers.py:_reply_schedule_for_question",
-            "chat schedule answer",
-            {
-                "question": question[:120],
-                "target_day": target_day.isoformat(),
-                "section": section,
-                "session_count": len(sessions),
-                "template_count": len(template or []),
-                "refreshed": refreshed,
-            },
-        )
-    except Exception:
-        pass
-    # #endregion
-
     context.user_data["last_intent"] = "schedule"
     context.user_data["last_schedule_day"] = target_day.isoformat()
 

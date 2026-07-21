@@ -3,6 +3,7 @@ import logging
 import hmac
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from telegram import Update
 
@@ -21,6 +22,52 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 logger = logging.getLogger(__name__)
 
 ptb_app = build_telegram_application()
+
+# Render free tier sleeps after ~15 min of no inbound HTTP traffic.
+# Ping well inside that window and retry quickly so a single slow/failed
+# request can never open a >15 min gap.
+KEEP_ALIVE_INTERVAL_SECONDS = 10 * 60
+KEEP_ALIVE_RETRY_SECONDS = 30
+KEEP_ALIVE_MAX_RETRIES = 3
+
+
+async def _keep_alive_loop() -> None:
+    """Ping our own public URL so Render free tier stays awake.
+
+    NOTE: this only keeps an already-running instance awake. It cannot wake a
+    sleeping instance (the process is gone). An external pinger is still needed
+    as the primary safety net.
+    """
+    settings = get_settings()
+    base = (settings.render_url or "").rstrip("/")
+    if not base or "your-app" in base:
+        logger.info("Keep-alive disabled (RENDER_URL not set)")
+        return
+
+    url = f"{base}/ping"
+    async with httpx.AsyncClient(timeout=20) as client:
+        while True:
+            ok = False
+            for attempt in range(1, KEEP_ALIVE_MAX_RETRIES + 1):
+                try:
+                    resp = await client.get(url)
+                    logger.info("Self-ping ok %s -> %s", url, resp.status_code)
+                    ok = True
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Self-ping attempt %s/%s failed: %s",
+                        attempt,
+                        KEEP_ALIVE_MAX_RETRIES,
+                        exc,
+                    )
+                    if attempt < KEEP_ALIVE_MAX_RETRIES:
+                        await asyncio.sleep(KEEP_ALIVE_RETRY_SECONDS)
+            await asyncio.sleep(
+                KEEP_ALIVE_INTERVAL_SECONDS if ok else KEEP_ALIVE_RETRY_SECONDS
+            )
 
 
 async def _background_watcher_loop() -> None:
@@ -44,18 +91,27 @@ async def lifespan(app: FastAPI):
     await register_bot_commands(ptb_app)
     logger.info("Telegram application started")
     watcher_task = asyncio.create_task(_background_watcher_loop())
+    keep_alive_task = asyncio.create_task(_keep_alive_loop())
     yield
-    watcher_task.cancel()
-    try:
-        await watcher_task
-    except asyncio.CancelledError:
-        pass
+    for task in (watcher_task, keep_alive_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await ptb_app.stop()
     await ptb_app.shutdown()
     logger.info("Telegram application stopped")
 
 
 app = FastAPI(title="Mailbot", lifespan=lifespan)
+
+
+@app.get("/ping")
+@app.head("/ping")
+async def ping():
+    """Ultra-cheap liveness endpoint for keep-alive pingers (no DB/LLM calls)."""
+    return {"status": "alive"}
 
 
 @app.get("/healthz")
