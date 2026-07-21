@@ -13,10 +13,8 @@ from ai.prompts import SCHEDULE_PROMPT
 from gmail_api.client import get_message_details, search_message_ids
 from services.db import (
     delete_class_sessions_for_message,
-    delete_class_sessions_for_week,
     get_class_sessions_for_message,
     get_classes_between,
-    get_classes_on,
     get_preferred_section,
     insert_class_sessions,
 )
@@ -78,6 +76,83 @@ def filter_by_section(sessions: list[dict], section: str | None) -> list[dict]:
         # No rows carry a section tag at all — don't hide the timetable
         return sessions
     return matched  # may be empty when only other sections are labeled
+
+
+def _session_date_value(session: dict[str, Any]) -> date | None:
+    raw = session.get("session_date")
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(str(raw)[:10])
+    except ValueError:
+        return None
+
+
+def project_sessions_to_day(sessions: list[dict[str, Any]], target_day: date) -> list[dict[str, Any]]:
+    """Map a weekly timetable template onto a calendar day by weekday."""
+    if not sessions:
+        return []
+    target_weekday = target_day.weekday()
+    projected: list[dict[str, Any]] = []
+    for session in sessions:
+        session_day = _session_date_value(session)
+        if session_day is None or session_day.weekday() != target_weekday:
+            continue
+        projected.append({**session, "session_date": target_day.isoformat()})
+    return sorted(projected, key=lambda x: x.get("start_time") or "")
+
+
+def project_sessions_to_week(
+    sessions: list[dict[str, Any]],
+    week_start: date,
+    *,
+    days: int = 7,
+) -> list[dict[str, Any]]:
+    """Project template sessions onto each day from week_start for `days` days."""
+    if not sessions or days <= 0:
+        return []
+    projected: list[dict[str, Any]] = []
+    for offset in range(days):
+        day = week_start + timedelta(days=offset)
+        projected.extend(project_sessions_to_day(sessions, day))
+    return sorted(
+        projected,
+        key=lambda x: (x.get("session_date") or "", x.get("start_time") or ""),
+    )
+
+
+def load_template_sessions(info: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Load the weekly timetable template from cache, DB, or a refresh payload."""
+    if info and info.get("sessions"):
+        return list(info["sessions"])
+    for message_id in find_latest_schedule_message_ids(max_candidates=3):
+        try:
+            stored = get_class_sessions_for_message(message_id)
+        except Exception as exc:
+            logger.warning("DB lookup for schedule message %s failed: %s", message_id, exc)
+            stored = []
+        if stored:
+            return stored
+    try:
+        anchor = today_ist()
+        week_start = anchor - timedelta(days=anchor.weekday())
+        week_end = week_start + timedelta(days=6)
+        return get_classes_between(week_start.isoformat(), week_end.isoformat())
+    except Exception as exc:
+        logger.warning("Fallback schedule template load failed: %s", exc)
+        return []
+
+
+def sessions_for_day(
+    target_day: date,
+    *,
+    section: str | None = None,
+    template: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return projected classes for a calendar day, optionally filtered by section."""
+    raw = template if template is not None else load_template_sessions()
+    return filter_by_section(project_sessions_to_day(raw, target_day), section)
+
 
 # In-process cache: avoid re-calling the LLM for the same timetable mail
 _parse_cache: dict[str, dict[str, Any]] = {}
@@ -185,13 +260,6 @@ def store_schedule_sessions(
         delete_class_sessions_for_message(gmail_message_id)
     except Exception as exc:
         logger.warning("Could not clear sessions for message %s: %s", gmail_message_id, exc)
-
-    week_starts = {s.get("week_start") for s in sessions if s.get("week_start")}
-    for week in week_starts:
-        try:
-            delete_class_sessions_for_week(week)
-        except Exception as exc:
-            logger.warning("Could not clear week %s sessions: %s", week, exc)
 
     payload = [{**s, "gmail_message_id": gmail_message_id} for s in sessions]
     try:
@@ -330,14 +398,14 @@ def format_schedule_share(sessions: list[dict[str, Any]]) -> str:
             label = date.fromisoformat(day).strftime("%a, %d %b")
         except ValueError:
             label = day
-        lines.append(f"<b>{label}</b>")
+        lines.append(f"<b>{html.escape(str(label))}</b>")
         day_sessions = sorted(by_day[day], key=lambda x: x.get("start_time") or "")
         for s in day_sessions:
-            course = s.get("course_or_topic") or "Class"
-            start = s.get("start_time") or "—"
+            course = html.escape(str(s.get("course_or_topic") or "Class"))
+            start = html.escape(str(s.get("start_time") or "—"))
             end = s.get("end_time")
-            time_bit = f"{start}" + (f"–{end}" if end else "")
-            room = s.get("room") or "Room TBA"
+            time_bit = start + (f"–{html.escape(str(end))}" if end else "")
+            room = html.escape(str(s.get("room") or "Room TBA"))
             lines.append(f"• {time_bit} — {course} ({room})")
         lines.append("")
     return "\n".join(lines).strip()
@@ -351,46 +419,58 @@ def _format_session_block(sessions: list[dict[str, Any]], title: str) -> str:
         sessions,
         key=lambda x: (x.get("session_date") or "", x.get("start_time") or ""),
     ):
-        course = s.get("course_or_topic") or "Class"
-        start = s.get("start_time") or "—"
+        course = html.escape(str(s.get("course_or_topic") or "Class"))
+        start = html.escape(str(s.get("start_time") or "—"))
         end = s.get("end_time")
-        time_bit = f"{start}" + (f"–{end}" if end else "")
-        room = s.get("room") or "Room TBA"
+        time_bit = start + (f"–{html.escape(str(end))}" if end else "")
+        room = html.escape(str(s.get("room") or "Room TBA"))
         faculty = s.get("faculty")
         day_label = ""
         try:
-            day_label = date.fromisoformat(str(s.get("session_date"))).strftime("%a %d %b") + " · "
+            day_label = html.escape(
+                date.fromisoformat(str(s.get("session_date"))).strftime("%a %d %b")
+            ) + " · "
         except (TypeError, ValueError):
             pass
         line = f"• <b>{day_label}{time_bit}</b> — {course}\n   Room: {room}"
         if faculty:
-            line += f"\n   Faculty: {faculty}"
+            line += f"\n   Faculty: {html.escape(str(faculty))}"
         lines.append(line)
         lines.append("")
     return "\n".join(lines).strip()
 
 
-def format_today_classes(day: date | None = None, *, section: str | None = None) -> str:
+def format_today_classes(
+    day: date | None = None,
+    *,
+    section: str | None = None,
+    template: list[dict[str, Any]] | None = None,
+) -> str:
     day = day or today_ist()
-    sessions = filter_by_section(get_classes_on(day.isoformat()), section)
+    sessions = sessions_for_day(day, section=section, template=template)
     if not sessions:
         return ""
     label = day.strftime("%a, %d %b %Y")
-    return _format_session_block(sessions, f"<b>📚 Today's classes — {label}</b>")
+    title = "Today's classes" if day == today_ist() else f"Classes — {label}"
+    return _format_session_block(sessions, f"<b>📚 {title}</b>")
 
 
-def format_upcoming_classes(day: date | None = None, *, days: int = 7, section: str | None = None) -> str:
+def format_upcoming_classes(
+    day: date | None = None,
+    *,
+    days: int = 7,
+    section: str | None = None,
+    template: list[dict[str, Any]] | None = None,
+) -> str:
     day = day or today_ist()
     end = day + timedelta(days=days)
     try:
-        sessions = filter_by_section(
-            get_classes_between(day.isoformat(), end.isoformat()),
-            section,
-        )
+        raw = template if template is not None else load_template_sessions()
+        projected = project_sessions_to_week(raw, day, days=days + 1)
+        sessions = filter_by_section(projected, section)
     except Exception as exc:
-        logger.warning("Upcoming classes query failed: %s", exc)
+        logger.warning("Upcoming classes projection failed: %s", exc)
         return ""
-    # Skip purely "today" if caller already tried today; still include today if that's all we have
     if not sessions:
         return ""
     label = f"{day.strftime('%d %b')} – {end.strftime('%d %b')}"
@@ -429,48 +509,28 @@ def classes_command_text(*, refresh: bool = True, section: str | None = None) ->
             logger.exception("Schedule refresh failed: %s", exc)
             info = {"ok": False, "reason": str(exc), "sessions": []}
 
+    template = load_template_sessions(info if info.get("sessions") else None)
+
     today_text = ""
     try:
-        today_text = format_today_classes(day, section=section)
+        today_text = format_today_classes(day, section=section, template=template)
     except Exception as exc:
         logger.warning("format_today_classes failed: %s", exc)
 
     if today_text:
         return today_text + _source_footer(info)
 
-    # Prefer in-memory sessions from the refresh if DB is empty/broken
-    sessions = filter_by_section(info.get("sessions") or [], section)
-    if sessions:
-        today_key = day.isoformat()
-        today_sessions = filter_by_section(
-            [s for s in sessions if s.get("session_date") == today_key],
-            section,
-        )
-        if today_sessions:
-            label = day.strftime("%a, %d %b %Y")
-            return _format_session_block(
-                today_sessions, f"<b>📚 Today's classes — {label}</b>"
-            ) + _source_footer(info)
-        upcoming = filter_by_section(
-            [
-                s
-                for s in sessions
-                if str(s.get("session_date") or "") >= today_key
-            ][:20],
-            section,
-        )
-        if upcoming:
-            return _format_session_block(
-                upcoming, "<b>📚 Upcoming classes (from latest timetable)</b>"
-            ) + _source_footer(info)
-        return format_schedule_share(sessions) + _source_footer(info)
+    if template:
+        upcoming_text = format_upcoming_classes(day, days=7, section=section, template=template)
+        if upcoming_text:
+            return upcoming_text + _source_footer(info)
 
-    try:
-        upcoming_text = format_upcoming_classes(day, days=7, section=section)
-    except Exception:
-        upcoming_text = ""
-    if upcoming_text:
-        return upcoming_text + _source_footer(info)
+        label = day.strftime("%a, %d %b %Y")
+        return (
+            f"No classes scheduled for {label} in your section"
+            f"{f' (Sec. {section})' if section else ''}.\n"
+            "Your timetable is loaded — try asking about another day, or run /section."
+        ) + _source_footer(info)
 
     reason = info.get("reason")
     if reason == "no_mail":

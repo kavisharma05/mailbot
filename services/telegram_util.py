@@ -17,6 +17,50 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_CHARS = 3900
 
 
+def _find_safe_hard_split(text: str, start: int, limit: int) -> int:
+    """Pick a split index <= start+limit, avoiding cuts inside HTML tags."""
+    end = min(start + limit, len(text))
+    if end >= len(text):
+        return end
+
+    in_tag = False
+    last_space: int | None = None
+    for i in range(start, end):
+        ch = text[i]
+        if ch == "<":
+            in_tag = True
+        elif ch == ">":
+            in_tag = False
+        elif ch in " \t" and not in_tag:
+            last_space = i
+
+    if last_space is not None and last_space > start + (limit // 3):
+        return last_space
+
+    if "<" in text[start:end]:
+        close = text.find(">", end)
+        if close != -1 and close - start <= limit + 200:
+            return close + 1
+
+    return end
+
+
+def _hard_split_line(line: str, limit: int) -> list[str]:
+    if len(line) <= limit:
+        return [line]
+    chunks: list[str] = []
+    start = 0
+    while start < len(line):
+        end = _find_safe_hard_split(line, start, limit)
+        if end <= start:
+            end = min(start + limit, len(line))
+        chunks.append(line[start:end].rstrip())
+        start = end
+        if start < len(line) and line[start] in " \t":
+            start += 1
+    return [piece for piece in chunks if piece]
+
+
 def chunk_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
     """Split text into <=limit pieces, preferring line boundaries.
 
@@ -38,8 +82,7 @@ def chunk_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
             if current:
                 chunks.append(current)
                 current = ""
-            for i in range(0, len(line), limit):
-                chunks.append(line[i : i + limit])
+            chunks.extend(_hard_split_line(line, limit))
             continue
 
         candidate = f"{current}\n{line}" if current else line

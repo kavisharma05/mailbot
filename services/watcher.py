@@ -97,7 +97,7 @@ def format_incoming_mail_message(
         lines.append(f"<b>Task:</b> {_escape_html(str(task))}")
 
     due = _format_deadline_display(deadline_date, deadline_text)
-    if due and due not in ("—", "Not specified", "Unknown"):
+    if due and due != "Not specified":
         lines.append(f"<b>Due:</b> {_escape_html(due)}")
 
     if summary:
@@ -246,14 +246,11 @@ def _deadline_is_past(deadline_date: str | None) -> bool:
 
 
 def _should_alert(
-    is_actionable: bool,
     confidence: str,
     deadline_date: str | None,
     *,
     skip_past_deadlines: bool,
 ) -> bool:
-    if not is_actionable or confidence not in ("high", "medium"):
-        return False
     if skip_past_deadlines and _deadline_is_past(deadline_date):
         return False
     return True
@@ -266,11 +263,12 @@ async def _process_message(
     skip_past_deadlines: bool = False,
 ) -> dict[str, Any]:
     """Classify one email, persist results, optionally alert + forward attachments."""
-    details = get_message_details(message_id, load_attachments=True)
+    details = await asyncio.to_thread(get_message_details, message_id, load_attachments=True)
     attachments = details.get("attachments") or []
     attachment_text = details.get("attachment_text") or ""
 
-    result = classify_email(
+    result = await asyncio.to_thread(
+        classify_email,
         details["subject"],
         details["body"],
         details["sender"],
@@ -279,11 +277,12 @@ async def _process_message(
     )
 
     if result is None:
-        log_low_confidence(
+        await asyncio.to_thread(
+            log_low_confidence,
             "deadline_classifier",
             {"message_id": message_id, "subject": details["subject"], "retry": True},
         )
-        return {"processed": 0, "alerts": 0}
+        return {"processed": 0, "alerts": 0, "transient": True}
 
     is_actionable = result.get("is_actionable", False)
     confidence = result.get("confidence", "low")
@@ -312,14 +311,19 @@ async def _process_message(
         attachment_text,
         result,
     ):
-        sessions = parse_schedule_sessions(
+        sessions = await asyncio.to_thread(
+            parse_schedule_sessions,
             subject=details["subject"],
             body=details["body"],
             attachment_text=attachment_text,
             received_at=details.get("received_at_iso"),
         )
         if sessions:
-            stored = store_schedule_sessions(sessions, gmail_message_id=message_id)
+            stored = await asyncio.to_thread(
+                store_schedule_sessions,
+                sessions,
+                gmail_message_id=message_id,
+            )
             await send_owner_mail_update(
                 bot,
                 owner_text,
@@ -334,7 +338,8 @@ async def _process_message(
             alerts = 1
             # Also keep a lightweight assignment so /due shows the schedule notice
             if is_actionable and confidence in ("high", "medium"):
-                assignment = insert_assignment(
+                assignment = await asyncio.to_thread(
+                    insert_assignment,
                     {
                         "source": "email",
                         "category": "admin",
@@ -347,11 +352,17 @@ async def _process_message(
                         "summary": result.get("summary"),
                         "confidence": confidence,
                         "status": "open",
-                    }
+                    },
                 )
                 if assignment:
                     assignment_id = assignment["id"]
-            mark_email_processed(message_id, True, confidence or "medium", assignment_id)
+            await asyncio.to_thread(
+                mark_email_processed,
+                message_id,
+                True,
+                confidence or "medium",
+                assignment_id,
+            )
             return {"processed": 1, "alerts": alerts}
 
     await send_owner_mail_update(
@@ -361,7 +372,8 @@ async def _process_message(
     )
 
     if is_actionable and confidence in ("high", "medium"):
-        assignment = insert_assignment(
+        assignment = await asyncio.to_thread(
+            insert_assignment,
             {
                 "source": "email",
                 "category": category,
@@ -374,13 +386,12 @@ async def _process_message(
                 "summary": result.get("summary"),
                 "confidence": confidence,
                 "status": "open",
-            }
+            },
         )
         if assignment:
             assignment_id = assignment["id"]
 
         if _should_alert(
-            is_actionable,
             confidence,
             deadline_date,
             skip_past_deadlines=skip_past_deadlines,
@@ -398,7 +409,8 @@ async def _process_message(
             )
             alerts = 1
     elif is_actionable or confidence == "low":
-        log_low_confidence(
+        await asyncio.to_thread(
+            log_low_confidence,
             "deadline_classifier",
             {
                 "message_id": message_id,
@@ -407,7 +419,13 @@ async def _process_message(
             },
         )
 
-    mark_email_processed(message_id, is_actionable, confidence, assignment_id)
+    await asyncio.to_thread(
+        mark_email_processed,
+        message_id,
+        is_actionable,
+        confidence,
+        assignment_id,
+    )
     return {"processed": 1, "alerts": alerts}
 
 
@@ -422,19 +440,19 @@ def _recent_unprocessed_message_ids(max_results: int = 40) -> list[str]:
 
 async def run_gmail_watcher(bot) -> dict:
     """Poll Gmail for new emails, classify, route alerts by category."""
-    state = get_watch_state()
+    state = await asyncio.to_thread(get_watch_state)
     now = datetime.now(timezone.utc)
 
     if not state or not state.get("last_history_id"):
-        history_id = get_profile_history_id()
-        update_watch_state(last_history_id=history_id, last_checked_at=now)
+        history_id = await asyncio.to_thread(get_profile_history_id)
+        await asyncio.to_thread(update_watch_state, last_history_id=history_id, last_checked_at=now)
         logger.info("Initialized watch state at historyId=%s — running 2-day catch-up", history_id)
         # Don't silently skip recent mail on (re)init
-        catchup_ids = _recent_unprocessed_message_ids(max_results=60)
+        catchup_ids = await asyncio.to_thread(_recent_unprocessed_message_ids, max_results=60)
         processed = 0
         alerts = 0
         for message_id in catchup_ids:
-            if is_email_processed(message_id):
+            if await asyncio.to_thread(is_email_processed, message_id):
                 continue
             try:
                 outcome = await _process_message(message_id, bot)
@@ -452,11 +470,11 @@ async def run_gmail_watcher(bot) -> dict:
         }
 
     start_id = state["last_history_id"]
-    message_ids, latest_history_id = list_history_message_ids(start_id)
+    message_ids, latest_history_id = await asyncio.to_thread(list_history_message_ids, start_id)
 
     # Merge recent inbox/spam scan so failed/skipped history items still get retried
     seen: set[str] = set(message_ids)
-    for mid in _recent_unprocessed_message_ids():
+    for mid in await asyncio.to_thread(_recent_unprocessed_message_ids):
         if mid not in seen:
             message_ids.append(mid)
             seen.add(mid)
@@ -466,7 +484,7 @@ async def run_gmail_watcher(bot) -> dict:
     failed = 0
 
     for message_id in message_ids:
-        if is_email_processed(message_id):
+        if await asyncio.to_thread(is_email_processed, message_id):
             continue
 
         try:
@@ -477,18 +495,20 @@ async def run_gmail_watcher(bot) -> dict:
             continue
         processed += outcome["processed"]
         alerts += outcome["alerts"]
-        if outcome["processed"] == 0:
-            failed += 1
 
-    # Only advance history when nothing failed classification — otherwise retry next run
+    # Advance history unless a message raised — transient classify failures retry via catch-up
     if failed == 0:
-        new_history_id = latest_history_id or get_profile_history_id()
-        update_watch_state(last_history_id=new_history_id, last_checked_at=now)
+        new_history_id = latest_history_id or await asyncio.to_thread(get_profile_history_id)
+        await asyncio.to_thread(
+            update_watch_state,
+            last_history_id=new_history_id,
+            last_checked_at=now,
+        )
     else:
         new_history_id = start_id
-        update_watch_state(last_checked_at=now)
+        await asyncio.to_thread(update_watch_state, last_checked_at=now)
         logger.warning(
-            "Deferred history advance: %d message(s) failed classify and will retry",
+            "Deferred history advance: %d message(s) raised errors and will retry",
             failed,
         )
 
@@ -503,14 +523,14 @@ async def run_gmail_watcher(bot) -> dict:
 
 async def run_gmail_backfill(bot, days: int = 14) -> dict:
     """One-time scan of recent inbox mail. Does not update watch_state."""
-    message_ids = list_inbox_message_ids_since(days=days)
+    message_ids = await asyncio.to_thread(list_inbox_message_ids_since, days=days)
 
     processed = 0
     alerts = 0
     skipped = 0
 
     for message_id in message_ids:
-        if is_email_processed(message_id):
+        if await asyncio.to_thread(is_email_processed, message_id):
             skipped += 1
             continue
 

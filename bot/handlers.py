@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 import re
@@ -20,7 +21,6 @@ from config import get_settings
 from gmail_api.client import send_email
 from services.db import (
     get_assignments_for_qa,
-    get_classes_on,
     get_open_assignments,
     get_preferred_section,
     log_low_confidence,
@@ -31,8 +31,10 @@ from services.schedule import (
     _format_session_block,
     _session_section,
     classes_command_text,
-    filter_by_section,
+    load_template_sessions,
+    project_sessions_to_day,
     refresh_schedule_from_gmail,
+    sessions_for_day,
 )
 from services.telegram_util import reply_long
 from services.timeutil import IST, format_deadline_display, today_ist
@@ -142,9 +144,10 @@ def _section_buttons(sections: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _available_sections() -> list[str]:
-    info = refresh_schedule_from_gmail()
-    sessions = info.get("sessions") or get_classes_on(today_ist().isoformat())
+async def _available_sections() -> list[str]:
+    info = await asyncio.to_thread(refresh_schedule_from_gmail)
+    template = load_template_sessions(info if info.get("sessions") else None)
+    sessions = template or sessions_for_day(today_ist(), section=None, template=template)
     found: set[str] = set()
     for s in sessions:
         sec = _session_section(
@@ -201,8 +204,14 @@ def _is_schedule_question(question: str, *, last_intent: str | None = None) -> b
     return False
 
 
-def _sessions_for_day(day_iso: str, section: str | None) -> list[dict]:
-    return filter_by_section(get_classes_on(day_iso), section)
+def _sessions_for_day(day_iso: str, section: str | None, template: list[dict] | None = None) -> list[dict]:
+    from datetime import date as date_cls
+
+    try:
+        target = date_cls.fromisoformat(day_iso)
+    except ValueError:
+        return []
+    return sessions_for_day(target, section=section, template=template)
 
 
 async def _reply_schedule_for_question(
@@ -215,26 +224,18 @@ async def _reply_schedule_for_question(
     target_day = _resolve_target_day(
         question, fallback_iso=context.user_data.get("last_schedule_day")
     )
-    section = get_preferred_section()
+    section = await asyncio.to_thread(get_preferred_section)
     force_refresh = _wants_schedule_refresh(question)
 
     sessions = _sessions_for_day(target_day.isoformat(), section)
     refreshed = False
+    template = load_template_sessions()
     if not sessions or force_refresh:
         try:
-            info = refresh_schedule_from_gmail()
+            info = await asyncio.to_thread(refresh_schedule_from_gmail)
             refreshed = True
-            # Prefer freshly parsed in-memory rows for the target day when DB lags
-            fresh = [
-                s
-                for s in (info.get("sessions") or [])
-                if str(s.get("session_date") or "") == target_day.isoformat()
-            ]
-            sessions = filter_by_section(fresh, section) if fresh else _sessions_for_day(
-                target_day.isoformat(), section
-            )
-            if not sessions:
-                sessions = _sessions_for_day(target_day.isoformat(), section)
+            template = load_template_sessions(info if info.get("sessions") else None)
+            sessions = _sessions_for_day(target_day.isoformat(), section, template=template)
         except Exception as exc:
             logger.exception("Schedule refresh failed during chat Q&A: %s", exc)
 
@@ -242,8 +243,7 @@ async def _reply_schedule_for_question(
     context.user_data["last_schedule_day"] = target_day.isoformat()
 
     if not sessions:
-        # If section filter hid rows that exist unlabeled-or-other, say so clearly
-        raw = get_classes_on(target_day.isoformat())
+        raw = project_sessions_to_day(template, target_day) if template else []
         label = target_day.strftime("%a, %d %b")
         if raw and section:
             await update.message.reply_text(
@@ -294,7 +294,7 @@ async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
-    items = get_open_assignments(category=category)
+    items = await asyncio.to_thread(get_open_assignments, category=category)
     context.user_data["due_items"] = [i["id"] for i in items[:20]]
     await reply_long(update.message, _format_due_list(items, category), parse_mode="HTML")
 
@@ -304,9 +304,9 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await update.message.chat.send_action("typing")
-    section = get_preferred_section()
+    section = await asyncio.to_thread(get_preferred_section)
     if not section:
-        available = _available_sections()
+        available = await _available_sections()
         if not available:
             await update.message.reply_text(
                 "Couldn't find any sections in the latest timetable yet — try again shortly."
@@ -317,7 +317,7 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     try:
-        text = classes_command_text(refresh=True, section=section)
+        text = await asyncio.to_thread(classes_command_text, refresh=True, section=section)
     except Exception as exc:
         logger.exception("/classes failed: %s", exc)
         await update.message.reply_text(
@@ -330,9 +330,9 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def section_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update) or not update.message:
         return
-    current = get_preferred_section()
+    current = await asyncio.to_thread(get_preferred_section)
     label = f"Current: Section {current}\n\n" if current else ""
-    available = _available_sections() or ["A", "B", "C", "D"]
+    available = await _available_sections() or ["A", "B", "C", "D"]
     await update.message.reply_text(f"{label}Pick your section:", reply_markup=_section_buttons(available))
 
 
@@ -342,7 +342,7 @@ async def section_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer()
     section = query.data.split(":", 1)[1]
-    set_preferred_section(section)
+    await asyncio.to_thread(set_preferred_section, section)
     await query.edit_message_text(
         f"Got it — showing Section {section} from now on. Run /classes anytime."
     )
@@ -355,7 +355,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
 
     if not context.args:
-        items = get_open_assignments(category=category)
+        items = await asyncio.to_thread(get_open_assignments, category=category)
         context.user_data["due_items"] = [i["id"] for i in items[:20]]
         await reply_long(
             update.message,
@@ -372,12 +372,12 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     due_ids: list[str] = context.user_data.get("due_items") or []
     if not due_ids:
-        items = get_open_assignments(category=category)
+        items = await asyncio.to_thread(get_open_assignments, category=category)
         due_ids = [i["id"] for i in items[:20]]
         context.user_data["due_items"] = due_ids
 
     if index < 1 or index > len(due_ids):
-        items = get_open_assignments(category=category)
+        items = await asyncio.to_thread(get_open_assignments, category=category)
         context.user_data["due_items"] = [i["id"] for i in items[:20]]
         await reply_long(
             update.message,
@@ -387,7 +387,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     assignment_id = due_ids[index - 1]
-    updated = mark_assignment_done(assignment_id)
+    updated = await asyncio.to_thread(mark_assignment_done, assignment_id)
     if not updated:
         await update.message.reply_text("Could not mark that item done — it may already be closed.")
         return
@@ -481,14 +481,15 @@ async def _answer_chat_question(
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
 
     try:
-        items = get_assignments_for_qa(category=None, limit=25)
+        items = await asyncio.to_thread(get_assignments_for_qa, category=None, limit=25)
         if category:
-            cat_items = get_assignments_for_qa(category=category, limit=15)
+            cat_items = await asyncio.to_thread(get_assignments_for_qa, category=category, limit=15)
             seen = {i["id"] for i in cat_items}
             items = cat_items + [i for i in items if i["id"] not in seen]
 
-        question_text, pasted = split_question_and_paste(question_for_qa)
-        answer = answer_question(
+        question_text, pasted = await asyncio.to_thread(split_question_and_paste, question_for_qa)
+        answer = await asyncio.to_thread(
+            answer_question,
             question_text,
             items,
             category=category,
@@ -536,10 +537,14 @@ async def receive_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     instructions = context.user_data["instructions"]
 
     await update.message.reply_text("Drafting your email...")
-    draft = compose_email(instructions)
+    draft = await asyncio.to_thread(compose_email, instructions)
 
     if not draft or "subject" not in draft or "body" not in draft:
-        log_low_confidence("composer", {"instructions": instructions, "draft": draft})
+        await asyncio.to_thread(
+            log_low_confidence,
+            "composer",
+            {"instructions": instructions, "draft": draft},
+        )
         await update.message.reply_text("Couldn't draft the email. Try rephrasing your instructions.")
         return ConversationHandler.END
 
@@ -580,7 +585,12 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ConversationHandler.END
 
     try:
-        send_email(to=recipient, subject=draft["subject"], body=draft["body"])
+        await asyncio.to_thread(
+            send_email,
+            to=recipient,
+            subject=draft["subject"],
+            body=draft["body"],
+        )
         await query.edit_message_text(f"Sent to {recipient}.")
     except Exception as exc:
         logger.exception("Failed to send email")

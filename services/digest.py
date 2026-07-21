@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -7,13 +8,15 @@ from config import get_settings
 from services.db import (
     get_assignments_due_between,
     get_assignments_due_on,
+    get_preferred_section,
     get_recent_assignments,
 )
 from services.schedule import (
+    _format_session_block,
     classes_command_text,
-    format_today_classes,
-    get_preferred_section,
+    load_template_sessions,
     refresh_schedule_from_gmail,
+    sessions_for_day,
 )
 from services.telegram_util import send_html
 from services.watcher import CATEGORY_LABELS, _escape_html, _format_deadline_display
@@ -145,16 +148,19 @@ async def _send_owner_digest(bot, text: str) -> bool:
     return await send_html(bot, owner, text)
 
 
-def _tomorrow_classes_text(tomorrow: date) -> str:
-    section = get_preferred_section()
+async def _tomorrow_classes_text(tomorrow: date) -> str:
+    section = await asyncio.to_thread(get_preferred_section)
+    info: dict[str, Any] = {}
     try:
-        refresh_schedule_from_gmail()
+        info = await asyncio.to_thread(refresh_schedule_from_gmail)
     except Exception as exc:
         logger.warning("Evening schedule refresh failed: %s", exc)
-    text = format_today_classes(day=tomorrow, section=section)
-    if not text:
+    template = load_template_sessions(info if info.get("sessions") else None)
+    sessions = sessions_for_day(tomorrow, section=section, template=template)
+    if not sessions:
         return ""
-    return text.replace("Today's classes", "Tomorrow's classes", 1)
+    label = tomorrow.strftime("%a, %d %b %Y")
+    return _format_session_block(sessions, f"<b>📚 Tomorrow's classes — {label}</b>")
 
 
 async def run_morning_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
@@ -164,12 +170,12 @@ async def run_morning_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
 
     classes_text = ""
     try:
-        classes_text = classes_command_text(refresh=True)
+        classes_text = await asyncio.to_thread(classes_command_text, refresh=True)
     except Exception as exc:
         logger.warning("Morning classes refresh failed: %s", exc)
 
-    today_items = get_assignments_due_on(today.date(), IST, category=None)
-    recent = get_recent_assignments(since, category=None)
+    today_items = await asyncio.to_thread(get_assignments_due_on, today.date(), IST, category=None)
+    recent = await asyncio.to_thread(get_recent_assignments, since, category=None)
     today_ids = {i["id"] for i in today_items}
     recent_only = [i for i in recent if i["id"] not in today_ids][:8]
 
@@ -203,11 +209,17 @@ async def run_evening_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
     today = now
     tomorrow = now + timedelta(days=1)
 
-    classes_text = _tomorrow_classes_text(tomorrow.date())
-    tomorrow_items = get_assignments_due_on(tomorrow.date(), IST, category=None)
+    classes_text = await _tomorrow_classes_text(tomorrow.date())
+    tomorrow_items = await asyncio.to_thread(
+        get_assignments_due_on,
+        tomorrow.date(),
+        IST,
+        category=None,
+    )
 
     overdue_items: list[dict[str, Any]] = []
-    all_open = get_assignments_due_between(
+    all_open = await asyncio.to_thread(
+        get_assignments_due_between,
         today.date() - timedelta(days=30),
         today.date() - timedelta(days=1),
         IST,

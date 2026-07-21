@@ -135,12 +135,19 @@ def resolve_deadline_text(text: str | None, *, now: datetime | None = None) -> d
         base = ref.date()
     elif re.search(r"\btomorrow\b", lower):
         base = (ref + timedelta(days=1)).date()
-    elif match := re.search(r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b", lower):
+    elif match := re.search(
+        r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b",
+        lower,
+    ):
         weekday = _WEEKDAY_MAP[match.group(1)]
         base = (ref + relativedelta(weekday=weekday(+1))).date()
-    elif match := re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b", lower):
+    elif match := re.search(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b",
+        lower,
+    ):
         weekday = _WEEKDAY_MAP[match.group(1)]
-        base = (ref + relativedelta(weekday=weekday(+1))).date()
+        days_ahead = (weekday.weekday - ref.weekday()) % 7
+        base = (ref + timedelta(days=days_ahead)).date()
     elif re.search(r"\bend of week\b|\bthis week\b|\bby friday\b", lower):
         base = (ref + relativedelta(weekday=FR(+1))).date()
     else:

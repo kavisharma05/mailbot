@@ -11,10 +11,15 @@ from gmail_api.auth import get_credentials
 
 logger = logging.getLogger(__name__)
 
+_gmail_service = None
+
 
 def get_gmail_service():
-    creds = get_credentials()
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    global _gmail_service
+    if _gmail_service is None:
+        creds = get_credentials()
+        _gmail_service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return _gmail_service
 
 
 def get_profile_history_id() -> str:

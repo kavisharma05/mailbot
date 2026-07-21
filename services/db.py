@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+_db_client: Client | None = None
+
 _ASSIGNMENT_COLUMNS = (
     "id, category, course_or_topic, task, deadline_text, deadline_date, "
     "summary, confidence, status, created_at"
@@ -19,8 +21,11 @@ _ASSIGNMENT_COLUMNS = (
 
 
 def get_db() -> Client:
-    settings = get_settings()
-    return create_client(settings.supabase_url, settings.supabase_service_key)
+    global _db_client
+    if _db_client is None:
+        settings = get_settings()
+        _db_client = create_client(settings.supabase_url, settings.supabase_service_key)
+    return _db_client
 
 
 def check_db_health() -> dict[str, Any]:

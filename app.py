@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import hmac
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -69,7 +70,7 @@ async def healthz():
 @app.post(f"/telegram/webhook/{{secret}}")
 async def telegram_webhook(secret: str, request: Request) -> Response:
     settings = get_settings()
-    if secret != settings.telegram_webhook_secret:
+    if not hmac.compare_digest(secret, settings.telegram_webhook_secret):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     data = await request.json()
@@ -81,7 +82,7 @@ async def telegram_webhook(secret: str, request: Request) -> Response:
 @app.post("/tasks/watch-gmail")
 async def watch_gmail(x_task_secret: str = Header(..., alias="x-task-secret")):
     settings = get_settings()
-    if x_task_secret != settings.task_secret:
+    if not hmac.compare_digest(x_task_secret, settings.task_secret):
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
     async with watcher_lock:
@@ -96,7 +97,7 @@ async def backfill_gmail(
     x_task_secret: str = Header(..., alias="x-task-secret"),
 ):
     settings = get_settings()
-    if x_task_secret != settings.task_secret:
+    if not hmac.compare_digest(x_task_secret, settings.task_secret):
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
     if days < 1 or days > 30:
@@ -113,7 +114,7 @@ async def digest_morning(
     x_task_secret: str = Header(..., alias="x-task-secret"),
 ):
     settings = get_settings()
-    if x_task_secret != settings.task_secret:
+    if not hmac.compare_digest(x_task_secret, settings.task_secret):
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
     result = await run_morning_digest(ptb_app.bot, dry_run=bool(dry_run))
@@ -127,7 +128,7 @@ async def digest_evening(
     x_task_secret: str = Header(..., alias="x-task-secret"),
 ):
     settings = get_settings()
-    if x_task_secret != settings.task_secret:
+    if not hmac.compare_digest(x_task_secret, settings.task_secret):
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
     result = await run_evening_digest(ptb_app.bot, dry_run=bool(dry_run))
