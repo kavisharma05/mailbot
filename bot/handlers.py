@@ -54,6 +54,10 @@ INSTRUCTIONS, RECIPIENT, CONFIRM = range(3)
 
 APPROVE_CB = "send_approve"
 CANCEL_CB = "send_cancel"
+CLEAR_CHAT_CB = "ui:clear_chat"
+
+# How many recent message IDs to try when clearing bot clutter in owner DM
+_CLEAR_CHAT_SCAN_LIMIT = 80
 
 CATEGORY_TITLES = CATEGORY_LABELS
 
@@ -375,6 +379,82 @@ async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer("Could not schedule reminder.")
 
 
+def _start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🧹 Clear chat", callback_data=CLEAR_CHAT_CB)]]
+    )
+
+
+def _track_bot_message(context: ContextTypes.DEFAULT_TYPE, message_id: int | None) -> None:
+    if message_id is None:
+        return
+    ids: list[int] = context.user_data.setdefault("bot_message_ids", [])
+    if message_id not in ids:
+        ids.append(message_id)
+    # Keep list bounded
+    if len(ids) > 200:
+        del ids[:-200]
+
+
+async def _clear_bot_messages(
+    bot,
+    chat_id: int | str,
+    *,
+    anchor_message_id: int,
+    extra_ids: list[int] | None = None,
+) -> int:
+    """Delete recent messages the bot sent (best-effort scan + tracked IDs)."""
+    seen: set[int] = set()
+    to_try: list[int] = list(extra_ids or [])
+    for mid in range(anchor_message_id, max(anchor_message_id - _CLEAR_CHAT_SCAN_LIMIT, 0), -1):
+        to_try.append(mid)
+
+    deleted = 0
+    for mid in to_try:
+        if mid in seen or mid <= 0:
+            continue
+        seen.add(mid)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except Exception:
+            pass
+    return deleted
+
+
+async def clear_chat_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        return
+    query = update.callback_query
+    if not query or not query.message:
+        return
+
+    chat = query.message.chat
+    if chat.type != ChatType.PRIVATE:
+        await query.answer("Clear chat works in your DM with the bot.", show_alert=True)
+        return
+
+    await query.answer("Clearing…")
+    tracked: list[int] = context.user_data.pop("bot_message_ids", [])
+    deleted = await _clear_bot_messages(
+        context.bot,
+        chat.id,
+        anchor_message_id=query.message.message_id,
+        extra_ids=tracked,
+    )
+    try:
+        await query.message.delete()
+        deleted += 1
+    except Exception:
+        pass
+
+    note = await context.bot.send_message(
+        chat_id=chat.id,
+        text=f"🧹 Cleared {deleted} bot message(s). Send /start anytime.",
+    )
+    _track_bot_message(context, note.message_id)
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update):
         return
@@ -385,7 +465,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not _is_owner(update):
         return
 
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "Mailbot ready.\n\n"
         "Commands:\n"
         "/due — open items (priority first)\n"
@@ -401,8 +481,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Marks in attachments show as text; readings are forwarded as files.\n\n"
         "In groups: reply to my messages, or mention me:\n"
         "@IMTAssistant_bot what's due this week?\n\n"
-        "Tip: In BotFather → /setprivacy → Disable, so I can see all group messages."
+        "Tip: In BotFather → /setprivacy → Disable, so I can see all group messages.",
+        reply_markup=_start_keyboard(),
     )
+    _track_bot_message(context, msg.message_id)
 
 
 async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -744,6 +826,7 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("classes", classes_command))
     application.add_handler(CommandHandler("section", section_command))
     application.add_handler(CallbackQueryHandler(section_button, pattern=r"^section:"))
+    application.add_handler(CallbackQueryHandler(clear_chat_button, pattern=f"^{CLEAR_CHAT_CB}$"))
     application.add_handler(CallbackQueryHandler(action_button, pattern=r"^act:"))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(build_conversation_handler())
