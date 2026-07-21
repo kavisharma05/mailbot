@@ -15,11 +15,16 @@ from services.schedule import (
     get_preferred_section,
     refresh_schedule_from_gmail,
 )
+from services.telegram_util import send_html
 from services.watcher import CATEGORY_LABELS, _escape_html, _format_deadline_display
 
 logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
+
+# Cap long sections so a digest never exceeds Telegram's message limit.
+_MAX_OVERDUE_SHOWN = 12
+_MAX_DUE_SHOWN = 20
 
 
 def _deadline_local_date(item: dict[str, Any], tz) -> datetime | None:
@@ -48,13 +53,23 @@ def _format_item_line(item: dict[str, Any], *, overdue: bool = False) -> str:
     )
 
 
-def _format_deadline_section(title: str, items: list[dict[str, Any]], *, overdue: bool = False) -> str:
+def _format_deadline_section(
+    title: str,
+    items: list[dict[str, Any]],
+    *,
+    overdue: bool = False,
+    max_shown: int | None = None,
+) -> str:
     if not items:
         return ""
     lines = [f"<b>{title} ({len(items)})</b>"]
-    for item in items:
+    shown = items[:max_shown] if max_shown else items
+    for item in shown:
         lines.append(_format_item_line(item, overdue=overdue))
         lines.append("")
+    remaining = len(items) - len(shown)
+    if remaining > 0:
+        lines.append(f"…and {remaining} more.")
     return "\n".join(lines).strip()
 
 
@@ -73,7 +88,7 @@ def _format_morning_owner_message(
         lines.append("")
 
     if today_items:
-        lines.append(_format_deadline_section("Due today", today_items))
+        lines.append(_format_deadline_section("Due today", today_items, max_shown=_MAX_DUE_SHOWN))
         lines.append("")
     else:
         lines.append("<b>Due today</b>: nothing open.")
@@ -103,7 +118,11 @@ def _format_evening_owner_message(
     lines = [f"<b>🌙 Evening — tomorrow</b>", f"<i>{date_str} (IST)</i>", ""]
 
     if overdue_items:
-        lines.append(_format_deadline_section("Overdue", overdue_items, overdue=True))
+        lines.append(
+            _format_deadline_section(
+                "Overdue", overdue_items, overdue=True, max_shown=_MAX_OVERDUE_SHOWN
+            )
+        )
         lines.append("")
 
     if classes_text and "📚" in classes_text:
@@ -111,7 +130,7 @@ def _format_evening_owner_message(
         lines.append("")
 
     if tomorrow_items:
-        lines.append(_format_deadline_section("Due tomorrow", tomorrow_items))
+        lines.append(_format_deadline_section("Due tomorrow", tomorrow_items, max_shown=_MAX_DUE_SHOWN))
     elif not classes_text:
         lines.append("Nothing due tomorrow and no classes scheduled yet.")
 
@@ -123,12 +142,7 @@ async def _send_owner_digest(bot, text: str) -> bool:
     owner = settings.telegram_owner_chat_id
     if not owner:
         return False
-    try:
-        await bot.send_message(chat_id=owner, text=text, parse_mode="HTML")
-        return True
-    except Exception as exc:
-        logger.warning("Failed sending owner digest: %s", exc)
-        return False
+    return await send_html(bot, owner, text)
 
 
 def _tomorrow_classes_text(tomorrow: date) -> str:

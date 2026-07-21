@@ -27,6 +27,7 @@ from services.schedule import (
     parse_schedule_sessions,
     store_schedule_sessions,
 )
+from services.telegram_util import send_html
 from services.timeutil import (
     IST,
     format_deadline_display,
@@ -47,17 +48,6 @@ CATEGORY_LABELS = {
     "admin": "Admin",
     "other": "Other",
 }
-
-
-def _resolve_chat_id(category: str, settings: Settings) -> str:
-    mapping = {
-        "deadline": settings.telegram_chat_deadlines,
-        "placement": settings.telegram_chat_placements,
-        "admin": settings.telegram_chat_admin,
-        "other": settings.telegram_chat_other,
-    }
-    chat_id = mapping.get(category, "") or settings.telegram_owner_chat_id
-    return chat_id
 
 
 def _escape_html(text: str) -> str:
@@ -127,7 +117,7 @@ async def send_owner_mail_update(
     chat_id = settings.telegram_owner_chat_id
     if not chat_id:
         return
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    await send_html(bot, chat_id, text)
     if attachments:
         await _forward_attachments(bot, chat_id, attachments, caption_prefix=None)
 
@@ -163,17 +153,6 @@ def format_alert_message(
     return "\n".join(lines)
 
 
-def _alert_chat_ids(category: str, settings: Settings, *, include_owner: bool = True) -> list[str]:
-    """Send to category group and optionally owner DM, de-duplicated."""
-    chats: list[str] = []
-    group = _resolve_chat_id(category, settings)
-    owner = settings.telegram_owner_chat_id if include_owner else ""
-    for chat_id in (group, owner):
-        if chat_id and chat_id not in chats:
-            chats.append(chat_id)
-    return chats
-
-
 async def send_category_alert(
     bot,
     category: str,
@@ -200,35 +179,8 @@ async def send_category_alert(
         summary=summary,
         sender=sender,
     )
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    await send_html(bot, chat_id, text)
     await _forward_attachments(bot, chat_id, attachments or [], caption_prefix=summary or task)
-
-
-async def send_telegram_alert(
-    bot,
-    category: str,
-    *,
-    course_or_topic: str | None = None,
-    task: str | None = None,
-    deadline_date: str | None = None,
-    deadline_text: str | None = None,
-    summary: str | None = None,
-    sender: str | None = None,
-    attachments: list[dict[str, Any]] | None = None,
-) -> None:
-    settings = get_settings()
-    text = format_alert_message(
-        category=category,
-        course_or_topic=course_or_topic,
-        task=task,
-        deadline_date=deadline_date,
-        deadline_text=deadline_text,
-        summary=summary,
-        sender=sender,
-    )
-    for chat_id in _alert_chat_ids(category, settings):
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-        await _forward_attachments(bot, chat_id, attachments or [], caption_prefix=summary or task)
 
 
 async def _forward_attachments(
@@ -276,7 +228,7 @@ async def share_schedule(
         text = f"{text}\n\n<i>{_escape_html(summary)}</i>"
     chat_id = _category_group_chat_id("admin", settings)
     if chat_id:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        await send_html(bot, chat_id, text)
         await _forward_attachments(bot, chat_id, attachments or [], caption_prefix="Class schedule")
 
 
@@ -484,7 +436,11 @@ async def run_gmail_watcher(bot) -> dict:
         for message_id in catchup_ids:
             if is_email_processed(message_id):
                 continue
-            outcome = await _process_message(message_id, bot)
+            try:
+                outcome = await _process_message(message_id, bot)
+            except Exception as exc:
+                logger.exception("Catch-up processing failed for %s: %s", message_id, exc)
+                continue
             processed += outcome["processed"]
             alerts += outcome["alerts"]
         return {
@@ -513,7 +469,12 @@ async def run_gmail_watcher(bot) -> dict:
         if is_email_processed(message_id):
             continue
 
-        outcome = await _process_message(message_id, bot)
+        try:
+            outcome = await _process_message(message_id, bot)
+        except Exception as exc:
+            logger.exception("Processing failed for %s: %s", message_id, exc)
+            failed += 1
+            continue
         processed += outcome["processed"]
         alerts += outcome["alerts"]
         if outcome["processed"] == 0:
@@ -553,7 +514,11 @@ async def run_gmail_backfill(bot, days: int = 14) -> dict:
             skipped += 1
             continue
 
-        outcome = await _process_message(message_id, bot, skip_past_deadlines=True)
+        try:
+            outcome = await _process_message(message_id, bot, skip_past_deadlines=True)
+        except Exception as exc:
+            logger.exception("Backfill processing failed for %s: %s", message_id, exc)
+            continue
         processed += outcome["processed"]
         alerts += outcome["alerts"]
 

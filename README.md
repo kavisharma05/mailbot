@@ -168,12 +168,23 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `/due` or `/list` | Show numbered open items for this chat's category |
 | `/done <n>` | Mark item #n from the last `/due` list as complete |
 | `/classes` | Today's classes with time and room (from timetable emails) |
+| `/section` | Change or check your class section |
 | `/ask <question>` | Ask about deadlines, today's mails, senders, or email content |
 | `/send` | Compose and send an email |
 | `/cancel` | Cancel the current `/send` flow |
 
 In groups, also reply to the bot or mention it (`@IMTAssistant_bot what's due?`).  
 For free-text in groups without mentioning, disable privacy in BotFather: `/setprivacy` → Disable.
+
+### Verified answers (`#verify`)
+
+Add **`#verify`** anywhere in a question (with `/ask` or free text) to force a **fresh Gmail lookup** with full message bodies, bypass DB/deterministic shortcuts, and get an LLM answer grounded only in live mail. The reply includes a **Sources (from Gmail)** block (sender, date, subject, snippet).
+
+Examples:
+- `#verify what did Prof Saleena say about the Brady case?`
+- `what's the exact CV deadline for ABC Corp #verify`
+
+Also accepted: `#live`, `#realtime`, or a leading `verify:` / `live:` prefix.
 
 ## Notes
 
@@ -186,6 +197,7 @@ For free-text in groups without mentioning, disable privacy in BotFather: `/setp
 - Watcher polls every **~60s** while the app is awake, plus GitHub Actions every **5 min** as backup
 - If email classification fails (LLM/JSON error), the message is **not** marked processed and will retry on the next watcher run (~60s)
 - `/ask` uses LLM + DB + Gmail; replies are plain text with safe fallbacks when AI is unavailable
+- **`#verify`** on any question forces live Gmail + cited sources (see above); use `/classes` for timetables instead
 - Watcher only processes **new** mail after first run; use `/tasks/backfill` for older mail
 - Both the watcher and backfill scan the **Inbox and Spam** folders (important emails sometimes land in spam)
 - LLM calls use **Groq first**, then **Cerebras** if Groq fails / rate-limits

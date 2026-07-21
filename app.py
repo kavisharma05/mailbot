@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from telegram import Update
 
-from bot.telegram_app import build_telegram_application
+from bot.telegram_app import build_telegram_application, register_bot_commands
 from config import get_settings
 from services.db import check_db_health
 from services.digest import run_evening_digest, run_morning_digest
@@ -40,6 +40,7 @@ async def _background_watcher_loop() -> None:
 async def lifespan(app: FastAPI):
     await ptb_app.initialize()
     await ptb_app.start()
+    await register_bot_commands(ptb_app)
     logger.info("Telegram application started")
     watcher_task = asyncio.create_task(_background_watcher_loop())
     yield

@@ -34,6 +34,7 @@ from services.schedule import (
     filter_by_section,
     refresh_schedule_from_gmail,
 )
+from services.telegram_util import reply_long
 from services.timeutil import IST, format_deadline_display, today_ist
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,23 @@ REFRESH_KEYWORDS = (
 )
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+# Inline tags / prefixes for live Gmail-verified answers (#verify is the documented token)
+_VERIFY_TAG_RE = re.compile(
+    r"(?:^|\s)(?:#(?:verify|live|realtime)\b|(?:verify|live):\s*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_verify_tag(text: str) -> tuple[bool, str]:
+    """Return (is_verified, question_with_tag_stripped)."""
+    if not text:
+        return False, ""
+    if not _VERIFY_TAG_RE.search(text):
+        return False, text.strip()
+    cleaned = _VERIFY_TAG_RE.sub(" ", text).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return True, cleaned
 
 
 def _is_owner(update: Update) -> bool:
@@ -246,7 +264,7 @@ async def _reply_schedule_for_question(
     if section:
         title = f"<b>📚 Classes — {label} (Sec. {section})</b>"
     text = _format_session_block(sessions, title)
-    await update.message.reply_text(text, parse_mode="HTML")
+    await reply_long(update.message, text, parse_mode="HTML")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -262,6 +280,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/classes — today's classes for your section (tap to set it first time)\n"
         "/section — change or check your section\n"
         "/ask <question> — ask about deadlines, mails today, senders, or email content\n"
+        "Add #verify to any question for a fresh Gmail answer with cited sources\n"
         "/send — compose and send an email (DM preferred)\n"
         "/cancel — cancel the current /send flow\n\n"
         "In groups: reply to my messages, or mention me:\n"
@@ -277,7 +296,7 @@ async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
     items = get_open_assignments(category=category)
     context.user_data["due_items"] = [i["id"] for i in items[:20]]
-    await update.message.reply_text(_format_due_list(items, category), parse_mode="HTML")
+    await reply_long(update.message, _format_due_list(items, category), parse_mode="HTML")
 
 
 async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -305,7 +324,7 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Couldn't load the class schedule right now. Try again in a minute."
         )
         return
-    await update.message.reply_text(text, parse_mode="HTML")
+    await reply_long(update.message, text, parse_mode="HTML")
 
 
 async def section_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -338,7 +357,8 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.args:
         items = get_open_assignments(category=category)
         context.user_data["due_items"] = [i["id"] for i in items[:20]]
-        await update.message.reply_text(
+        await reply_long(
+            update.message,
             "Usage: /done <number>\n\n" + _format_due_list(items, category),
             parse_mode="HTML",
         )
@@ -359,7 +379,8 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if index < 1 or index > len(due_ids):
         items = get_open_assignments(category=category)
         context.user_data["due_items"] = [i["id"] for i in items[:20]]
-        await update.message.reply_text(
+        await reply_long(
+            update.message,
             f"No item #{index}. Pick from the list:\n\n" + _format_due_list(items, category),
             parse_mode="HTML",
         )
@@ -442,9 +463,17 @@ async def _answer_chat_question(
     context: ContextTypes.DEFAULT_TYPE,
     question: str,
 ) -> None:
+    verified, cleaned = _extract_verify_tag(question)
+    if verified and not cleaned:
+        await update.message.reply_text(
+            'Add a question after #verify, e.g. "#verify what\'s the CV deadline?"'
+        )
+        return
+
+    question_for_qa = cleaned if verified else question
     last_intent = context.user_data.get("last_intent")
-    if _is_schedule_question(question, last_intent=last_intent):
-        await _reply_schedule_for_question(update, context, question)
+    if not verified and _is_schedule_question(question_for_qa, last_intent=last_intent):
+        await _reply_schedule_for_question(update, context, question_for_qa)
         return
 
     context.user_data["last_intent"] = "qa"
@@ -458,12 +487,13 @@ async def _answer_chat_question(
             seen = {i["id"] for i in cat_items}
             items = cat_items + [i for i in items if i["id"] not in seen]
 
-        question_text, pasted = split_question_and_paste(question)
+        question_text, pasted = split_question_and_paste(question_for_qa)
         answer = answer_question(
             question_text,
             items,
             category=category,
             pasted_email=pasted,
+            verified=verified,
         )
     except Exception as exc:
         logger.exception("Q&A failed: %s", exc)
@@ -475,8 +505,8 @@ async def _answer_chat_question(
     if not answer or not answer.strip():
         answer = "I couldn't find a clear answer. Try /due or rephrase your question."
 
-    # Plain text avoids Telegram HTML parse errors from LLM output
-    await update.message.reply_text(answer[:4096])
+    # Plain text avoids Telegram HTML parse errors from LLM output; chunk if long.
+    await reply_long(update.message, answer)
 
 
 async def send_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

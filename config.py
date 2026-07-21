@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     github_models_token: str = ""
     github_models_model: str = "openai/gpt-4o-mini"
     openrouter_api_key: str = ""
-    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+    openrouter_model: str = "google/gemma-4-31b-it:free"
 
     gmail_client_id: str
     gmail_client_secret: str

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ai.client import call_json, call_text, get_last_groq_error
-from ai.prompts import ASSISTANT_PROMPT, GMAIL_QUERY_PROMPT
+from ai.prompts import ASSISTANT_PROMPT, GMAIL_QUERY_PROMPT, VERIFIED_ASSISTANT_PROMPT
 from gmail_api.client import (
     count_messages,
     get_message_details,
@@ -306,11 +306,15 @@ def _wants_mail_bodies(question: str) -> bool:
     )
 
 
-def _gather_mailbox_context(question: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _gather_mailbox_context(
+    question: str,
+    *,
+    force_bodies: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Stats + message list for mailbox Q&A."""
     queries = _build_mailbox_queries(question)
     primary = queries[0]
-    wants_bodies = _wants_mail_bodies(question) or "whom" in question.lower() or "who" in question.lower()
+    wants_bodies = force_bodies or _wants_mail_bodies(question) or "whom" in question.lower() or "who" in question.lower()
 
     try:
         stats = count_messages(primary, hard_cap=300)
@@ -325,8 +329,8 @@ def _gather_mailbox_context(question: str) -> tuple[dict[str, Any], list[dict[st
             batch = list_message_summaries(
                 query,
                 max_results=_MAX_MAILBOX_EMAILS,
-                include_body=wants_bodies or "how many" not in question.lower(),
-                body_chars=_MAILBOX_BODY_CHARS if wants_bodies else 400,
+                include_body=force_bodies or wants_bodies or "how many" not in question.lower(),
+                body_chars=_MAILBOX_BODY_CHARS if wants_bodies or force_bodies else 400,
             )
         except Exception as exc:
             logger.warning("list_message_summaries failed for %r: %s", query, exc)
@@ -390,6 +394,30 @@ def _format_mailbox_fallback(stats: dict[str, Any], emails: list[dict[str, Any]]
                 lines.append(f"   Snippet: {snippet}")
             lines.append("")
     lines.append("(Offline format — free AI quota resting; data is live from Gmail.)")
+    return "\n".join(lines).strip()
+
+
+def _format_sources_block(emails: list[dict[str, Any]], *, limit: int = 5) -> str:
+    """Deterministic evidence footer for verified mode."""
+    if not emails:
+        return ""
+
+    lines = ["", "Sources (from Gmail):", ""]
+    for i, mail in enumerate(emails[:limit], start=1):
+        subject = mail.get("subject") or "(no subject)"
+        sender = mail.get("sender") or "unknown"
+        received = mail.get("received_at") or "unknown"
+        lines.append(f"{i}. {subject}")
+        lines.append(f"   From: {sender}")
+        lines.append(f"   Received: {received}")
+        body = mail.get("body")
+        if body:
+            snippet = re.sub(r"\s+", " ", str(body))[:200]
+            lines.append(f"   Snippet: {snippet}")
+        lines.append("")
+
+    if len(emails) > limit:
+        lines.append(f"…and {len(emails) - limit} more matching message(s).")
     return "\n".join(lines).strip()
 
 
@@ -691,9 +719,10 @@ def _build_user_prompt(
     category: str | None,
     pasted_email: str | None,
     mailbox_stats: dict[str, Any] | None = None,
+    *,
+    verified: bool = False,
 ) -> str:
     scope = f"Category hint: {category}" if category else "Category hint: none"
-    slim_items = [_slim_item_for_prompt(i) for i in items[:_MAX_ITEMS]]
     parts = [scope, ""]
 
     if pasted_email:
@@ -705,11 +734,14 @@ def _build_user_prompt(
         parts.append(f"Mailbox stats (JSON):\n{json.dumps(mailbox_stats, default=str)}")
         parts.append("")
 
-    # For pure mailbox questions, keep tracked items short to leave room for mail bodies
-    item_limit = 8 if mailbox_stats else _MAX_ITEMS
-    parts.append(
-        f"Tracked items (JSON):\n{json.dumps(slim_items[:item_limit], default=str)}"
-    )
+    if not verified:
+        slim_items = [_slim_item_for_prompt(i) for i in items[:_MAX_ITEMS]]
+        # For pure mailbox questions, keep tracked items short to leave room for mail bodies
+        item_limit = 8 if mailbox_stats else _MAX_ITEMS
+        parts.append(
+            f"Tracked items (JSON):\n{json.dumps(slim_items[:item_limit], default=str)}"
+        )
+
     parts.append(f"\nMatching Gmail emails (JSON):\n{json.dumps(emails, default=str)}")
     parts.append(f"\nStudent question:\n{question}")
 
@@ -875,11 +907,37 @@ def answer_question(
     *,
     scan_gmail: bool = True,
     pasted_email: str | None = None,
+    verified: bool = False,
 ) -> str:
     """LLM-first: always ask the model; keyword heuristics only gather context / fallback."""
     ref = now_ist()
     today = today_ist().isoformat()
     now_str = ref.strftime("%Y-%m-%d %H:%M %Z")
+
+    if verified:
+        system = VERIFIED_ASSISTANT_PROMPT.format(today=today, now=now_str)
+        try:
+            stats, emails = _gather_mailbox_context(question, force_bodies=True)
+        except Exception as exc:
+            logger.warning("Verified mailbox fetch failed: %s", exc)
+            stats, emails = {"count": 0, "error": str(exc)}, []
+        user = _build_user_prompt(
+            question,
+            items,
+            emails,
+            category,
+            pasted_email,
+            mailbox_stats=stats,
+            verified=True,
+        )
+        answer = call_text(system, user, temperature=0.45, max_tokens=1100)
+        if answer and not _llm_answer_is_useless(answer):
+            sources = _format_sources_block(emails)
+            if sources:
+                return f"{answer.strip()}\n\n{sources}"
+            return answer.strip()
+        return _format_mailbox_fallback(stats or {}, emails, question)
+
     system = ASSISTANT_PROMPT.format(today=today, now=now_str)
 
     stats, emails = _gather_context_for_question(
