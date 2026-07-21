@@ -12,7 +12,13 @@ A Telegram bot that helps MBA/college students manage academic email: compose po
 - **Class timetable** — Parses weekly schedules from body or attachments; morning digest + `/classes` show today's courses, times, and rooms
 - **14-day backfill** — One-time scan of recent inbox mail via `POST /tasks/backfill`
 
-Email categories: `deadline`, `placement`, `admin`, `other`.
+Email categories: `deadline`, `placement`, `certification`, `admin`, `other`.
+
+- **Marks attachments** — score sheets / results are posted as readable text in Telegram
+- **Reading attachments** — cases, chapters, and books are forwarded as files with the alert
+- **Action buttons** — DONE / NOT IMPORTANT / REMIND AGAIN on actionable alerts (placement, certification, deadlines)
+- **Priority surfacing** — important mail is pinned, highlighted in digests, and sorted first in `/due`
+- **Quiet owner DMs** — newsletters no longer flood your DM unless `OWNER_DM_ALL_MAIL=true`
 
 Scaffolded for later: submission matcher (#3), manual reminder parser (#4).
 
@@ -63,6 +69,7 @@ Create four Telegram groups and add your bot to each:
 |-------|---------|----------|
 | Deadlines | `TELEGRAM_CHAT_DEADLINES` | Assignments, projects, exams |
 | Placements | `TELEGRAM_CHAT_PLACEMENTS` | Shortlists, CV deadlines, interviews |
+| Certifications | `TELEGRAM_CHAT_CERTIFICATION` | NSE/Bloomberg/Coursera certs (falls back to Placements if blank) |
 | Admin | `TELEGRAM_CHAT_ADMIN` | Fees, registration, forms |
 | Other | `TELEGRAM_CHAT_OTHER` | Events, clubs, FYI |
 
@@ -144,6 +151,7 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `TELEGRAM_WEBHOOK_SECRET` | Random secret for webhook path |
 | `TELEGRAM_CHAT_DEADLINES` | Chat ID for deadline alerts (optional) |
 | `TELEGRAM_CHAT_PLACEMENTS` | Chat ID for placement alerts (optional) |
+| `TELEGRAM_CHAT_CERTIFICATION` | Chat ID for certification alerts (optional; falls back to placements) |
 | `TELEGRAM_CHAT_ADMIN` | Chat ID for admin alerts (optional) |
 | `TELEGRAM_CHAT_OTHER` | Chat ID for other/FYI alerts (optional) |
 | `GROQ_API_KEY` | Groq API key (free from console.groq.com) |
@@ -159,6 +167,10 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `TASK_SECRET` | Protects `/tasks/watch-gmail`, `/tasks/backfill`, and digest endpoints |
 | `STUDENT_NAME` | Sign-off name for composed emails |
 | `RENDER_URL` | Public URL (for set_webhook.py) |
+| `OWNER_DM_ALL_MAIL` | `true` to DM owner for every email including newsletters (default: false) |
+| `REMIND_AGAIN_HOURS` | Hours until REMIND AGAIN re-alerts (default: 4) |
+
+Run `supabase/migration_reliability_polish.sql` once when upgrading an existing project.
 
 ## Commands
 

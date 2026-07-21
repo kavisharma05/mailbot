@@ -29,7 +29,7 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# Build
-dist/
-build/
-*.egg-info/
+# Local debug curl output
+healthz_body.txt
+ping_follow.txt
+ping_response_body.txt

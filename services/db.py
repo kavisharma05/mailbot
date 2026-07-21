@@ -16,7 +16,7 @@ _db_client: Client | None = None
 
 _ASSIGNMENT_COLUMNS = (
     "id, category, course_or_topic, task, deadline_text, deadline_date, "
-    "summary, confidence, status, created_at"
+    "summary, confidence, status, remind_at, gmail_message_id, gmail_thread_id, created_at"
 )
 
 
@@ -95,6 +95,30 @@ def is_email_processed(message_id: str) -> bool:
     return bool(result.data)
 
 
+# Short TTL cache: when Supabase flakes, avoid reprocessing storms (returns True = skip)
+_processed_cache: dict[str, float] = {}
+_PROCESSED_CACHE_TTL = 120.0
+
+
+def is_email_processed_cached(message_id: str) -> bool:
+    import time
+
+    now = time.time()
+    cached = _processed_cache.get(message_id)
+    if cached and cached > now:
+        return True
+    if is_email_processed(message_id):
+        _processed_cache[message_id] = now + _PROCESSED_CACHE_TTL
+        return True
+    return False
+
+
+def cache_email_processed(message_id: str) -> None:
+    import time
+
+    _processed_cache[message_id] = time.time() + _PROCESSED_CACHE_TTL
+
+
 def mark_email_processed(
     message_id: str,
     is_actionable: bool | None,
@@ -111,11 +135,33 @@ def mark_email_processed(
                 "assignment_id": assignment_id,
             }
         ).execute()
+        cache_email_processed(message_id)
     except Exception as exc:
         logger.exception("mark_email_processed failed for %s: %s", message_id, exc)
 
 
+@_safe_read(None)
+def find_open_assignment_for_message(message_id: str) -> dict[str, Any] | None:
+    db = get_db()
+    result = (
+        db.table("assignments")
+        .select(_ASSIGNMENT_COLUMNS)
+        .eq("gmail_message_id", message_id)
+        .eq("status", "open")
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
 def insert_assignment(data: dict[str, Any]) -> dict[str, Any] | None:
+    message_id = data.get("gmail_message_id")
+    if message_id:
+        existing = find_open_assignment_for_message(str(message_id))
+        if existing:
+            logger.info("Deduped assignment for message %s -> %s", message_id, existing["id"])
+            return existing
     try:
         db = get_db()
         result = db.table("assignments").insert(data).execute()
@@ -218,13 +264,116 @@ def mark_assignment_done(assignment_id: str) -> dict[str, Any] | None:
     db = get_db()
     result = (
         db.table("assignments")
-        .update({"status": "done"})
+        .update({"status": "done", "remind_at": None})
         .eq("id", assignment_id)
         .eq("status", "open")
         .execute()
     )
     rows = result.data or []
     return rows[0] if rows else None
+
+
+@_safe_read(None)
+def dismiss_assignment(assignment_id: str) -> dict[str, Any] | None:
+    db = get_db()
+    result = (
+        db.table("assignments")
+        .update({"status": "dismissed", "remind_at": None})
+        .eq("id", assignment_id)
+        .eq("status", "open")
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+@_safe_read(None)
+def schedule_assignment_reminder(assignment_id: str, remind_at: datetime) -> dict[str, Any] | None:
+    db = get_db()
+    result = (
+        db.table("assignments")
+        .update({"remind_at": remind_at.isoformat()})
+        .eq("id", assignment_id)
+        .eq("status", "open")
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+@_safe_read([])
+def get_assignments_due_reminder(before: datetime | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    db = get_db()
+    cutoff = (before or datetime.now(timezone.utc)).isoformat()
+    result = (
+        db.table("assignments")
+        .select(_ASSIGNMENT_COLUMNS)
+        .eq("status", "open")
+        .not_.is_("remind_at", "null")
+        .lte("remind_at", cutoff)
+        .order("remind_at")
+        .limit(limit)
+        .execute()
+    )
+    return result.data or []
+
+
+@_safe_read(None)
+def clear_assignment_reminder(assignment_id: str) -> None:
+    db = get_db()
+    db.table("assignments").update({"remind_at": None}).eq("id", assignment_id).execute()
+
+
+def enqueue_pending_email(message_id: str, error: str | None = None) -> None:
+    try:
+        db = get_db()
+        existing = (
+            db.table("pending_emails")
+            .select("message_id, attempts")
+            .eq("message_id", message_id)
+            .limit(1)
+            .execute()
+        )
+        rows = existing.data or []
+        if rows:
+            db.table("pending_emails").update(
+                {
+                    "attempts": int(rows[0].get("attempts") or 0) + 1,
+                    "last_error": error,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ).eq("message_id", message_id).execute()
+        else:
+            db.table("pending_emails").insert(
+                {
+                    "message_id": message_id,
+                    "attempts": 1,
+                    "last_error": error,
+                }
+            ).execute()
+    except Exception as exc:
+        logger.exception("enqueue_pending_email failed for %s: %s", message_id, exc)
+
+
+def dequeue_pending_email(message_id: str) -> None:
+    try:
+        db = get_db()
+        db.table("pending_emails").delete().eq("message_id", message_id).execute()
+    except Exception as exc:
+        logger.exception("dequeue_pending_email failed for %s: %s", message_id, exc)
+
+
+@_safe_read([])
+def list_pending_email_ids(limit: int = 30) -> list[str]:
+    db = get_db()
+    result = (
+        db.table("pending_emails")
+        .select("message_id")
+        .order("updated_at")
+        .limit(limit)
+        .execute()
+    )
+    return [row["message_id"] for row in (result.data or []) if row.get("message_id")]
 
 
 @_safe_read(None)

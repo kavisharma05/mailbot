@@ -9,7 +9,8 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 BOT_COMMANDS = [
-    BotCommand("due", "Open items for this chat/category"),
+    BotCommand("help", "Commands and tips"),
+    BotCommand("due", "Open items (priority first)"),
     BotCommand("list", "Same as /due"),
     BotCommand("done", "Mark item #n from /due as complete"),
     BotCommand("classes", "Today's classes for your section"),

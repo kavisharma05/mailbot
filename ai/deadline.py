@@ -12,7 +12,7 @@ from services.timeutil import (
     today_ist,
 )
 
-VALID_CATEGORIES = ("deadline", "placement", "admin", "other")
+VALID_CATEGORIES = ("deadline", "placement", "certification", "admin", "other")
 VALID_CONFIDENCE = ("high", "medium", "low")
 
 
@@ -20,6 +20,55 @@ def _normalize_category(value: str | None) -> str:
     if value in VALID_CATEGORIES:
         return value
     return "other"
+
+
+def _boost_category_from_signals(
+    subject: str,
+    body: str,
+    sender: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Lightweight keyword/sender corrections for common MBA mail types."""
+    blob = f"{subject}\n{body}\n{sender}".lower()
+    category = _normalize_category(result.get("category"))
+
+    cert_signals = (
+        "certification",
+        "certificate",
+        "certified",
+        "nse",
+        "bloomberg",
+        "coursera",
+        "linkedin learning",
+        "skill certification",
+        "professional certification",
+    )
+    placement_signals = (
+        "shortlist",
+        "placement",
+        "recruit",
+        "interview slot",
+        "cv deadline",
+        "resume deadline",
+        "company ppt",
+        "job opening",
+    )
+
+    if any(s in blob for s in cert_signals):
+        result["category"] = "certification"
+        if result.get("is_actionable") is not False:
+            result["is_actionable"] = True
+        if result.get("confidence") == "low":
+            result["confidence"] = "medium"
+    elif any(s in blob for s in placement_signals) and category in ("other", "admin"):
+        result["category"] = "placement"
+        if result.get("confidence") == "low":
+            result["confidence"] = "medium"
+
+    if not result.get("sender") and sender:
+        result["sender"] = sender.split("<")[0].strip().strip('"')
+
+    return result
 
 
 def _normalize_confidence(value: str | None) -> str:
@@ -157,5 +206,6 @@ def classify_email(
     if not result or not isinstance(result, dict):
         return None
 
+    result = _boost_category_from_signals(subject, body, sender, result)
     combined_body = f"{body}\n{attachment_text or ''}"
     return normalize_classification(result, received_at=ref, body=combined_body)

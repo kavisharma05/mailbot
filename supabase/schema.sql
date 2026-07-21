@@ -11,14 +11,31 @@ create table if not exists assignments (
     gmail_message_id text,
     expected_filename_hint text,
     summary text,
-    category text check (category in ('deadline', 'placement', 'admin', 'other')),
+    category text check (category in ('deadline', 'placement', 'certification', 'admin', 'other')),
     confidence text check (confidence in ('high', 'medium', 'low')),
     status text not null default 'open' check (status in ('open', 'done', 'dismissed')),
+    remind_at timestamptz,
     created_at timestamptz not null default now()
 );
 
 create index if not exists idx_assignments_status on assignments (status);
 create index if not exists idx_assignments_deadline on assignments (deadline_date);
+create unique index if not exists idx_assignments_gmail_message_open
+  on assignments (gmail_message_id)
+  where gmail_message_id is not null and status = 'open';
+
+create index if not exists idx_assignments_remind_at on assignments (remind_at)
+  where remind_at is not null and status = 'open';
+
+create table if not exists pending_emails (
+    message_id text primary key,
+    attempts int not null default 0,
+    last_error text,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_pending_emails_updated on pending_emails (updated_at);
 
 create table if not exists processed_emails (
     message_id text primary key,

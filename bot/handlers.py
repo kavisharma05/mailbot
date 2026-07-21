@@ -2,7 +2,7 @@ import asyncio
 import html
 import logging
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
@@ -19,14 +19,23 @@ from ai.assistant import answer_question, split_question_and_paste
 from ai.composer import compose_email
 from config import get_settings
 from gmail_api.client import send_email
+from services.alert_actions import (
+    ACT_DISMISS,
+    ACT_DONE,
+    ACT_REMIND,
+    parse_action_callback,
+)
 from services.db import (
+    dismiss_assignment,
     get_assignments_for_qa,
     get_open_assignments,
     get_preferred_section,
     log_low_confidence,
     mark_assignment_done,
+    schedule_assignment_reminder,
     set_preferred_section,
 )
+from services.formatting import CATEGORY_LABELS, is_priority_item
 from services.schedule import (
     _format_session_block,
     _session_section,
@@ -46,12 +55,7 @@ INSTRUCTIONS, RECIPIENT, CONFIRM = range(3)
 APPROVE_CB = "send_approve"
 CANCEL_CB = "send_cancel"
 
-CATEGORY_TITLES = {
-    "deadline": "Deadlines",
-    "placement": "Placements",
-    "admin": "Admin",
-    "other": "Other",
-}
+CATEGORY_TITLES = CATEGORY_LABELS
 
 GREETINGS = {"hi", "hey", "hello", "yo", "sup", "hii", "hiii", "heya"}
 
@@ -104,14 +108,30 @@ def _category_for_chat(chat_id: int | str | None) -> str | None:
     mapping = {
         str(settings.telegram_chat_deadlines): "deadline",
         str(settings.telegram_chat_placements): "placement",
+        str(settings.telegram_chat_certification or settings.telegram_chat_placements): "certification",
         str(settings.telegram_chat_admin): "admin",
         str(settings.telegram_chat_other): "other",
     }
     return mapping.get(chat)
 
 
+def _sort_items_priority_first(items: list[dict]) -> list[dict]:
+    def key(item: dict) -> tuple[int, str]:
+        cat = item.get("category") or "other"
+        pri = 0 if is_priority_item(
+            cat,
+            task=item.get("task"),
+            summary=item.get("summary"),
+        ) else 1
+        due = item.get("deadline_date") or "9999"
+        return (pri, due)
+
+    return sorted(items, key=key)
+
+
 def _format_due_list(items: list[dict], category: str | None) -> str:
     title = CATEGORY_TITLES.get(category or "", "Open items")
+    items = _sort_items_priority_first(items)
     if not items:
         return f"<b>{html.escape(title)}</b>\n\nNo open items right now."
 
@@ -122,7 +142,8 @@ def _format_due_list(items: list[dict], category: str | None) -> str:
         due = format_deadline_display(item.get("deadline_date"), item.get("deadline_text"), tz=IST)
         cat = item.get("category") or "other"
         prefix = f"[{CATEGORY_TITLES.get(cat, cat)}] " if not category else ""
-        lines.append(f"{i}. {prefix}<b>{html.escape(str(task))}</b>")
+        pri = "🔴 " if is_priority_item(cat, task=task, summary=item.get("summary")) else ""
+        lines.append(f"{i}. {pri}{prefix}<b>{html.escape(str(task))}</b>")
         lines.append(f"   Course: {html.escape(str(course))}")
         lines.append(f"   Due: {html.escape(str(due))}")
         lines.append("")
@@ -290,6 +311,76 @@ async def _reply_schedule_for_question(
     await reply_long(update.message, text, parse_mode="HTML")
 
 
+async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    parsed = parse_action_callback(query.data)
+    if not parsed:
+        await query.answer()
+        return
+
+    action, assignment_id = parsed
+    settings = get_settings()
+
+    if action == ACT_DONE:
+        updated = await asyncio.to_thread(mark_assignment_done, assignment_id)
+        if updated:
+            task = updated.get("task") or updated.get("summary") or "item"
+            await query.answer("Marked done.")
+            try:
+                await query.edit_message_text(
+                    f"✅ Done: {html.escape(str(task))}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            try:
+                await context.bot.unpin_chat_message(
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                )
+            except Exception:
+                pass
+        else:
+            await query.answer("Already closed or not found.")
+        return
+
+    if action == ACT_DISMISS:
+        updated = await asyncio.to_thread(dismiss_assignment, assignment_id)
+        if updated:
+            await query.answer("Marked not important.")
+            try:
+                await query.edit_message_text("🚫 Marked not important.")
+            except Exception:
+                pass
+            try:
+                await context.bot.unpin_chat_message(
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                )
+            except Exception:
+                pass
+        else:
+            await query.answer("Already closed or not found.")
+        return
+
+    if action == ACT_REMIND:
+        hours = max(1, int(settings.remind_again_hours or 4))
+        remind_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+        updated = await asyncio.to_thread(schedule_assignment_reminder, assignment_id, remind_at)
+        if updated:
+            await query.answer(f"Reminder set for {hours}h from now.")
+        else:
+            await query.answer("Could not schedule reminder.")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        return
+    await start_command(update, context)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update):
         return
@@ -297,7 +388,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "Mailbot ready.\n\n"
         "Commands:\n"
-        "/due — open items for this chat/category\n"
+        "/due — open items (priority first)\n"
         "/list — same as /due\n"
         "/done <n> — mark item #n from /due as complete\n"
         "/classes — today's classes for your section (tap to set it first time)\n"
@@ -306,6 +397,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Add #verify to any question for a fresh Gmail answer with cited sources\n"
         "/send — compose and send an email (DM preferred)\n"
         "/cancel — cancel the current /send flow\n\n"
+        "Actionable alerts have DONE / NOT IMPORTANT / REMIND AGAIN buttons.\n"
+        "Marks in attachments show as text; readings are forwarded as files.\n\n"
         "In groups: reply to my messages, or mention me:\n"
         "@IMTAssistant_bot what's due this week?\n\n"
         "Tip: In BotFather → /setprivacy → Disable, so I can see all group messages."
@@ -644,12 +737,14 @@ def build_conversation_handler() -> ConversationHandler:
 
 def register_handlers(application) -> None:
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("due", due_command))
     application.add_handler(CommandHandler("list", due_command))
     application.add_handler(CommandHandler("done", done_command))
     application.add_handler(CommandHandler("classes", classes_command))
     application.add_handler(CommandHandler("section", section_command))
     application.add_handler(CallbackQueryHandler(section_button, pattern=r"^section:"))
+    application.add_handler(CallbackQueryHandler(action_button, pattern=r"^act:"))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(build_conversation_handler())
     # Free-text Q&A after conversation handler so /send flow keeps priority

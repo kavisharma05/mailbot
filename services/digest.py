@@ -18,16 +18,37 @@ from services.schedule import (
     refresh_schedule_from_gmail,
     sessions_for_day,
 )
+from services.formatting import CATEGORY_LABELS, escape_html, format_deadline, is_priority_item
 from services.telegram_util import send_html
-from services.watcher import CATEGORY_LABELS, _escape_html, _format_deadline_display
 
 logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
+_escape_html = escape_html
+_format_deadline_display = format_deadline
 
 # Cap long sections so a digest never exceeds Telegram's message limit.
 _MAX_OVERDUE_SHOWN = 12
 _MAX_DUE_SHOWN = 20
+
+
+def _priority_items(*lists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for items in lists:
+        for item in items:
+            iid = item.get("id")
+            if iid and iid in seen:
+                continue
+            if iid:
+                seen.add(iid)
+            if is_priority_item(
+                item.get("category") or "other",
+                task=item.get("task"),
+                summary=item.get("summary"),
+            ):
+                out.append(item)
+    return out
 
 
 def _deadline_local_date(item: dict[str, Any], tz) -> datetime | None:
@@ -82,9 +103,14 @@ def _format_morning_owner_message(
     classes_text: str,
     today_items: list[dict[str, Any]],
     recent_items: list[dict[str, Any]],
+    priority_items: list[dict[str, Any]] | None = None,
 ) -> str:
     date_str = today.strftime("%a, %d %b %Y")
     lines = [f"<b>☀️ Good morning — your day</b>", f"<i>{date_str} (IST)</i>", ""]
+
+    if priority_items:
+        lines.append(_format_deadline_section("🔴 Priority", priority_items, max_shown=12))
+        lines.append("")
 
     if classes_text and "📚" in classes_text:
         lines.append(classes_text)
@@ -116,9 +142,14 @@ def _format_evening_owner_message(
     classes_text: str,
     overdue_items: list[dict[str, Any]],
     tomorrow_items: list[dict[str, Any]],
+    priority_items: list[dict[str, Any]] | None = None,
 ) -> str:
     date_str = tomorrow.strftime("%a, %d %b %Y")
     lines = [f"<b>🌙 Evening — tomorrow</b>", f"<i>{date_str} (IST)</i>", ""]
+
+    if priority_items:
+        lines.append(_format_deadline_section("🔴 Priority", priority_items, max_shown=12))
+        lines.append("")
 
     if overdue_items:
         lines.append(
@@ -178,12 +209,14 @@ async def run_morning_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
     recent = await asyncio.to_thread(get_recent_assignments, since, category=None)
     today_ids = {i["id"] for i in today_items}
     recent_only = [i for i in recent if i["id"] not in today_ids][:8]
+    priority = _priority_items(today_items, recent_only)
 
     text = _format_morning_owner_message(
         today=today,
         classes_text=classes_text,
         today_items=today_items,
         recent_items=recent_only,
+        priority_items=priority,
     )
 
     sent: list[str] = []
@@ -235,6 +268,7 @@ async def run_evening_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
         classes_text=classes_text,
         overdue_items=overdue_items,
         tomorrow_items=tomorrow_items,
+        priority_items=_priority_items(overdue_items, tomorrow_items),
     )
 
     sent: list[str] = []

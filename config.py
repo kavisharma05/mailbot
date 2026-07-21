@@ -11,8 +11,16 @@ class Settings(BaseSettings):
     telegram_webhook_secret: str
     telegram_chat_deadlines: str = ""
     telegram_chat_placements: str = ""
+    telegram_chat_certification: str = ""
     telegram_chat_admin: str = ""
     telegram_chat_other: str = ""
+
+    # When true, owner gets a DM for every classified email (including newsletters).
+    # Default false — only actionable / high-priority mail DMs the owner.
+    owner_dm_all_mail: bool = False
+
+    # Default hours for REMIND AGAIN on actionable alerts
+    remind_again_hours: int = 4
 
     groq_api_key: str
     groq_model: str = "llama-3.3-70b-versatile"

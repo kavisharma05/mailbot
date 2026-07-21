@@ -13,6 +13,7 @@ from services.db import check_db_health
 from services.digest import run_evening_digest, run_morning_digest
 from services.watcher import (
     WATCHER_INTERVAL_SECONDS,
+    run_due_reminders,
     run_gmail_backfill,
     run_gmail_watcher,
     watcher_lock,
@@ -97,11 +98,21 @@ async def _keep_alive_loop() -> None:
 
 async def _background_watcher_loop() -> None:
     """Poll Gmail every ~60s while the process is awake."""
+    reminder_counter = 0
     while True:
         try:
             async with watcher_lock:
                 result = await run_gmail_watcher(ptb_app.bot)
             logger.info("Background watcher result: %s", result)
+            reminder_counter += 1
+            if reminder_counter >= 5:
+                reminder_counter = 0
+                try:
+                    remind_result = await run_due_reminders(ptb_app.bot)
+                    if remind_result.get("reminders_sent"):
+                        logger.info("Due reminders: %s", remind_result)
+                except Exception as exc:
+                    logger.exception("Due reminders failed: %s", exc)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

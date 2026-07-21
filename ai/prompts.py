@@ -95,6 +95,8 @@ Current time: {now}
 Categories (pick exactly one):
 - "deadline" — assignments, projects, cases, quizzes, exams, submissions, class prep
 - "placement" — shortlists, CV/resume deadlines, company PPTs, interview slots, internships
+- "certification" — professional/skill certifications, certificate courses, NSE/Bloomberg/Coursera
+  deadlines, mandatory certification registration or submission
 - "admin" — fees, registration, forms, ID/library/hostel, official notices, timetables
 - "other" — clubs, events, newsletters, FYI-only mail with no action required
 
@@ -151,7 +153,7 @@ Respond ONLY with strict JSON, no markdown fences, no preamble:
 {{
 "is_actionable": true/false,
 "is_schedule": true/false,
-"category": "deadline|placement|admin|other",
+"category": "deadline|placement|certification|admin|other",
 "course_or_topic": "string or null",
 "task": "string or null",
 "deadline_text": "string or null (as stated in the email)",
@@ -168,7 +170,7 @@ Today: {today}. Now: {now}.
 {{
 "is_actionable": true/false,
 "is_schedule": true/false,
-"category": "deadline|placement|admin|other",
+"category": "deadline|placement|certification|admin|other",
 "course_or_topic": "string or null",
 "task": "string or null",
 "deadline_text": "string or null",

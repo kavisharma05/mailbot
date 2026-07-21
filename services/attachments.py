@@ -5,16 +5,34 @@ from __future__ import annotations
 import io
 import logging
 import re
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
+AttachmentIntent = Literal["marks", "reading", "other"]
+
 _MAX_TEXT_CHARS = 12000
 _MAX_FILE_BYTES = 20 * 1024 * 1024  # 20 MB Telegram-friendly limit
+_MAX_MARKS_TELEGRAM_CHARS = 3500
 _SKIP_NAME_RE = re.compile(
     r"(logo|signature|spacer|untitled|image0|footer|header)",
     re.IGNORECASE,
 )
+
+_MARKS_KEYWORDS = re.compile(
+    r"\b(marks?|marksheet|grade|grades|score|scores|result|results|"
+    r"cgpa|sgpa|gpa|percentile|rank|roll\s*no|roll\s*number|"
+    r"total\s*marks|internal\s*assessment|ia\s*marks|mid\s*term\s*marks)\b",
+    re.IGNORECASE,
+)
+
+_READING_KEYWORDS = re.compile(
+    r"\b(read|reading|readings|chapter|ch\.|case\s*study|case|"
+    r"book|article|paper|textbook|handout|prep\s*material|study\s*material)\b",
+    re.IGNORECASE,
+)
+
+_READING_EXTENSIONS = (".pdf", ".docx", ".doc", ".epub", ".pptx", ".ppt")
 
 
 def should_forward_attachment(att: dict[str, Any]) -> bool:
@@ -114,3 +132,66 @@ def combine_attachment_text(attachments: list[dict[str, Any]]) -> str:
         name = att.get("filename") or "attachment"
         blocks.append(f"--- Attachment: {name} ---\n{text}")
     return "\n\n".join(blocks)[:_MAX_TEXT_CHARS]
+
+
+def classify_attachment_intent(
+    filename: str,
+    extracted_text: str | None,
+    *,
+    email_subject: str = "",
+    email_body: str = "",
+) -> AttachmentIntent:
+    """Heuristic: marks -> post as text; reading -> forward file."""
+    name = (filename or "").lower()
+    text = (extracted_text or "").strip()
+    context = f"{email_subject} {email_body}".lower()
+
+    if text and _MARKS_KEYWORDS.search(text):
+        return "marks"
+    if _MARKS_KEYWORDS.search(name) or _MARKS_KEYWORDS.search(context):
+        if text and len(text) > 80:
+            return "marks"
+
+    if any(name.endswith(ext) for ext in _READING_EXTENSIONS):
+        if _READING_KEYWORDS.search(name) or _READING_KEYWORDS.search(context):
+            return "reading"
+        if _READING_KEYWORDS.search(text[:500] if text else ""):
+            return "reading"
+        if name.endswith(".pdf") and text and len(text) > 200:
+            return "reading"
+
+    if _READING_KEYWORDS.search(name):
+        return "reading"
+
+    return "other"
+
+
+def annotate_attachment_intents(
+    attachments: list[dict[str, Any]],
+    *,
+    email_subject: str = "",
+    email_body: str = "",
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for att in attachments:
+        intent = classify_attachment_intent(
+            att.get("filename") or "",
+            att.get("extracted_text"),
+            email_subject=email_subject,
+            email_body=email_body,
+        )
+        out.append({**att, "intent": intent})
+    return out
+
+
+def format_marks_for_telegram(filename: str, extracted_text: str) -> str:
+    """Format marks/score text for inline Telegram display."""
+    from services.formatting import escape_html
+
+    body = extracted_text.strip()
+    if len(body) > _MAX_MARKS_TELEGRAM_CHARS:
+        body = body[:_MAX_MARKS_TELEGRAM_CHARS] + "\n…(truncated)"
+    return (
+        f"📊 <b>Marks / results</b> — <i>{escape_html(filename)}</i>\n\n"
+        f"<pre>{escape_html(body)}</pre>"
+    )
