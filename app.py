@@ -29,6 +29,31 @@ ptb_app = build_telegram_application()
 KEEP_ALIVE_INTERVAL_SECONDS = 10 * 60
 KEEP_ALIVE_RETRY_SECONDS = 30
 KEEP_ALIVE_MAX_RETRIES = 3
+PING_BODY = b"ok"
+
+
+class InstantPingMiddleware:
+    """Answer /ping before FastAPI lifespan finishes starting Telegram/Gmail."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") in ("/ping", "/ping/"):
+            body = b"" if scope["method"] == "HEAD" else PING_BODY
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        [b"content-type", b"text/plain; charset=utf-8"],
+                        [b"content-length", str(len(body)).encode()],
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
 
 
 async def _keep_alive_loop() -> None:
@@ -104,17 +129,10 @@ async def lifespan(app: FastAPI):
     logger.info("Telegram application stopped")
 
 
-app = FastAPI(title="Mailbot", lifespan=lifespan)
+fastapi_app = FastAPI(title="Mailbot", lifespan=lifespan)
 
 
-@app.get("/ping")
-@app.head("/ping")
-async def ping():
-    """Ultra-cheap liveness endpoint for keep-alive pingers (no DB/LLM calls)."""
-    return {"status": "alive"}
-
-
-@app.get("/healthz")
+@fastapi_app.get("/healthz")
 async def healthz():
     from ai.client import get_llm_status
 
@@ -123,7 +141,7 @@ async def healthz():
     return {"status": status, "llm": get_llm_status(), "db": db}
 
 
-@app.post(f"/telegram/webhook/{{secret}}")
+@fastapi_app.post(f"/telegram/webhook/{{secret}}")
 async def telegram_webhook(secret: str, request: Request) -> Response:
     settings = get_settings()
     if not hmac.compare_digest(secret, settings.telegram_webhook_secret):
@@ -135,7 +153,7 @@ async def telegram_webhook(secret: str, request: Request) -> Response:
     return Response(status_code=200)
 
 
-@app.post("/tasks/watch-gmail")
+@fastapi_app.post("/tasks/watch-gmail")
 async def watch_gmail(x_task_secret: str = Header(..., alias="x-task-secret")):
     settings = get_settings()
     if not hmac.compare_digest(x_task_secret, settings.task_secret):
@@ -147,7 +165,7 @@ async def watch_gmail(x_task_secret: str = Header(..., alias="x-task-secret")):
     return result
 
 
-@app.post("/tasks/backfill")
+@fastapi_app.post("/tasks/backfill")
 async def backfill_gmail(
     days: int = 14,
     x_task_secret: str = Header(..., alias="x-task-secret"),
@@ -164,7 +182,7 @@ async def backfill_gmail(
     return result
 
 
-@app.post("/tasks/digest-morning")
+@fastapi_app.post("/tasks/digest-morning")
 async def digest_morning(
     dry_run: int = 0,
     x_task_secret: str = Header(..., alias="x-task-secret"),
@@ -178,7 +196,7 @@ async def digest_morning(
     return result
 
 
-@app.post("/tasks/digest-evening")
+@fastapi_app.post("/tasks/digest-evening")
 async def digest_evening(
     dry_run: int = 0,
     x_task_secret: str = Header(..., alias="x-task-secret"),
@@ -190,3 +208,6 @@ async def digest_evening(
     result = await run_evening_digest(ptb_app.bot, dry_run=bool(dry_run))
     logger.info("Evening digest result: %s", result)
     return result
+
+
+app = InstantPingMiddleware(fastapi_app)
