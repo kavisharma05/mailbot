@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
+from google.auth.exceptions import RefreshError
 from telegram import Update
 
 from bot.telegram_app import build_telegram_application, register_bot_commands
@@ -174,8 +175,15 @@ async def watch_gmail(x_task_secret: str = Header(..., alias="x-task-secret")):
     if not hmac.compare_digest(x_task_secret, settings.task_secret):
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
-    async with watcher_lock:
-        result = await run_gmail_watcher(ptb_app.bot)
+    try:
+        async with watcher_lock:
+            result = await run_gmail_watcher(ptb_app.bot)
+    except RefreshError as exc:
+        logger.exception("Gmail auth failed during watch-gmail: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Gmail refresh token expired or revoked; re-run scripts/get_gmail_token.py and update GMAIL_REFRESH_TOKEN",
+        ) from exc
     logger.info("Gmail watcher result: %s", result)
     return result
 

@@ -12,6 +12,11 @@ GMAIL_SCOPES = [
 _cached_credentials: Credentials | None = None
 
 
+def clear_credentials_cache() -> None:
+    global _cached_credentials
+    _cached_credentials = None
+
+
 def get_credentials() -> Credentials:
     global _cached_credentials
     settings = get_settings()
@@ -25,6 +30,17 @@ def get_credentials() -> Credentials:
             scopes=GMAIL_SCOPES,
         )
         if not creds.valid:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception:
+                # Drop bad cache so a rotated GMAIL_REFRESH_TOKEN can be picked up.
+                clear_credentials_cache()
+                try:
+                    from gmail_api.client import clear_gmail_service_cache
+
+                    clear_gmail_service_cache()
+                except Exception:
+                    pass
+                raise
         _cached_credentials = creds
     return _cached_credentials

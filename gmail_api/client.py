@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from typing import Any
 
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 
 from gmail_api.auth import get_credentials
@@ -12,6 +13,11 @@ from gmail_api.auth import get_credentials
 logger = logging.getLogger(__name__)
 
 _gmail_service = None
+
+
+def clear_gmail_service_cache() -> None:
+    global _gmail_service
+    _gmail_service = None
 
 
 def get_gmail_service():
@@ -30,12 +36,13 @@ def get_profile_history_id() -> str:
 
 def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | None]:
     """Return new message IDs since start_history_id and the latest historyId."""
-    service = get_gmail_service()
     message_ids: list[str] = []
     latest_history_id: str | None = None
     page_token = None
 
     try:
+        # Keep service construction inside try so auth / history-id errors can fall back.
+        service = get_gmail_service()
         while True:
             kwargs: dict[str, Any] = {
                 "userId": "me",
@@ -58,6 +65,9 @@ def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | No
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
+    except RefreshError:
+        clear_gmail_service_cache()
+        raise
     except Exception as exc:
         logger.warning("History list failed (%s), falling back to recent messages", exc)
         return list_recent_inbox_message_ids(), None
