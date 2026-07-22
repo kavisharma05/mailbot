@@ -2,6 +2,7 @@ import logging
 from datetime import date, datetime, timezone
 from functools import wraps
 from typing import Any, Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 from supabase import Client, create_client
 
@@ -534,3 +535,77 @@ def find_contacts_by_name(token: str, limit: int = 20) -> list[dict[str, Any]]:
         .execute()
     )
     return result.data or []
+
+
+# --- Digest idempotency (in-memory fallback if migration not applied yet) ---
+
+_digest_state_fallback: dict[str, date | None] = {"last_morning": None, "last_evening": None}
+_digest_state_table_missing = False
+
+
+def get_digest_state() -> dict[str, date | None]:
+    global _digest_state_table_missing
+    if _digest_state_table_missing:
+        return dict(_digest_state_fallback)
+    try:
+        db = get_db()
+        result = (
+            db.table("digest_state")
+            .select("last_morning, last_evening")
+            .eq("id", 1)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        err = str(exc).lower()
+        if "digest_state" in err or "does not exist" in err or "42p01" in err:
+            _digest_state_table_missing = True
+            logger.warning("digest_state table missing — using in-memory fallback: %s", exc)
+            return dict(_digest_state_fallback)
+        logger.exception("get_digest_state failed: %s", exc)
+        return dict(_digest_state_fallback)
+
+    rows = result.data or []
+    if not rows:
+        return {"last_morning": None, "last_evening": None}
+
+    def _parse_day(raw: Any) -> date | None:
+        if not raw:
+            return None
+        if isinstance(raw, date) and not isinstance(raw, datetime):
+            return raw
+        try:
+            return date.fromisoformat(str(raw)[:10])
+        except ValueError:
+            return None
+
+    row = rows[0]
+    return {
+        "last_morning": _parse_day(row.get("last_morning")),
+        "last_evening": _parse_day(row.get("last_evening")),
+    }
+
+
+def mark_digest_sent(kind: str, sent_on: date | None = None) -> None:
+    """Record that morning or evening digest was sent on sent_on (IST calendar day)."""
+    global _digest_state_table_missing
+    if kind not in ("morning", "evening"):
+        return
+    day = sent_on or datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    column = "last_morning" if kind == "morning" else "last_evening"
+    _digest_state_fallback[column] = day
+
+    if _digest_state_table_missing:
+        return
+    try:
+        db = get_db()
+        db.table("digest_state").update(
+            {column: day.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", 1).execute()
+    except Exception as exc:
+        err = str(exc).lower()
+        if "digest_state" in err or "does not exist" in err or "42p01" in err:
+            _digest_state_table_missing = True
+            logger.warning("digest_state table missing — using in-memory fallback: %s", exc)
+        else:
+            logger.exception("mark_digest_sent failed for %s: %s", kind, exc)

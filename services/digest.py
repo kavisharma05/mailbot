@@ -8,8 +8,10 @@ from config import get_settings
 from services.db import (
     get_assignments_due_between,
     get_assignments_due_on,
+    get_digest_state,
     get_preferred_section,
     get_recent_assignments,
+    mark_digest_sent,
 )
 from services.schedule import (
     _format_session_block,
@@ -179,6 +181,13 @@ async def _send_owner_digest(bot, text: str) -> bool:
     return await send_html(bot, owner, text)
 
 
+def _digest_already_sent_today(kind: str, today: date) -> bool:
+    state = get_digest_state() or {}
+    key = "last_morning" if kind == "morning" else "last_evening"
+    last = state.get(key)
+    return last == today
+
+
 async def _tomorrow_classes_text(tomorrow: date) -> str:
     section = await asyncio.to_thread(get_preferred_section)
     info: dict[str, Any] = {}
@@ -194,9 +203,19 @@ async def _tomorrow_classes_text(tomorrow: date) -> str:
     return _format_session_block(sessions, f"<b>📚 Tomorrow's classes — {label}</b>")
 
 
-async def run_morning_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
+async def run_morning_digest(bot, *, dry_run: bool = False, force: bool = False) -> dict[str, Any]:
     now = datetime.now(IST)
     today = now
+    today_date = today.date()
+
+    if not dry_run and not force and _digest_already_sent_today("morning", today_date):
+        return {
+            "kind": "morning",
+            "date_ist": today_date.isoformat(),
+            "skipped": "already_sent",
+            "dry_run": dry_run,
+        }
+
     since = datetime.now(timezone.utc) - timedelta(hours=18)
 
     classes_text = ""
@@ -223,12 +242,13 @@ async def run_morning_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
     if not dry_run:
         if await _send_owner_digest(bot, text):
             sent.append("owner")
+            await asyncio.to_thread(mark_digest_sent, "morning", today_date)
     else:
         sent.append("preview")
 
     return {
         "kind": "morning",
-        "date_ist": today.date().isoformat(),
+        "date_ist": today_date.isoformat(),
         "sent": sent,
         "due_today_count": len(today_items),
         "recent_count": len(recent_only),
@@ -237,10 +257,20 @@ async def run_morning_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
     }
 
 
-async def run_evening_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
+async def run_evening_digest(bot, *, dry_run: bool = False, force: bool = False) -> dict[str, Any]:
     now = datetime.now(IST)
     today = now
+    today_date = today.date()
     tomorrow = now + timedelta(days=1)
+
+    if not dry_run and not force and _digest_already_sent_today("evening", today_date):
+        return {
+            "kind": "evening",
+            "date_ist": today_date.isoformat(),
+            "tomorrow_ist": tomorrow.date().isoformat(),
+            "skipped": "already_sent",
+            "dry_run": dry_run,
+        }
 
     classes_text = await _tomorrow_classes_text(tomorrow.date())
     tomorrow_items = await asyncio.to_thread(
@@ -275,12 +305,13 @@ async def run_evening_digest(bot, *, dry_run: bool = False) -> dict[str, Any]:
     if not dry_run:
         if await _send_owner_digest(bot, text):
             sent.append("owner")
+            await asyncio.to_thread(mark_digest_sent, "evening", today_date)
     else:
         sent.append("preview")
 
     return {
         "kind": "evening",
-        "date_ist": today.date().isoformat(),
+        "date_ist": today_date.isoformat(),
         "tomorrow_ist": tomorrow.date().isoformat(),
         "sent": sent,
         "due_tomorrow_count": len(tomorrow_items),

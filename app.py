@@ -13,6 +13,7 @@ from config import get_settings
 from services.db import check_db_health
 from services.digest import run_evening_digest, run_morning_digest
 from services.telegram_dedupe import should_process_update
+from services.timeutil import now_ist
 from services.watcher import (
     WATCHER_INTERVAL_SECONDS,
     run_due_reminders,
@@ -32,6 +33,9 @@ ptb_app = build_telegram_application()
 KEEP_ALIVE_INTERVAL_SECONDS = 10 * 60
 KEEP_ALIVE_RETRY_SECONDS = 30
 KEEP_ALIVE_MAX_RETRIES = 3
+DIGEST_SCHEDULER_INTERVAL_SECONDS = 60
+MORNING_DIGEST_HOUR = 7
+EVENING_DIGEST_HOUR = 20
 PING_BODY = b"ok"
 
 
@@ -122,6 +126,30 @@ async def _background_watcher_loop() -> None:
         await asyncio.sleep(WATCHER_INTERVAL_SECONDS)
 
 
+async def _digest_scheduler_loop() -> None:
+    """Fire morning (07:00 IST) and evening (20:00 IST) digests while the app is awake."""
+    while True:
+        try:
+            now = now_ist()
+            if now.hour >= MORNING_DIGEST_HOUR:
+                result = await run_morning_digest(ptb_app.bot)
+                if result.get("sent"):
+                    logger.info("In-app morning digest: %s", result)
+                elif result.get("skipped"):
+                    pass  # already sent today — expected on subsequent ticks
+            if now.hour >= EVENING_DIGEST_HOUR:
+                result = await run_evening_digest(ptb_app.bot)
+                if result.get("sent"):
+                    logger.info("In-app evening digest: %s", result)
+                elif result.get("skipped"):
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Digest scheduler failed: %s", exc)
+        await asyncio.sleep(DIGEST_SCHEDULER_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await ptb_app.initialize()
@@ -130,8 +158,9 @@ async def lifespan(app: FastAPI):
     logger.info("Telegram application started")
     watcher_task = asyncio.create_task(_background_watcher_loop())
     keep_alive_task = asyncio.create_task(_keep_alive_loop())
+    digest_task = asyncio.create_task(_digest_scheduler_loop())
     yield
-    for task in (watcher_task, keep_alive_task):
+    for task in (watcher_task, keep_alive_task, digest_task):
         task.cancel()
         try:
             await task
@@ -208,13 +237,16 @@ async def backfill_gmail(
 @fastapi_app.post("/tasks/digest-morning")
 async def digest_morning(
     dry_run: int = 0,
+    force: int = 0,
     x_task_secret: str = Header(..., alias="x-task-secret"),
 ):
     settings = get_settings()
     if not hmac.compare_digest(x_task_secret, settings.task_secret):
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
-    result = await run_morning_digest(ptb_app.bot, dry_run=bool(dry_run))
+    result = await run_morning_digest(
+        ptb_app.bot, dry_run=bool(dry_run), force=bool(force)
+    )
     logger.info("Morning digest result: %s", result)
     return result
 
@@ -222,13 +254,16 @@ async def digest_morning(
 @fastapi_app.post("/tasks/digest-evening")
 async def digest_evening(
     dry_run: int = 0,
+    force: int = 0,
     x_task_secret: str = Header(..., alias="x-task-secret"),
 ):
     settings = get_settings()
     if not hmac.compare_digest(x_task_secret, settings.task_secret):
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
-    result = await run_evening_digest(ptb_app.bot, dry_run=bool(dry_run))
+    result = await run_evening_digest(
+        ptb_app.bot, dry_run=bool(dry_run), force=bool(force)
+    )
     logger.info("Evening digest result: %s", result)
     return result
 

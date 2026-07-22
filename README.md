@@ -6,7 +6,7 @@ A Telegram bot that helps MBA/college students manage academic email: compose po
 
 - **`/send`** — Turn rough instructions into a polished email draft, approve, and send via Gmail
 - **Email watcher** — Polls Gmail every ~60s in-app (plus GitHub Actions every 5 min as backup), classifies with Groq, sends rich owner alerts (sender, subject, summary, deadline)
-- **Scheduled digests** — Morning 7:00 IST: today's classes + due items to owner DM. Evening 20:00 IST: tomorrow's classes + due items to owner DM
+- **Scheduled digests** — Morning 7:00 IST and evening 20:00 IST owner DMs, fired by an **in-app scheduler** (GitHub Actions cron remains as backup)
 - **Incoming mail alerts** — Owner DM after classification with sender, subject, content summary, and deadline when present; actionable items also go to category groups
 - **Attachments** — Downloads mail attachments, reads PDF/Excel/Word text for classification, and forwards files to category groups and owner DM for actionable mail
 - **Class timetable** — Parses weekly schedules from body or attachments; morning digest + `/classes` show today's courses, times, and rooms
@@ -18,14 +18,14 @@ Email categories: `deadline`, `placement`, `certification`, `admin`, `other`.
 - **Reading attachments** — cases, chapters, and books are forwarded as files with the alert
 - **Action buttons** — DONE / NOT IMPORTANT / REMIND AGAIN on actionable alerts (placement, certification, deadlines)
 - **Priority surfacing** — important mail is pinned, highlighted in digests, and sorted first in `/due`
-- **Quiet owner DMs** — newsletters no longer flood your DM unless `OWNER_DM_ALL_MAIL=true`
+- **Quiet owner DMs** — set `OWNER_DM_ALL_MAIL=true` to DM owner for **every** email (recommended if you cannot miss any mail); default is actionable/priority only
 
 Scaffolded for later: submission matcher (#3), manual reminder parser (#4).
 
 ## Architecture
 
-- **FastAPI** app on Render (free tier) with Telegram webhook and a 60s in-process Gmail poll loop
-- **GitHub Actions** cron hits `/tasks/watch-gmail` every 5 min (cold-start safety net), plus digest endpoints at 7:00 and 20:00 IST
+- **FastAPI** app on Render (free tier) with Telegram webhook, a 60s in-process Gmail poll loop, and an in-app IST digest scheduler (7:00 / 20:00)
+- **GitHub Actions** cron hits `/tasks/watch-gmail` every 5 min (cold-start safety net) and digest endpoints at 7:00 and 20:00 IST as **backup** (idempotent — won't double-send)
 - **Supabase** Postgres for assignments, processed emails, watch state
 - **Gmail API** (OAuth2) for read + send
 - **Groq API** (free tier, Llama 3.3 70B) for structured JSON classification/composition
@@ -119,7 +119,9 @@ The `.github/workflows/scheduler.yml` workflow will:
 |----------------|-----|----------|
 | `*/5 * * * *` | every 5 min | `/tasks/watch-gmail` |
 | `30 1 * * *` | 7:00 | `/tasks/digest-morning` |
-| `30 14 * * *` | 20:00 | `/tasks/digest-evening` |
+| `30 14 * * *` | 20:00 | `/tasks/digest-evening` (backup; in-app scheduler is primary) |
+
+Digests are sent once per day via idempotent state in Supabase (`digest_state`). A second trigger the same day returns `{"skipped": "already_sent"}`. Use `?force=1` to re-send manually.
 
 Use **Actions → Mailbot Scheduler → Run workflow** to manually trigger the watcher or either digest.
 
@@ -167,11 +169,12 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `TASK_SECRET` | Protects `/tasks/watch-gmail`, `/tasks/backfill`, and digest endpoints |
 | `STUDENT_NAME` | Sign-off name for composed emails; also used to find your row on marksheets in chat Q&A (set this to match how your name appears on grade PDFs/Excel) |
 | `RENDER_URL` | Public URL (for set_webhook.py) |
-| `OWNER_DM_ALL_MAIL` | `true` to DM owner for every email including newsletters (default: false) |
+| `OWNER_DM_ALL_MAIL` | `true` to DM owner for **every** classified email (set on Render too); default `false` = actionable/priority only |
 | `REMIND_AGAIN_HOURS` | Hours until REMIND AGAIN re-alerts (default: 4) |
 
 Run `supabase/migration_reliability_polish.sql` once when upgrading an existing project.
 Run `supabase/migration_contacts.sql` once to enable learned name→email contact resolution.
+Run `supabase/migration_digest_state.sql` once to enable digest idempotency (prevents double morning/evening sends).
 
 ## Commands
 
@@ -204,9 +207,8 @@ Also accepted: `#live`, `#realtime`, or a leading `verify:` / `live:` prefix.
 
 - Verify `GROQ_MODEL` matches a model available on the Groq free tier
 - Low-confidence classifier outputs are logged to `low_confidence_log` in Supabase
-- Only `medium` and `high` confidence actionable emails trigger category-group alerts (owner always gets a rich summary after classify)
-- **Morning digest (7:00 IST):** consolidated owner DM — today's classes, due today, recently tracked items
-- **Evening digest (20:00 IST):** consolidated owner DM — overdue (if any), tomorrow's classes, due tomorrow
+- Only `medium` and `high` confidence actionable emails trigger category-group alerts (owner gets a rich summary after classify when `OWNER_DM_ALL_MAIL=true` or mail is actionable/priority)
+- **Morning digest (7:00 IST)** and **evening digest (20:00 IST):** in-app scheduler while Render is awake; GitHub Actions + cron-job.org keep-alive are backups
 - Category groups receive actionable real-time alerts only; digests go to owner DM
 - Watcher polls every **~60s** while the app is awake, plus GitHub Actions every **5 min** as backup
 - If email classification fails (LLM/JSON error), the message is **not** marked processed and will retry on the next watcher run (~60s)
