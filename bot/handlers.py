@@ -10,15 +10,25 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
 
-from ai.assistant import answer_question, split_question_and_paste
+from ai.assistant import answer_question, lookup_contact_email, split_question_and_paste
 from ai.composer import compose_email
+from ai.intent import (
+    INTENT_COMPOSE,
+    INTENT_CONTACT_LOOKUP,
+    INTENT_DUE_LIST,
+    INTENT_MAILBOX_QA,
+    INTENT_SCHEDULE,
+    INTENT_SMALLTALK,
+    classify_message,
+)
 from config import get_settings
 from gmail_api.client import send_email
+from services.contacts import format_contact_lookup_answer, resolve_contact, resolve_contact_email
+from services.conversation import clear_convo, get_convo, remember_turn
 from services.alert_actions import (
     ACT_DISMISS,
     ACT_DONE,
@@ -51,6 +61,10 @@ from services.timeutil import IST, format_deadline_display, today_ist
 logger = logging.getLogger(__name__)
 
 INSTRUCTIONS, RECIPIENT, CONFIRM = range(3)
+
+COMPOSE_NEED_CONTENT = "need_content"
+COMPOSE_NEED_RECIPIENT = "need_recipient"
+COMPOSE_CONFIRM = "confirm"
 
 APPROVE_CB = "send_approve"
 CANCEL_CB = "send_cancel"
@@ -476,7 +490,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/ask <question> — ask about deadlines, mails today, senders, or email content\n"
         "Add #verify to any question for a fresh Gmail answer with cited sources\n"
         "/send — compose and send an email (DM preferred)\n"
-        "/cancel — cancel the current /send flow\n\n"
+        "/cancel — cancel the current compose flow\n"
+        "/reset — clear conversation context for a fresh topic\n\n"
         "Actionable alerts have DONE / NOT IMPORTANT / REMIND AGAIN buttons.\n"
         "Marks in attachments show as text; readings are forwarded as files.\n\n"
         "In groups: reply to my messages, or mention me:\n"
@@ -610,13 +625,189 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _answer_chat_question(update, context, question)
 
 
+def _get_compose(user_data: dict) -> dict | None:
+    compose = user_data.get("compose")
+    return compose if isinstance(compose, dict) else None
+
+
+def _clear_compose(user_data: dict) -> None:
+    user_data.pop("compose", None)
+
+
+def _compose_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Approve & Send", callback_data=APPROVE_CB),
+                InlineKeyboardButton("Cancel", callback_data=CANCEL_CB),
+            ]
+        ]
+    )
+
+
+async def _resolve_recipient_hint(recipient: str | None) -> tuple[str | None, str | None]:
+    """Return (email, disambiguation_message)."""
+    if not recipient:
+        return None, None
+    text = recipient.strip()
+    if "@" in text:
+        return text.lower(), None
+    email = await asyncio.to_thread(resolve_contact_email, text)
+    if email:
+        return email, None
+    matches = await asyncio.to_thread(resolve_contact, text)
+    if len(matches) == 1:
+        return matches[0].get("email"), None
+    if len(matches) > 1:
+        return None, await asyncio.to_thread(format_contact_lookup_answer, text, matches)
+    return None, (
+        f"I don't have an email for {text} yet. "
+        "Paste their email address, or wait until you've received mail from them."
+    )
+
+
+async def _draft_and_show_compose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    compose = _get_compose(context.user_data)
+    if not compose:
+        return
+    recipient = compose.get("recipient")
+    instructions = compose.get("instructions")
+    if not recipient or not instructions:
+        return
+
+    await update.message.reply_text("Drafting your email...")
+    draft = await asyncio.to_thread(compose_email, instructions)
+    if not draft or "subject" not in draft or "body" not in draft:
+        await asyncio.to_thread(
+            log_low_confidence,
+            "composer",
+            {"instructions": instructions, "draft": draft},
+        )
+        await update.message.reply_text("Couldn't draft the email. Try rephrasing your instructions.")
+        _clear_compose(context.user_data)
+        return
+
+    compose["draft"] = draft
+    compose["step"] = COMPOSE_CONFIRM
+    context.user_data["compose"] = compose
+
+    msg = (
+        f"To: {recipient}\n"
+        f"Subject: {draft['subject']}\n\n"
+        f"{draft['body']}"
+    )
+    sent = await update.message.reply_text(msg, reply_markup=_compose_keyboard())
+    _track_bot_message(context, sent.message_id)
+
+
+async def _begin_compose_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    recipient: str | None = None,
+    content: str | None = None,
+) -> None:
+    compose: dict = {"step": COMPOSE_NEED_CONTENT, "instructions": None, "recipient": None, "draft": None}
+    if content:
+        compose["instructions"] = content.strip()
+    if recipient:
+        email, note = await _resolve_recipient_hint(recipient)
+        if note:
+            compose["recipient_name"] = recipient
+            if compose["instructions"]:
+                compose["pending_recipient_name"] = recipient
+            await update.message.reply_text(note)
+            if not compose["instructions"]:
+                compose["step"] = COMPOSE_NEED_CONTENT
+                context.user_data["compose"] = compose
+                await update.message.reply_text("What do you want to say in the email?")
+                remember_turn(
+                    context.user_data,
+                    user_text=update.message.text,
+                    bot_text=note,
+                    intent="compose",
+                )
+                return
+        elif email:
+            compose["recipient"] = email
+
+    if compose.get("instructions") and compose.get("recipient"):
+        context.user_data["compose"] = compose
+        await _draft_and_show_compose(update, context)
+        remember_turn(
+            context.user_data,
+            user_text=update.message.text,
+            intent="compose",
+            person=compose.get("recipient_name") or recipient,
+            person_email=compose.get("recipient"),
+            query=compose.get("instructions"),
+        )
+        return
+
+    if compose.get("instructions") and not compose.get("recipient"):
+        compose["step"] = COMPOSE_NEED_RECIPIENT
+        context.user_data["compose"] = compose
+        await update.message.reply_text("Who should I send it to? (name or email address)")
+        remember_turn(context.user_data, user_text=update.message.text, intent="compose", query=compose["instructions"])
+        return
+
+    compose["step"] = COMPOSE_NEED_CONTENT
+    context.user_data["compose"] = compose
+    if recipient and not compose.get("recipient"):
+        compose["recipient_name"] = recipient
+        await update.message.reply_text("What do you want to say in the email?")
+    else:
+        await update.message.reply_text(
+            "What do you want to say? Give me rough instructions and I'll draft the email."
+        )
+    remember_turn(context.user_data, user_text=update.message.text, intent="compose", person=recipient)
+
+
+async def _continue_compose_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    compose = _get_compose(context.user_data)
+    if not compose:
+        return
+
+    step = compose.get("step")
+    if step == COMPOSE_NEED_CONTENT:
+        compose["instructions"] = text.strip()
+        if compose.get("recipient"):
+            context.user_data["compose"] = compose
+            await _draft_and_show_compose(update, context)
+            remember_turn(context.user_data, user_text=text, intent="compose", query=text)
+            return
+        compose["step"] = COMPOSE_NEED_RECIPIENT
+        context.user_data["compose"] = compose
+        await update.message.reply_text("Who should I send it to? (name or email address)")
+        remember_turn(context.user_data, user_text=text, intent="compose", query=text)
+        return
+
+    if step == COMPOSE_NEED_RECIPIENT:
+        email, note = await _resolve_recipient_hint(text.strip())
+        if note and not email:
+            await update.message.reply_text(note)
+            remember_turn(context.user_data, user_text=text, intent="compose")
+            return
+        compose["recipient"] = email or text.strip()
+        context.user_data["compose"] = compose
+        await _draft_and_show_compose(update, context)
+        remember_turn(
+            context.user_data,
+            user_text=text,
+            intent="compose",
+            person=text.strip(),
+            person_email=compose.get("recipient"),
+        )
+        return
+
+
 async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Answer free-text questions in DMs, mentions, or replies to the bot."""
     if not _is_owner(update) or not update.message or not update.message.text:
         return
 
-    # Don't steal messages from /send conversation states
-    if context.user_data.get("instructions") or context.user_data.get("draft"):
+    if _get_compose(context.user_data):
+        await _continue_compose_flow(update, context, update.message.text)
         return
 
     text = update.message.text
@@ -644,22 +835,69 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     question = _strip_bot_mention(text, bot_username)
-
-    if question.strip().lower().rstrip("!.?") in GREETINGS:
-        await update.message.reply_text("Hey — ask me about deadlines, mail, or /classes.")
-        return
-
     if not question:
         await update.message.reply_text("Ask me about your deadlines, placements, or admin items.")
         return
 
-    await _answer_chat_question(update, context, question)
+    convo = get_convo(context.user_data)
+    classified = await asyncio.to_thread(classify_message, question, convo)
+    intent = classified.get("intent", INTENT_MAILBOX_QA)
+
+    if intent == INTENT_SMALLTALK:
+        reply = "Hey — ask me about deadlines, mail, /send to compose, or /classes."
+        await update.message.reply_text(reply)
+        remember_turn(context.user_data, user_text=question, bot_text=reply, intent=intent)
+        return
+
+    if intent == INTENT_COMPOSE:
+        await _begin_compose_flow(
+            update,
+            context,
+            recipient=classified.get("recipient"),
+            content=classified.get("content"),
+        )
+        return
+
+    if intent == INTENT_CONTACT_LOOKUP:
+        person = classified.get("person")
+        answer = await asyncio.to_thread(lookup_contact_email, person)
+        await reply_long(update.message, answer)
+        remember_turn(
+            context.user_data,
+            user_text=question,
+            bot_text=answer,
+            intent=intent,
+            person=person,
+            query=question,
+        )
+        return
+
+    if intent == INTENT_SCHEDULE:
+        await _reply_schedule_for_question(update, context, question)
+        remember_turn(context.user_data, user_text=question, intent="schedule", query=question)
+        return
+
+    if intent == INTENT_DUE_LIST:
+        await due_command(update, context)
+        remember_turn(context.user_data, user_text=question, intent="due_list", query=question)
+        return
+
+    await _answer_chat_question(
+        update,
+        context,
+        question,
+        person_hint=classified.get("person"),
+        intent=intent,
+    )
 
 
 async def _answer_chat_question(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     question: str,
+    *,
+    person_hint: str | None = None,
+    intent: str = "mailbox_qa",
 ) -> None:
     verified, cleaned = _extract_verify_tag(question)
     if verified and not cleaned:
@@ -672,9 +910,11 @@ async def _answer_chat_question(
     last_intent = context.user_data.get("last_intent")
     if not verified and _is_schedule_question(question_for_qa, last_intent=last_intent):
         await _reply_schedule_for_question(update, context, question_for_qa)
+        remember_turn(context.user_data, user_text=question, intent="schedule", query=question_for_qa)
         return
 
-    context.user_data["last_intent"] = "qa"
+    context.user_data["last_intent"] = intent
+    convo = get_convo(context.user_data)
     await update.message.chat.send_action("typing")
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
 
@@ -693,6 +933,8 @@ async def _answer_chat_question(
             category=category,
             pasted_email=pasted,
             verified=verified,
+            convo=convo,
+            person_hint=person_hint,
         )
     except Exception as exc:
         logger.exception("Q&A failed: %s", exc)
@@ -706,81 +948,69 @@ async def _answer_chat_question(
 
     # Plain text avoids Telegram HTML parse errors from LLM output; chunk if long.
     await reply_long(update.message, answer)
-
-
-async def send_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_owner(update):
-        return ConversationHandler.END
-
-    context.user_data.clear()
-    await update.message.reply_text(
-        "What do you want to say? Give me rough instructions and I'll draft the email."
-    )
-    return INSTRUCTIONS
-
-
-async def receive_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["instructions"] = update.message.text
-    await update.message.reply_text("Who should I send it to? (email address)")
-    return RECIPIENT
-
-
-async def receive_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    recipient = update.message.text.strip()
-    if "@" not in recipient:
-        await update.message.reply_text("That doesn't look like an email. Try again:")
-        return RECIPIENT
-
-    context.user_data["recipient"] = recipient
-    instructions = context.user_data["instructions"]
-
-    await update.message.reply_text("Drafting your email...")
-    draft = await asyncio.to_thread(compose_email, instructions)
-
-    if not draft or "subject" not in draft or "body" not in draft:
-        await asyncio.to_thread(
-            log_low_confidence,
-            "composer",
-            {"instructions": instructions, "draft": draft},
-        )
-        await update.message.reply_text("Couldn't draft the email. Try rephrasing your instructions.")
-        return ConversationHandler.END
-
-    context.user_data["draft"] = draft
-
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Approve & Send", callback_data=APPROVE_CB),
-                InlineKeyboardButton("Cancel", callback_data=CANCEL_CB),
-            ]
-        ]
+    person = person_hint or convo.get("last_person")
+    person_email = convo.get("last_person_email")
+    if person_hint:
+        resolved = await asyncio.to_thread(resolve_contact_email, person_hint)
+        if resolved:
+            person_email = resolved
+    remember_turn(
+        context.user_data,
+        user_text=question,
+        bot_text=answer[:800],
+        intent=intent,
+        person=person_hint or person,
+        person_email=person_email,
+        query=question,
     )
 
-    await update.message.reply_text(
-        f"To: {recipient}\n"
-        f"Subject: {draft['subject']}\n\n"
-        f"{draft['body']}",
-        reply_markup=keyboard,
+
+async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+
+    convo = get_convo(context.user_data)
+    seed_content = None
+    seed_recipient = None
+    if convo:
+        seed_recipient = convo.get("last_person_email") or convo.get("last_person")
+        for turn in reversed(convo.get("history") or []):
+            if turn.get("role") == "user" and len(turn.get("text") or "") > 20:
+                seed_content = turn.get("text")
+                break
+
+    args = " ".join(context.args).strip() if context.args else ""
+    if args:
+        if "@" in args:
+            await _begin_compose_flow(update, context, recipient=args)
+        else:
+            await _begin_compose_flow(update, context, content=args)
+        return
+
+    await _begin_compose_flow(
+        update,
+        context,
+        recipient=seed_recipient,
+        content=seed_content,
     )
-    return CONFIRM
 
 
-async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
     if query.data == CANCEL_CB:
-        context.user_data.clear()
+        _clear_compose(context.user_data)
         await query.edit_message_text("Cancelled. Draft discarded.")
-        return ConversationHandler.END
+        return
 
-    draft = context.user_data.get("draft")
-    recipient = context.user_data.get("recipient")
+    compose = _get_compose(context.user_data)
+    draft = (compose or {}).get("draft")
+    recipient = (compose or {}).get("recipient")
 
     if not draft or not recipient:
         await query.edit_message_text("Something went wrong. Run /send again.")
-        return ConversationHandler.END
+        return
 
     try:
         await asyncio.to_thread(
@@ -790,30 +1020,30 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             body=draft["body"],
         )
         await query.edit_message_text(f"Sent to {recipient}.")
+        remember_turn(
+            context.user_data,
+            bot_text=f"Sent to {recipient}.",
+            intent="compose",
+            person_email=recipient,
+        )
     except Exception as exc:
         logger.exception("Failed to send email")
         await query.edit_message_text(f"Failed to send: {exc}")
 
-    context.user_data.clear()
-    return ConversationHandler.END
+    _clear_compose(context.user_data)
 
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text("Cancelled.")
-    return ConversationHandler.END
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _clear_compose(context.user_data)
+    await update.message.reply_text("Cancelled compose flow.")
 
 
-def build_conversation_handler() -> ConversationHandler:
-    return ConversationHandler(
-        entry_points=[CommandHandler("send", send_start)],
-        states={
-            INSTRUCTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_instructions)],
-            RECIPIENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_recipient)],
-            CONFIRM: [CallbackQueryHandler(confirm_callback, pattern=f"^({APPROVE_CB}|{CANCEL_CB})$")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
-        allow_reentry=True,
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+    clear_convo(context.user_data)
+    await update.message.reply_text(
+        "Context cleared. You can start a fresh topic — deadlines, mail lookup, or /send."
     )
 
 
@@ -829,6 +1059,11 @@ def register_handlers(application) -> None:
     application.add_handler(CallbackQueryHandler(clear_chat_button, pattern=f"^{CLEAR_CHAT_CB}$"))
     application.add_handler(CallbackQueryHandler(action_button, pattern=r"^act:"))
     application.add_handler(CommandHandler("ask", ask_command))
-    application.add_handler(build_conversation_handler())
-    # Free-text Q&A after conversation handler so /send flow keeps priority
+    application.add_handler(CommandHandler("send", send_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(CommandHandler("new", reset_command))
+    application.add_handler(
+        CallbackQueryHandler(confirm_callback, pattern=f"^({APPROVE_CB}|{CANCEL_CB})$")
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_message))

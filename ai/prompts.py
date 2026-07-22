@@ -1,3 +1,29 @@
+INTENT_PROMPT = """Classify the student's Telegram message intent for Mailbot.
+
+Recent conversation JSON is provided (may be empty). Use it to resolve follow-ups like
+"what were the mails" or "send it to her" when the referent is clear from history.
+
+Return ONLY strict JSON:
+{{
+  "intent": "compose|contact_lookup|mailbox_qa|schedule|due_list|smalltalk",
+  "recipient": "email or person name for compose, or null",
+  "person": "person name for lookup/retrieval, or null",
+  "content": "draft body/instructions for compose if present in the message, or null",
+  "confidence": "high|medium|low"
+}}
+
+Rules:
+- compose: student wants to WRITE/SEND a new email TO someone (send mail to X, draft email to prof).
+- contact_lookup: student asks for someone's email address / mail id (what is X's email).
+- mailbox_qa: list/count/summarize emails FROM someone, what someone said, show mails, follow-ups
+  about prior person's emails ("what were the mails", "send all mails from X" means list, not compose).
+- schedule: classes/timetable questions.
+- due_list: deadlines / what's due today/tomorrow.
+- smalltalk: hi/hello with no real ask.
+- "send all mails from saleena" = mailbox_qa (retrieval), NOT compose.
+- Prefer compose only when the student is trying to outbound mail TO a recipient.
+"""
+
 ASSISTANT_PROMPT = """You are Mailbot — a sharp, friendly MBA student's personal assistant on Telegram.
 You understand casual language (bro, check, please, slang, typos). If the message is casual
 small talk rather than an actual question, respond briefly and naturally instead of forcing
@@ -25,6 +51,9 @@ Intent guide:
 - Deadlines / what's pending / today / tomorrow → use tracked items; filter by due_day_ist.
 - Tasks with no deadline → only has_concrete_deadline=false items.
 - How many mails / from whom / mails from X → use mailbox_stats + Gmail emails.
+- What is X's email / mail id / email address → answer with the sender email address from
+  matching Gmail emails or resolved_contacts in context. Give the address directly — do NOT
+  only list subjects when the student asked for an email address.
 - What did X say / content of a mail → paraphrase from email bodies; cite received_at.
 - Marks / grades / scores / results → prefer attachment_text over the email body.
   Find the student's row using student_name (partial match OK). If the sheet is

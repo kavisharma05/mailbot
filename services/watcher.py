@@ -14,6 +14,7 @@ from gmail_api.client import (
 )
 from services.alert_delivery import deliver_attachments, send_actionable_alert, send_owner_update
 from services.attachments import annotate_attachment_intents
+from services.contacts import upsert_contact_from_sender
 from services.db import (
     clear_assignment_reminder,
     dequeue_pending_email,
@@ -255,6 +256,7 @@ async def _process_message(
 ) -> dict[str, Any]:
     """Classify one email, persist results, optionally alert + forward attachments."""
     details = await asyncio.to_thread(get_message_details, message_id, load_attachments=True)
+    await asyncio.to_thread(upsert_contact_from_sender, details.get("sender"))
     attachments = annotate_attachment_intents(
         details.get("attachments") or [],
         email_subject=details.get("subject") or "",

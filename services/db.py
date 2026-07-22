@@ -488,3 +488,49 @@ def set_preferred_section(section: str) -> None:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     ).execute()
+
+
+@_safe_write
+def upsert_contact(email: str, display_name: str | None, name_key: str) -> None:
+    db = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    existing = db.table("contacts").select("id, message_count").eq("email", email).limit(1).execute()
+    rows = existing.data or []
+    if rows:
+        count = int(rows[0].get("message_count") or 0) + 1
+        db.table("contacts").update(
+            {
+                "display_name": display_name or rows[0].get("display_name"),
+                "name_key": name_key or rows[0].get("name_key") or "",
+                "message_count": count,
+                "last_seen_at": now,
+            }
+        ).eq("email", email).execute()
+        return
+    db.table("contacts").insert(
+        {
+            "email": email,
+            "display_name": display_name,
+            "name_key": name_key or "",
+            "message_count": 1,
+            "last_seen_at": now,
+        }
+    ).execute()
+
+
+@_safe_read([])
+def find_contacts_by_name(token: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Find contacts whose name_key/display_name contains the token."""
+    if not token or len(token) < 2:
+        return []
+    db = get_db()
+    needle = token.lower()
+    result = (
+        db.table("contacts")
+        .select("email, display_name, name_key, message_count, last_seen_at")
+        .or_(f"name_key.ilike.%{needle}%,display_name.ilike.%{needle}%,email.ilike.%{needle}%")
+        .order("message_count", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return result.data or []

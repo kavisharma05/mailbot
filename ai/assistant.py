@@ -13,6 +13,13 @@ from gmail_api.client import (
     list_message_summaries,
     search_message_ids,
 )
+from services.contacts import (
+    format_contact_lookup_answer,
+    parse_sender,
+    resolve_contact,
+    resolve_contact_email,
+    sender_matches_name,
+)
 from services.timeutil import (
     IST,
     format_deadline_display,
@@ -45,7 +52,53 @@ _STOPWORDS = {
 }
 
 
-def _looks_like_pasted_email(text: str) -> bool:
+_REFERENT_RE = re.compile(
+    r"\b(the mails?|the emails?|those mails?|those emails?|her mails?|his mails?|"
+    r"their mails?|what were the|again|same person|that person|from her|from him)\b",
+    re.IGNORECASE,
+)
+
+
+def _question_has_referent(question: str) -> bool:
+    return bool(_REFERENT_RE.search(question))
+
+
+def _resolve_person_query(question: str, convo: dict[str, Any] | None = None) -> str | None:
+    """Extract person from question, falling back to conversation memory."""
+    person = _extract_person_query(question)
+    if person:
+        return person
+    if convo and _question_has_referent(question):
+        return convo.get("last_person")
+    return None
+
+
+def _person_to_gmail_from(person: str | None) -> tuple[str | None, str | None]:
+    """Return (gmail_from_clause, resolved_email). Prefer exact email from contacts."""
+    if not person:
+        return None, None
+    if "@" in person:
+        email = person.strip().lower()
+        return f"from:{email}", email
+    email = resolve_contact_email(person)
+    if email:
+        return f"from:{email}", email
+    return f'from:("{person}")', None
+
+
+def _filter_emails_for_person(emails: list[dict[str, Any]], person: str | None) -> list[dict[str, Any]]:
+    if not person or not emails:
+        return emails
+    filtered = [m for m in emails if sender_matches_name(m.get("sender"), person)]
+    return filtered or emails
+
+
+def lookup_contact_email(person: str | None) -> str:
+    """Deterministic contact lookup answer."""
+    if not person:
+        return "Who should I look up? Try: what is santhi mam's email?"
+    matches = resolve_contact(person)
+    return format_contact_lookup_answer(person, matches)
     lower = text.lower()
     return len(text) > 180 and (
         "dear " in lower
@@ -292,29 +345,37 @@ def _gmail_day_bounds_query(day: datetime | None = None) -> str:
     return f"after:{d.year}/{d.month:02d}/{d.day:02d} before:{nxt.year}/{nxt.month:02d}/{nxt.day:02d}"
 
 
-def _build_mailbox_queries(question: str) -> list[str]:
+def _build_mailbox_queries(question: str, convo: dict[str, Any] | None = None) -> list[str]:
     q = question.lower()
-    person = _extract_person_query(question)
+    person = _resolve_person_query(question, convo)
     queries: list[str] = []
 
     if "today" in q or "got today" in q or "received today" in q:
         day_q = _gmail_day_bounds_query()
         if person:
-            queries.append(f'from:("{person}") {day_q}')
-            queries.append(f"from:({person}) {day_q}")
+            from_clause, _ = _person_to_gmail_from(person)
+            if from_clause:
+                queries.append(f"{from_clause} {day_q}")
         queries.append(day_q)
         queries.append(f"(in:inbox OR in:spam) {day_q}")
     elif "yesterday" in q:
         day_q = _gmail_day_bounds_query(now_ist() - timedelta(days=1))
         if person:
-            queries.append(f'from:("{person}") {day_q}')
+            from_clause, _ = _person_to_gmail_from(person)
+            if from_clause:
+                queries.append(f"{from_clause} {day_q}")
         queries.append(day_q)
     elif person:
-        queries.append(f'from:("{person}") newer_than:90d')
-        queries.append(f"from:({person.split()[-1]}) newer_than:90d")
+        from_clause, email = _person_to_gmail_from(person)
+        if from_clause:
+            queries.append(f"{from_clause} newer_than:90d")
+        if email:
+            queries.append(f"from:{email} newer_than:90d")
+        else:
+            queries.append(f"from:({person.split()[-1]}) newer_than:90d")
         keywords = _extract_keywords(question, max_words=4)
-        if keywords:
-            queries.append(f'from:("{person}") {" ".join(keywords)} newer_than:90d')
+        if keywords and from_clause:
+            queries.append(f'{from_clause} {" ".join(keywords)} newer_than:90d')
     else:
         keywords = _extract_keywords(question, max_words=5)
         if keywords:
@@ -435,10 +496,12 @@ def _gather_mailbox_context(
     question: str,
     *,
     force_bodies: bool = False,
+    convo: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Stats + message list for mailbox Q&A."""
-    queries = _build_mailbox_queries(question)
+    queries = _build_mailbox_queries(question, convo)
     primary = queries[0]
+    person = _resolve_person_query(question, convo)
     wants_bodies = force_bodies or _wants_mail_bodies(question) or "whom" in question.lower() or "who" in question.lower()
     wants_attachments = force_bodies or _wants_attachment_text(question)
 
@@ -489,8 +552,10 @@ def _gather_mailbox_context(
             {"sender": s, "count": c}
             for s, c in sorted(senders.items(), key=lambda kv: (-kv[1], kv[0]))
         ],
-        "person_filter": _extract_person_query(question),
+        "person_filter": person,
+        "resolved_email": resolve_contact_email(person) if person and "@" not in person else person,
     }
+    emails = _filter_emails_for_person(emails, person)
     if wants_attachments:
         emails = _apply_attachment_budget(emails, wants_attachments=True)
     return stats, emails
@@ -855,9 +920,25 @@ def _build_user_prompt(
     mailbox_stats: dict[str, Any] | None = None,
     *,
     verified: bool = False,
+    convo: dict[str, Any] | None = None,
+    resolved_contacts: list[dict[str, Any]] | None = None,
 ) -> str:
     scope = f"Category hint: {category}" if category else "Category hint: none"
     parts = [scope, ""]
+
+    if convo:
+        convo_ctx = {
+            "last_person": convo.get("last_person"),
+            "last_person_email": convo.get("last_person_email"),
+            "last_query": convo.get("last_query"),
+            "last_intent": convo.get("last_intent"),
+        }
+        parts.append(f"Conversation memory (JSON):\n{json.dumps(convo_ctx, default=str)}")
+        parts.append("")
+
+    if resolved_contacts:
+        parts.append(f"Resolved contacts (JSON):\n{json.dumps(resolved_contacts, default=str)}")
+        parts.append("")
 
     if pasted_email:
         parts.append("Student pasted this email text:")
@@ -997,6 +1078,7 @@ def _gather_context_for_question(
     *,
     scan_gmail: bool,
     pasted_email: str | None,
+    convo: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Pull the richest useful Gmail context; heuristics only choose WHAT to fetch."""
     if not scan_gmail:
@@ -1009,7 +1091,7 @@ def _gather_context_for_question(
     wants_marks = _wants_attachment_text(question)
     wants_mailbox = (
         _is_mailbox_question(question)
-        or bool(_extract_person_query(question))
+        or bool(_resolve_person_query(question, convo))
         or wants_marks
         or any(w in q for w in ("mail", "email", "inbox", "sender", "whom", "who sent", "said", "wrote"))
     )
@@ -1019,7 +1101,7 @@ def _gather_context_for_question(
 
     if wants_mailbox:
         try:
-            stats, emails = _gather_mailbox_context(question)
+            stats, emails = _gather_mailbox_context(question, convo=convo)
         except Exception as exc:
             logger.warning("Mailbox context failed: %s", exc)
             stats, emails = {"count": 0, "error": str(exc)}, []
@@ -1050,6 +1132,8 @@ def answer_question(
     scan_gmail: bool = True,
     pasted_email: str | None = None,
     verified: bool = False,
+    convo: dict[str, Any] | None = None,
+    person_hint: str | None = None,
 ) -> str:
     """LLM-first: always ask the model; keyword heuristics only gather context / fallback."""
     ref = now_ist()
@@ -1061,10 +1145,12 @@ def answer_question(
             today=today, now=now_str, student_name=get_settings().student_name
         )
         try:
-            stats, emails = _gather_mailbox_context(question, force_bodies=True)
+            stats, emails = _gather_mailbox_context(question, force_bodies=True, convo=convo)
         except Exception as exc:
             logger.warning("Verified mailbox fetch failed: %s", exc)
             stats, emails = {"count": 0, "error": str(exc)}, []
+        person = person_hint or _resolve_person_query(question, convo)
+        resolved = resolve_contact(person) if person and "@" not in person else []
         user = _build_user_prompt(
             question,
             items,
@@ -1073,6 +1159,8 @@ def answer_question(
             pasted_email,
             mailbox_stats=stats,
             verified=True,
+            convo=convo,
+            resolved_contacts=resolved,
         )
         answer = call_text(system, user, temperature=0.45, max_tokens=1100)
         if answer and not _llm_answer_is_useless(answer):
@@ -1087,8 +1175,10 @@ def answer_question(
     )
 
     stats, emails = _gather_context_for_question(
-        question, scan_gmail=scan_gmail, pasted_email=pasted_email
+        question, scan_gmail=scan_gmail, pasted_email=pasted_email, convo=convo
     )
+    person = person_hint or _resolve_person_query(question, convo)
+    resolved = resolve_contact(person) if person and "@" not in person else []
     user = _build_user_prompt(
         question,
         items,
@@ -1096,6 +1186,8 @@ def answer_question(
         category,
         pasted_email,
         mailbox_stats=stats,
+        convo=convo,
+        resolved_contacts=resolved,
     )
 
     # Primary path: let the LLM understand any natural wording
@@ -1127,7 +1219,7 @@ def answer_question(
     ):
         if stats is None:
             try:
-                stats, emails = _gather_mailbox_context(question)
+                stats, emails = _gather_mailbox_context(question, convo=convo)
             except Exception:
                 stats, emails = {"count": 0}, emails
         return _format_mailbox_fallback(stats or {}, emails, question)

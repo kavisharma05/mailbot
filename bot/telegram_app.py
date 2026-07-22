@@ -17,7 +17,8 @@ BOT_COMMANDS = [
     BotCommand("section", "Change or check your section"),
     BotCommand("ask", "Ask about deadlines, mail, senders, or content"),
     BotCommand("send", "Compose and send an email"),
-    BotCommand("cancel", "Cancel the current /send flow"),
+    BotCommand("cancel", "Cancel the current compose flow"),
+    BotCommand("reset", "Clear conversation context"),
     BotCommand("start", "Welcome + help"),
 ]
 

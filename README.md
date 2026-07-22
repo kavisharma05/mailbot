@@ -171,6 +171,7 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `REMIND_AGAIN_HOURS` | Hours until REMIND AGAIN re-alerts (default: 4) |
 
 Run `supabase/migration_reliability_polish.sql` once when upgrading an existing project.
+Run `supabase/migration_contacts.sql` once to enable learned name→email contact resolution.
 
 ## Commands
 
@@ -183,7 +184,8 @@ Run `supabase/migration_reliability_polish.sql` once when upgrading an existing 
 | `/section` | Change or check your class section |
 | `/ask <question>` | Ask about deadlines, today's mails, senders, or email content |
 | `/send` | Compose and send an email |
-| `/cancel` | Cancel the current `/send` flow |
+| `/cancel` | Cancel the current compose flow |
+| `/reset` or `/new` | Clear conversation context for a fresh topic |
 
 In groups, also reply to the bot or mention it (`@IMTAssistant_bot what's due?`).  
 For free-text in groups without mentioning, disable privacy in BotFather: `/setprivacy` → Disable.
@@ -209,6 +211,9 @@ Also accepted: `#live`, `#realtime`, or a leading `verify:` / `live:` prefix.
 - Watcher polls every **~60s** while the app is awake, plus GitHub Actions every **5 min** as backup
 - If email classification fails (LLM/JSON error), the message is **not** marked processed and will retry on the next watcher run (~60s)
 - `/ask` uses LLM + DB + Gmail; replies are plain text with safe fallbacks when AI is unavailable
+- **Natural-language compose:** say "send a mail to saleena mam saying …" in DM — no `/send` required; the bot remembers recipient/content across turns
+- **`/reset`** clears conversation context (last person, follow-ups) when switching topics; distinct from the 🧹 Clear chat button
+- **Learned contacts:** sender names/emails from processed mail are stored for reliable "what is X's email?" lookups
 - **`#verify`** on any question forces live Gmail + cited sources (see above); use `/classes` for timetables instead
 - Watcher only processes **new** mail after first run; use `/tasks/backfill` for older mail
 - Both the watcher and backfill scan the **Inbox and Spam** folders (important emails sometimes land in spam)
