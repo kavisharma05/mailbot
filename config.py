@@ -8,6 +8,8 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str
     telegram_owner_chat_id: str
+    # Telegram user id for owner-only commands (defaults to owner chat id for DMs)
+    telegram_owner_user_id: str = ""
     telegram_webhook_secret: str
     telegram_chat_deadlines: str = ""
     telegram_chat_placements: str = ""
@@ -60,6 +62,12 @@ class Settings(BaseSettings):
 
     # Web OAuth redirect URI for one-tap Gmail reconnect (e.g. https://app.onrender.com/oauth/callback)
     gmail_oauth_redirect_uri: str = ""
+
+    # When true and admin_schedule_sender is blank, reject untrusted timetable mail
+    require_trusted_schedule_sender: bool = True
+
+    def owner_user_id(self) -> str:
+        return (self.telegram_owner_user_id or self.telegram_owner_chat_id).strip()
 
 
 @lru_cache

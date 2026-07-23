@@ -150,6 +150,7 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | From BotFather |
 | `TELEGRAM_OWNER_CHAT_ID` | Your Telegram chat ID (fallback for all alerts) |
+| `TELEGRAM_OWNER_USER_ID` | Optional Telegram **user** id for owner-only commands (defaults to owner chat id in DMs) |
 | `TELEGRAM_WEBHOOK_SECRET` | Random secret for webhook path |
 | `TELEGRAM_CHAT_DEADLINES` | Chat ID for deadline alerts (optional) |
 | `TELEGRAM_CHAT_PLACEMENTS` | Chat ID for placement alerts (optional) |
@@ -174,11 +175,13 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `HEARTBEAT_URL` | healthchecks.io ping URL (optional; alerts if watcher stops) |
 | `ADMIN_SCHEDULE_SENDER` | Comma-separated trusted timetable sender(s), e.g. `registrar@mycollege.ac.in` |
 | `GMAIL_OAUTH_REDIRECT_URI` | Web OAuth callback, e.g. `https://your-app.onrender.com/oauth/callback` |
+| `REQUIRE_TRUSTED_SCHEDULE_SENDER` | `true` (default) rejects timetable mail unless `ADMIN_SCHEDULE_SENDER` is set when `RENDER_URL` is configured |
 
 Run `supabase/migration_reliability_polish.sql` once when upgrading an existing project.
 Run `supabase/migration_contacts.sql` once to enable learned name→email contact resolution.
 Run `supabase/migration_digest_state.sql` once to enable digest idempotency (prevents double morning/evening sends).
 Run `supabase/migration_precision_reliability.sql` once for scheduled reminders, item priority/type, OAuth tokens, and heartbeat columns.
+Run `supabase/migration_delivery_claims.sql` once for digest send leases, reminder dedupe, and pending-email dead letters.
 
 ### Heartbeat monitoring (recommended)
 
@@ -238,7 +241,7 @@ Also accepted: `#live`, `#realtime`, or a leading `verify:` / `live:` prefix.
 
 - Verify `GROQ_MODEL` matches a model available on the Groq free tier
 - Low-confidence classifier outputs are logged to `low_confidence_log` in Supabase
-- Only `medium` and `high` confidence actionable emails trigger category-group alerts (owner gets a rich summary after classify when `OWNER_DM_ALL_MAIL=true` or mail is actionable/priority)
+- Only `medium` and `high` confidence actionable emails trigger category-group alerts (owner gets a rich summary after classify when `OWNER_DM_ALL_MAIL=true` or mail is actionable/priority). Low-confidence actionable mail is tracked but not posted to category groups.
 - **Morning digest (7:00 IST)** and **evening digest (20:00 IST):** in-app scheduler while Render is awake; GitHub Actions + cron-job.org keep-alive are backups
 - Category groups receive actionable real-time alerts only; digests go to owner DM
 - Watcher polls every **~60s** while the app is awake, plus GitHub Actions every **5 min** as backup

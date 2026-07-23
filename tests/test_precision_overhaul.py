@@ -57,7 +57,17 @@ def test_trusted_schedule_sender_when_configured():
 def test_trusted_schedule_sender_open_when_unconfigured():
     with patch("services.schedule.get_settings") as mock_settings:
         mock_settings.return_value.admin_schedule_sender = ""
+        mock_settings.return_value.require_trusted_schedule_sender = False
+        mock_settings.return_value.render_url = ""
         assert is_trusted_schedule_sender("anyone@spam.com")
+
+
+def test_trusted_schedule_sender_denied_in_production_without_allowlist():
+    with patch("services.schedule.get_settings") as mock_settings:
+        mock_settings.return_value.admin_schedule_sender = ""
+        mock_settings.return_value.require_trusted_schedule_sender = True
+        mock_settings.return_value.render_url = "https://mailbot.onrender.com"
+        assert not is_trusted_schedule_sender("anyone@spam.com")
 
 
 def test_schedule_queries_prefix_from_clause():

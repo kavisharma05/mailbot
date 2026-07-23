@@ -517,6 +517,32 @@ def _gmail_day_bounds_query(day: datetime | None = None) -> str:
     return f"after:{d.year}/{d.month:02d}/{d.day:02d} before:{nxt.year}/{nxt.month:02d}/{nxt.day:02d}"
 
 
+def _sanitize_gmail_query(query: str) -> str | None:
+    q = (query or "").strip()
+    if not q or len(q) > 240:
+        return None
+    if any(ch in q for ch in ("\n", "\r", ";", "\x00")):
+        return None
+    lowered = q.lower()
+    if any(token in lowered for token in ("delete", "trash", "label:", "category:")):
+        return None
+    return q
+
+
+def _finalize_gmail_queries(queries: list[str], *, limit: int = 4) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in queries:
+        cleaned = _sanitize_gmail_query(item)
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        out.append(cleaned)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _build_mailbox_queries(question: str, convo: dict[str, Any] | None = None) -> list[str]:
     q = question.lower()
     person = _resolve_person_query(question, convo)
@@ -566,14 +592,7 @@ def _build_mailbox_queries(question: str, convo: dict[str, Any] | None = None) -
     if not queries:
         queries.append(_gmail_day_bounds_query())
 
-    # unique preserve order
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in queries:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out[:4]
+    return _finalize_gmail_queries(queries)
 
 
 def _wants_mail_bodies(question: str) -> bool:
@@ -903,13 +922,7 @@ def build_gmail_queries(
     if not queries:
         queries.append("newer_than:14d")
 
-    seen: set[str] = set()
-    unique: list[str] = []
-    for q in queries:
-        if q not in seen:
-            seen.add(q)
-            unique.append(q)
-    return unique[:4]
+    return _finalize_gmail_queries(queries)
 
 
 def _parse_target_date(question: str) -> datetime | None:

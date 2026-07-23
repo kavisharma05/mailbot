@@ -28,25 +28,31 @@ def test_tomorrow_classes_text_is_defined():
 def test_digest_marks_only_after_successful_send():
     db_module._digest_state_table_missing = True
     db_module._digest_state_fallback["last_morning"] = None
+    db_module._digest_leases_fallback.clear()
     day = date(2026, 7, 23)
     bot = MagicMock()
 
     async def _run():
         with (
-            patch("services.digest._digest_already_sent_today", return_value=False),
+            patch("services.digest.digest_already_sent_today", return_value=False),
+            patch("services.digest.acquire_digest_lease", return_value=True),
             patch("services.digest.classes_command_text", return_value=""),
             patch("services.digest.get_assignments_due_on", return_value=[]),
             patch("services.digest.get_recent_assignments", return_value=[]),
             patch("services.digest._send_owner_digest", new=AsyncMock(return_value=False)),
+            patch("services.digest.release_digest_lease") as release,
             patch("services.digest.mark_digest_sent") as mark,
         ):
             result = await run_morning_digest(bot, dry_run=False)
             mark.assert_not_called()
+            release.assert_called_once_with("morning", day)
             assert result["sent"] == []
 
         db_module._digest_state_fallback["last_morning"] = None
+        db_module._digest_leases_fallback.clear()
         with (
-            patch("services.digest._digest_already_sent_today", return_value=False),
+            patch("services.digest.digest_already_sent_today", return_value=False),
+            patch("services.digest.acquire_digest_lease", return_value=True),
             patch("services.digest.classes_command_text", return_value=""),
             patch("services.digest.get_assignments_due_on", return_value=[]),
             patch("services.digest.get_recent_assignments", return_value=[]),
@@ -63,23 +69,28 @@ def test_digest_marks_only_after_successful_send():
 def test_digest_send_failure_allows_retry():
     db_module._digest_state_table_missing = True
     db_module._digest_state_fallback["last_morning"] = None
+    db_module._digest_leases_fallback.clear()
     day = date(2026, 7, 23)
     bot = MagicMock()
 
     async def _run():
         with (
-            patch("services.digest._digest_already_sent_today", return_value=False),
+            patch("services.digest.digest_already_sent_today", return_value=False),
+            patch("services.digest.acquire_digest_lease", return_value=True),
             patch("services.digest.classes_command_text", return_value=""),
             patch("services.digest.get_assignments_due_on", return_value=[]),
             patch("services.digest.get_recent_assignments", return_value=[]),
             patch("services.digest._send_owner_digest", new=AsyncMock(return_value=False)),
+            patch("services.digest.release_digest_lease"),
             patch("services.digest.mark_digest_sent"),
         ):
             first = await run_morning_digest(bot, dry_run=False)
             assert first.get("skipped") is None
 
+        db_module._digest_leases_fallback.clear()
         with (
-            patch("services.digest._digest_already_sent_today", return_value=False),
+            patch("services.digest.digest_already_sent_today", return_value=False),
+            patch("services.digest.acquire_digest_lease", return_value=True),
             patch("services.digest.classes_command_text", return_value=""),
             patch("services.digest.get_assignments_due_on", return_value=[]),
             patch("services.digest.get_recent_assignments", return_value=[]),
@@ -98,7 +109,8 @@ def test_evening_digest_calls_tomorrow_classes_text():
 
     async def _run():
         with (
-            patch("services.digest._digest_already_sent_today", return_value=False),
+            patch("services.digest.digest_already_sent_today", return_value=False),
+            patch("services.digest.acquire_digest_lease", return_value=True),
             patch("services.digest._tomorrow_classes_text", new=AsyncMock(return_value="")),
             patch("services.digest.get_assignments_due_on", return_value=[]),
             patch("services.digest.get_assignments_due_between", return_value=[]),

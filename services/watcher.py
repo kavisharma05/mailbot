@@ -239,7 +239,7 @@ def _should_alert(
 ) -> bool:
     if skip_past_deadlines and _deadline_is_past(deadline_date):
         return False
-    return confidence in ("high", "medium", "low")
+    return confidence in ("high", "medium")
 
 
 def _should_owner_dm(
@@ -531,6 +531,10 @@ async def run_gmail_watcher(bot) -> dict:
         raise
 
 
+async def _processed_lookup(message_id: str) -> bool | None:
+    return await asyncio.to_thread(is_email_processed_cached, message_id)
+
+
 async def _run_gmail_watcher_inner(bot) -> dict:
     state = await asyncio.to_thread(get_watch_state)
     now = datetime.now(timezone.utc)
@@ -544,7 +548,14 @@ async def _run_gmail_watcher_inner(bot) -> dict:
         processed = 0
         alerts = 0
         for message_id in message_ids:
-            if await asyncio.to_thread(is_email_processed_cached, message_id):
+            processed_state = await _processed_lookup(message_id)
+            if processed_state is None:
+                logger.warning(
+                    "Skipping %s — processed state unknown (DB unavailable)",
+                    message_id,
+                )
+                continue
+            if processed_state:
                 continue
             try:
                 outcome = await _process_message(message_id, bot)
@@ -567,7 +578,15 @@ async def _run_gmail_watcher_inner(bot) -> dict:
     failed = 0
 
     for message_id in message_ids:
-        if await asyncio.to_thread(is_email_processed_cached, message_id):
+        processed_state = await _processed_lookup(message_id)
+        if processed_state is None:
+            logger.warning(
+                "Deferring %s — processed state unknown (DB unavailable)",
+                message_id,
+            )
+            failed += 1
+            continue
+        if processed_state:
             continue
 
         try:
@@ -619,7 +638,11 @@ async def run_gmail_backfill(bot, days: int = 14) -> dict:
     skipped = 0
 
     for message_id in message_ids:
-        if await asyncio.to_thread(is_email_processed_cached, message_id):
+        processed_state = await _processed_lookup(message_id)
+        if processed_state is None:
+            logger.warning("Backfill skipping %s — processed state unknown", message_id)
+            continue
+        if processed_state:
             skipped += 1
             continue
 
@@ -695,13 +718,15 @@ def _oauth_start_url() -> str | None:
     if not base or "your-app" in base:
         return None
     if settings.gmail_oauth_redirect_uri:
-        # redirect_uri host is the app base
         from urllib.parse import urlparse
 
         parsed = urlparse(settings.gmail_oauth_redirect_uri)
         if parsed.scheme and parsed.netloc:
             base = f"{parsed.scheme}://{parsed.netloc}"
-    return f"{base}/oauth/start"
+    import hashlib
+
+    token = hashlib.sha256(f"oauth:{settings.task_secret}".encode()).hexdigest()[:32]
+    return f"{base}/oauth/start?token={token}"
 
 
 async def notify_gmail_auth_failure(bot) -> None:

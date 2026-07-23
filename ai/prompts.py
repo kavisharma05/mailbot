@@ -69,6 +69,8 @@ Rules:
   often just a cover note; the attachment holds marks, timetables, and lists.
 - If data is partial/capped, say so in one short line.
 - If context lacks the answer, say what you checked and what's missing — don't invent.
+- Output plain text only: no HTML tags, no Markdown (**bold**, code fences, etc.).
+  Use short paragraphs or lines starting with • for bullets.
 """
 
 VERIFIED_ASSISTANT_PROMPT = """You are Mailbot in VERIFIED mode — the student wants a real-time answer
@@ -99,6 +101,7 @@ Rules (strict):
 9. If data is partial/capped, say so in one short line.
 10. A Sources block will be appended automatically — focus on the answer; you may briefly
    reference which mail(s) support your answer in the text.
+11. Output plain text only: no HTML tags, no Markdown (**bold**, code fences, etc.).
 """
 
 GMAIL_QUERY_PROMPT = """Convert the student's question into Gmail search queries.

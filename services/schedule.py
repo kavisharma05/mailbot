@@ -209,6 +209,8 @@ def is_trusted_schedule_sender(sender: str) -> bool:
     settings = get_settings()
     allowed = [s.strip().lower() for s in settings.admin_schedule_sender.split(",") if s.strip()]
     if not allowed:
+        if settings.require_trusted_schedule_sender and (settings.render_url or "").strip():
+            return False
         return True
     sender_lower = (sender or "").lower()
     return any(a in sender_lower for a in allowed)

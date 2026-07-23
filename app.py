@@ -1,3 +1,4 @@
+import hashlib
 import asyncio
 import logging
 import hmac
@@ -6,7 +7,8 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, RedirectResponse
 from google.auth.exceptions import RefreshError
 from telegram import Update
 
@@ -14,6 +16,8 @@ from bot.telegram_app import build_telegram_application, register_bot_commands
 from config import get_settings
 from services.db import check_db_health
 from services.digest import run_evening_digest, run_morning_digest
+from services.formatting import escape_html as _escape_html
+from services.oauth_state import create_oauth_state, verify_oauth_state
 from services.telegram_dedupe import should_process_update
 from services.timeutil import now_ist
 from services.monitoring import ping_heartbeat
@@ -276,7 +280,8 @@ async def backfill_gmail(
     if days < 1 or days > 30:
         raise HTTPException(status_code=400, detail="days must be between 1 and 30")
 
-    result = await run_gmail_backfill(ptb_app.bot, days=days)
+    async with watcher_lock:
+        result = await run_gmail_backfill(ptb_app.bot, days=days)
     logger.info("Gmail backfill result: %s", result)
     return result
 
@@ -327,15 +332,20 @@ async def run_reminders_task(x_task_secret: str = Header(..., alias="x-task-secr
 
 
 @fastapi_app.get("/oauth/start")
-async def oauth_start():
+async def oauth_start(token: str | None = Query(default=None)):
     """Redirect owner to Google consent screen for one-tap Gmail reconnect."""
     settings = get_settings()
+    expected = hashlib.sha256(f"oauth:{settings.task_secret}".encode()).hexdigest()[:32]
+    if not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="Invalid OAuth start token")
+
     redirect_uri = settings.gmail_oauth_redirect_uri
     if not redirect_uri:
         raise HTTPException(
             status_code=503,
             detail="Set GMAIL_OAUTH_REDIRECT_URI to enable one-tap reconnect",
         )
+    state = create_oauth_state()
     params = urlencode(
         {
             "client_id": settings.gmail_client_id,
@@ -351,22 +361,31 @@ async def oauth_start():
             "access_type": "offline",
             "prompt": "consent",
             "include_granted_scopes": "true",
+            "state": state,
         }
     )
-    from fastapi.responses import RedirectResponse
 
     return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
 
 
 @fastapi_app.get("/oauth/callback")
-async def oauth_callback(code: str | None = None, error: str | None = None):
+async def oauth_callback(
+    code: str | None = None,
+    error: str | None = None,
+    state: str | None = None,
+):
     """Exchange OAuth code for refresh token and run reconnect backfill."""
-    from fastapi.responses import HTMLResponse
-
     if error or not code:
+        safe_error = _escape_html(error or "No authorization code")
         return HTMLResponse(
-            f"<h1>Gmail reconnect failed</h1><p>{error or 'No authorization code'}</p>",
+            f"<h1>Gmail reconnect failed</h1><p>{safe_error}</p>",
             status_code=400,
+        )
+
+    if not verify_oauth_state(state):
+        return HTMLResponse(
+            "<h1>Gmail reconnect failed</h1><p>Invalid or expired OAuth state.</p>",
+            status_code=403,
         )
 
     settings = get_settings()

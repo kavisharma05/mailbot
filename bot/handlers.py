@@ -66,7 +66,7 @@ from services.db import (
     schedule_assignment_reminder,
     set_preferred_section,
 )
-from services.formatting import CATEGORY_LABELS, category_icon, is_priority_item
+from services.formatting import format_due_list
 from services.schedule import (
     _format_session_block,
     _session_section,
@@ -76,8 +76,8 @@ from services.schedule import (
     refresh_schedule_from_gmail,
     sessions_for_day,
 )
-from services.telegram_util import reply_long
-from services.timeutil import IST, format_deadline_display, today_ist
+from services.telegram_util import reply_long, safe_user_error_message
+from services.timeutil import IST, today_ist
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +95,6 @@ QUICK_ACTION_LABELS = ("📚 Classes", "⏰ Due", "✉️ Send", "📋 Section")
 
 # How many recent message IDs to try when clearing bot clutter in owner DM
 _CLEAR_CHAT_SCAN_LIMIT = 25
-
-CATEGORY_TITLES = CATEGORY_LABELS
 
 GREETINGS = {"hi", "hey", "hello", "yo", "sup", "hii", "hiii", "heya"}
 
@@ -138,7 +136,7 @@ def _is_owner(update: Update) -> bool:
     user = update.effective_user
     if not user:
         return False
-    return str(user.id) == str(settings.telegram_owner_chat_id)
+    return str(user.id) == str(settings.owner_user_id())
 
 
 def _category_for_chat(chat_id: int | str | None) -> str | None:
@@ -164,45 +162,13 @@ def _category_for_chat(chat_id: int | str | None) -> str | None:
 
 
 def _sort_items_priority_first(items: list[dict]) -> list[dict]:
-    def key(item: dict) -> tuple[int, str]:
-        cat = item.get("category") or "other"
-        pri = 0 if is_priority_item(
-            cat,
-            task=item.get("task"),
-            summary=item.get("summary"),
-            deadline_date=item.get("deadline_date"),
-        ) else 1
-        due = item.get("deadline_date") or "9999"
-        return (pri, due)
+    from services.formatting import sort_assignments
 
-    return sorted(items, key=key)
+    return sort_assignments(items)
 
 
-def _format_due_list(items: list[dict], category: str | None) -> str:
-    title = CATEGORY_TITLES.get(category or "", "Open items")
-    items = _sort_items_priority_first(items)
-    if not items:
-        return f"<b>{html.escape(title)}</b>\n\nNo open items right now."
-
-    lines = [f"<b>{html.escape(title)}</b> — {len(items)} open", ""]
-    for i, item in enumerate(items[:20], start=1):
-        task = item.get("task") or item.get("summary") or "Untitled"
-        course = item.get("course_or_topic") or "—"
-        due = format_deadline_display(item.get("deadline_date"), item.get("deadline_text"), tz=IST)
-        cat = item.get("category") or "other"
-        icon = category_icon(cat)
-        prefix = f"[{CATEGORY_TITLES.get(cat, cat)}] " if not category else ""
-        pri = "🔴 " if is_priority_item(
-            cat,
-            task=task,
-            summary=item.get("summary"),
-            deadline_date=item.get("deadline_date"),
-        ) else ""
-        lines.append(f"{i}. {pri}{icon} {prefix}<b>{html.escape(str(task))}</b>")
-        lines.append(f"   Course: {html.escape(str(course))}")
-        lines.append(f"   Due: {html.escape(str(due))}")
-        lines.append("")
-    return "\n".join(lines).strip()
+def _format_due_list(items: list[dict], category: str | None) -> tuple[str, list[str]]:
+    return format_due_list(items, category)
 
 
 def _strip_bot_mention(text: str, bot_username: str | None) -> str:
@@ -369,6 +335,9 @@ async def _reply_schedule_for_question(
 async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
+        return
+    if not _is_owner(update):
+        await query.answer("Only the bot owner can use these actions.", show_alert=True)
         return
     parsed = parse_action_callback(query.data)
     if not parsed:
@@ -643,8 +612,9 @@ async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
     items = await asyncio.to_thread(get_open_assignments, category=category)
-    context.user_data["due_items"] = [i["id"] for i in items[:20]]
-    await reply_long(update.message, _format_due_list(items, category), parse_mode="HTML")
+    text, due_ids = _format_due_list(items, category)
+    context.user_data["due_items"] = due_ids
+    await reply_long(update.message, text, parse_mode="HTML")
 
 
 async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -704,10 +674,11 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not context.args:
         items = await asyncio.to_thread(get_open_assignments, category=category)
-        context.user_data["due_items"] = [i["id"] for i in items[:20]]
+        text, due_ids = _format_due_list(items, category)
+        context.user_data["due_items"] = due_ids
         await reply_long(
             update.message,
-            "Usage: /done <number>\n\n" + _format_due_list(items, category),
+            "Usage: /done <number>\n\n" + text,
             parse_mode="HTML",
         )
         return
@@ -721,15 +692,16 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     due_ids: list[str] = context.user_data.get("due_items") or []
     if not due_ids:
         items = await asyncio.to_thread(get_open_assignments, category=category)
-        due_ids = [i["id"] for i in items[:20]]
+        _, due_ids = _format_due_list(items, category)
         context.user_data["due_items"] = due_ids
 
     if index < 1 or index > len(due_ids):
         items = await asyncio.to_thread(get_open_assignments, category=category)
-        context.user_data["due_items"] = [i["id"] for i in items[:20]]
+        text, due_ids = _format_due_list(items, category)
+        context.user_data["due_items"] = due_ids
         await reply_long(
             update.message,
-            f"No item #{index}. Pick from the list:\n\n" + _format_due_list(items, category),
+            f"No item #{index}. Pick from the list:\n\n" + text,
             parse_mode="HTML",
         )
         return
@@ -1379,7 +1351,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     except Exception as exc:
         logger.exception("Failed to send email")
-        await query.edit_message_text(f"Failed to send: {exc}")
+        await query.edit_message_text(safe_user_error_message("send that email"))
 
     _clear_compose(context.user_data)
 

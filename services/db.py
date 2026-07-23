@@ -1,5 +1,5 @@
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Callable, TypeVar
 from zoneinfo import ZoneInfo
@@ -10,6 +10,9 @@ from config import get_settings
 from services.timeutil import item_effective_deadline_dt, parse_iso_deadline
 
 logger = logging.getLogger(__name__)
+
+MAX_PENDING_EMAIL_ATTEMPTS = 10
+DIGEST_LEASE_SECONDS = 900
 
 T = TypeVar("T")
 
@@ -106,10 +109,19 @@ def update_watch_state(
 
 
 @_safe_read(False)
-def is_email_processed(message_id: str) -> bool:
+def _is_email_processed_db(message_id: str) -> bool:
     db = get_db()
     result = db.table("processed_emails").select("message_id").eq("message_id", message_id).limit(1).execute()
     return bool(result.data)
+
+
+def is_email_processed(message_id: str) -> bool | None:
+    """Return True/False when known; None when DB lookup failed (unknown)."""
+    try:
+        return _is_email_processed_db(message_id)
+    except Exception as exc:
+        logger.exception("is_email_processed failed for %s: %s", message_id, exc)
+        return None
 
 
 # Short TTL cache: when Supabase flakes, avoid reprocessing storms (returns True = skip)
@@ -130,7 +142,7 @@ def _prune_processed_cache(now: float | None = None) -> None:
         _processed_cache.pop(next(iter(_processed_cache)))
 
 
-def is_email_processed_cached(message_id: str) -> bool:
+def is_email_processed_cached(message_id: str) -> bool | None:
     import time
 
     now = time.time()
@@ -138,7 +150,10 @@ def is_email_processed_cached(message_id: str) -> bool:
     cached = _processed_cache.get(message_id)
     if cached and cached > now:
         return True
-    if is_email_processed(message_id):
+    db_result = is_email_processed(message_id)
+    if db_result is None:
+        return None
+    if db_result:
         _processed_cache[message_id] = now + _PROCESSED_CACHE_TTL
         _prune_processed_cache(now)
         return True
@@ -158,20 +173,24 @@ def mark_email_processed(
     is_actionable: bool | None,
     confidence: str | None,
     assignment_id: str | None = None,
-) -> None:
+) -> bool:
     try:
         db = get_db()
-        db.table("processed_emails").insert(
+        db.table("processed_emails").upsert(
             {
                 "message_id": message_id,
                 "is_actionable": is_actionable,
                 "confidence": confidence,
                 "assignment_id": assignment_id,
-            }
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="message_id",
         ).execute()
         cache_email_processed(message_id)
+        return True
     except Exception as exc:
         logger.exception("mark_email_processed failed for %s: %s", message_id, exc)
+        return False
 
 
 @_safe_read(None)
@@ -385,26 +404,37 @@ def enqueue_pending_email(message_id: str, error: str | None = None) -> None:
         db = get_db()
         existing = (
             db.table("pending_emails")
-            .select("message_id, attempts")
+            .select("message_id, attempts, dead_letter")
             .eq("message_id", message_id)
             .limit(1)
             .execute()
         )
         rows = existing.data or []
+        if rows and rows[0].get("dead_letter"):
+            logger.warning("Skipping enqueue for dead-letter pending email %s", message_id)
+            return
         if rows:
-            db.table("pending_emails").update(
-                {
-                    "attempts": int(rows[0].get("attempts") or 0) + 1,
-                    "last_error": error,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-            ).eq("message_id", message_id).execute()
+            attempts = int(rows[0].get("attempts") or 0) + 1
+            payload: dict[str, Any] = {
+                "attempts": attempts,
+                "last_error": error,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if attempts >= MAX_PENDING_EMAIL_ATTEMPTS:
+                payload["dead_letter"] = True
+                logger.error(
+                    "Pending email %s exceeded %s attempts — marked dead letter",
+                    message_id,
+                    MAX_PENDING_EMAIL_ATTEMPTS,
+                )
+            db.table("pending_emails").update(payload).eq("message_id", message_id).execute()
         else:
             db.table("pending_emails").insert(
                 {
                     "message_id": message_id,
                     "attempts": 1,
                     "last_error": error,
+                    "dead_letter": False,
                 }
             ).execute()
     except Exception as exc:
@@ -424,12 +454,21 @@ def list_pending_email_ids(limit: int = 100) -> list[str]:
     db = get_db()
     result = (
         db.table("pending_emails")
-        .select("message_id")
+        .select("message_id, attempts, dead_letter")
+        .eq("dead_letter", False)
         .order("updated_at")
         .limit(limit)
         .execute()
     )
-    return [row["message_id"] for row in (result.data or []) if row.get("message_id")]
+    out: list[str] = []
+    for row in result.data or []:
+        mid = row.get("message_id")
+        if not mid:
+            continue
+        if int(row.get("attempts") or 0) >= MAX_PENDING_EMAIL_ATTEMPTS:
+            continue
+        out.append(str(mid))
+    return out
 
 
 @_safe_read(None)
@@ -596,6 +635,127 @@ def find_contacts_by_name(token: str, limit: int = 20) -> list[dict[str, Any]]:
 
 _digest_state_fallback: dict[str, date | None] = {"last_morning": None, "last_evening": None}
 _digest_state_table_missing = False
+_delivery_claims_table_missing = False
+_digest_leases_fallback: dict[str, float] = {}
+
+
+def _digest_column(kind: str) -> str:
+    return "last_morning" if kind == "morning" else "last_evening"
+
+
+def _digest_claim_key(kind: str, day: date) -> str:
+    return f"digest:{kind}:{day.isoformat()}"
+
+
+def digest_already_sent_today(kind: str, today: date) -> bool:
+    state = get_digest_state() or {}
+    return state.get(_digest_column(kind)) == today
+
+
+def acquire_digest_lease(kind: str, sent_on: date | None = None, *, ttl_seconds: int = DIGEST_LEASE_SECONDS) -> bool:
+    """Acquire a short-lived send lease; prevents double-send while allowing retry after failure."""
+    global _delivery_claims_table_missing
+    if kind not in ("morning", "evening"):
+        return False
+
+    import time
+
+    day = sent_on or datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    if digest_already_sent_today(kind, day):
+        return False
+
+    claim_key = _digest_claim_key(kind, day)
+    now_mono = time.monotonic()
+    expires_mono = now_mono + ttl_seconds
+    now_utc = datetime.now(timezone.utc)
+    expires_at = now_utc + timedelta(seconds=ttl_seconds)
+
+    expired = [k for k, exp in _digest_leases_fallback.items() if exp <= now_mono]
+    for key in expired:
+        _digest_leases_fallback.pop(key, None)
+
+    active = _digest_leases_fallback.get(claim_key)
+    if active and active > now_mono:
+        return False
+
+    if _delivery_claims_table_missing:
+        _digest_leases_fallback[claim_key] = expires_mono
+        return True
+
+    try:
+        db = get_db()
+        existing = (
+            db.table("delivery_claims")
+            .select("claim_key, expires_at, completed_at")
+            .eq("claim_key", claim_key)
+            .limit(1)
+            .execute()
+        )
+        rows = existing.data or []
+        if rows:
+            row = rows[0]
+            if row.get("completed_at"):
+                return False
+            exp_raw = row.get("expires_at")
+            if exp_raw:
+                try:
+                    exp_dt = datetime.fromisoformat(str(exp_raw).replace("Z", "+00:00"))
+                    if exp_dt > now_utc:
+                        return False
+                except ValueError:
+                    pass
+            db.table("delivery_claims").update(
+                {
+                    "claimed_at": now_utc.isoformat(),
+                    "expires_at": expires_at.isoformat(),
+                }
+            ).eq("claim_key", claim_key).execute()
+        else:
+            db.table("delivery_claims").insert(
+                {
+                    "claim_key": claim_key,
+                    "kind": kind,
+                    "claim_date": day.isoformat(),
+                    "claimed_at": now_utc.isoformat(),
+                    "expires_at": expires_at.isoformat(),
+                }
+            ).execute()
+        _digest_leases_fallback[claim_key] = expires_mono
+        return True
+    except Exception as exc:
+        err = str(exc).lower()
+        if "delivery_claims" in err or "does not exist" in err or "42p01" in err:
+            _delivery_claims_table_missing = True
+            logger.warning("delivery_claims table missing — using in-memory lease fallback: %s", exc)
+            _digest_leases_fallback[claim_key] = expires_mono
+            return True
+        logger.exception("acquire_digest_lease failed for %s: %s", kind, exc)
+        return False
+
+
+def release_digest_lease(kind: str, sent_on: date | None = None) -> None:
+    global _delivery_claims_table_missing
+    if kind not in ("morning", "evening"):
+        return
+    day = sent_on or datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    claim_key = _digest_claim_key(kind, day)
+    _digest_leases_fallback.pop(claim_key, None)
+    if _delivery_claims_table_missing:
+        return
+    try:
+        db = get_db()
+        db.table("delivery_claims").delete().eq("claim_key", claim_key).is_("completed_at", "null").execute()
+    except Exception as exc:
+        err = str(exc).lower()
+        if "delivery_claims" in err or "does not exist" in err or "42p01" in err:
+            _delivery_claims_table_missing = True
+        else:
+            logger.exception("release_digest_lease failed for %s: %s", kind, exc)
+
+
+def claim_digest(kind: str, sent_on: date | None = None) -> bool:
+    """Backward-compatible alias for tests — prefer acquire_digest_lease()."""
+    return acquire_digest_lease(kind, sent_on)
 
 
 def get_digest_state() -> dict[str, date | None]:
@@ -641,61 +801,29 @@ def get_digest_state() -> dict[str, date | None]:
     }
 
 
-def claim_digest(kind: str, sent_on: date | None = None) -> bool:
-    """Atomically claim today's digest slot. Returns True if this caller should send."""
-    global _digest_state_table_missing
-    if kind not in ("morning", "evening"):
-        return False
-
-    day = sent_on or datetime.now(ZoneInfo("Asia/Kolkata")).date()
-    column = "last_morning" if kind == "morning" else "last_evening"
-
-    if _digest_state_table_missing:
-        if _digest_state_fallback.get(column) == day:
-            return False
-        _digest_state_fallback[column] = day
-        return True
-
-    try:
-        db = get_db()
-        result = (
-            db.table("digest_state")
-            .update(
-                {
-                    column: day.isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            .eq("id", 1)
-            .or_(f"{column}.is.null,{column}.neq.{day.isoformat()}")
-            .execute()
-        )
-        rows = result.data or []
-        if rows:
-            _digest_state_fallback[column] = day
-            return True
-        return False
-    except Exception as exc:
-        err = str(exc).lower()
-        if "digest_state" in err or "does not exist" in err or "42p01" in err:
-            _digest_state_table_missing = True
-            logger.warning("digest_state table missing — using in-memory fallback: %s", exc)
-            if _digest_state_fallback.get(column) == day:
-                return False
-            _digest_state_fallback[column] = day
-            return True
-        logger.exception("claim_digest failed for %s: %s", kind, exc)
-        return False
-
-
 def mark_digest_sent(kind: str, sent_on: date | None = None) -> None:
     """Record that morning or evening digest was sent on sent_on (IST calendar day)."""
-    global _digest_state_table_missing
+    global _digest_state_table_missing, _delivery_claims_table_missing
     if kind not in ("morning", "evening"):
         return
     day = sent_on or datetime.now(ZoneInfo("Asia/Kolkata")).date()
-    column = "last_morning" if kind == "morning" else "last_evening"
+    column = _digest_column(kind)
+    claim_key = _digest_claim_key(kind, day)
     _digest_state_fallback[column] = day
+    _digest_leases_fallback.pop(claim_key, None)
+
+    if not _delivery_claims_table_missing:
+        try:
+            db = get_db()
+            db.table("delivery_claims").update(
+                {"completed_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("claim_key", claim_key).execute()
+        except Exception as exc:
+            err = str(exc).lower()
+            if "delivery_claims" in err or "does not exist" in err or "42p01" in err:
+                _delivery_claims_table_missing = True
+            else:
+                logger.exception("mark_digest_sent claim completion failed for %s: %s", kind, exc)
 
     if _digest_state_table_missing:
         return
@@ -799,10 +927,22 @@ def insert_scheduled_reminders(rows: list[dict[str, Any]]) -> list[dict[str, Any
     global _scheduled_reminders_table_missing
     if not rows or _scheduled_reminders_table_missing:
         return []
+    inserted: list[dict[str, Any]] = []
     try:
         db = get_db()
-        result = db.table("scheduled_reminders").insert(rows).execute()
-        return result.data or []
+        for row in rows:
+            try:
+                result = db.table("scheduled_reminders").upsert(
+                    row,
+                    on_conflict="assignment_id,tier",
+                ).execute()
+                inserted.extend(result.data or [row])
+            except Exception as exc:
+                err = str(exc).lower()
+                if "duplicate" in err or "23505" in err:
+                    continue
+                raise
+        return inserted
     except Exception as exc:
         err = str(exc).lower()
         if "scheduled_reminders" in err or "does not exist" in err or "42p01" in err:
