@@ -99,17 +99,32 @@ def is_email_processed(message_id: str) -> bool:
 # Short TTL cache: when Supabase flakes, avoid reprocessing storms (returns True = skip)
 _processed_cache: dict[str, float] = {}
 _PROCESSED_CACHE_TTL = 120.0
+_PROCESSED_CACHE_MAX_ENTRIES = 2000
+
+
+def _prune_processed_cache(now: float | None = None) -> None:
+    """Drop expired entries and cap size (mirrors telegram_dedupe)."""
+    import time
+
+    now = now if now is not None else time.time()
+    expired = [mid for mid, expiry in _processed_cache.items() if expiry <= now]
+    for mid in expired:
+        _processed_cache.pop(mid, None)
+    while len(_processed_cache) > _PROCESSED_CACHE_MAX_ENTRIES:
+        _processed_cache.pop(next(iter(_processed_cache)))
 
 
 def is_email_processed_cached(message_id: str) -> bool:
     import time
 
     now = time.time()
+    _prune_processed_cache(now)
     cached = _processed_cache.get(message_id)
     if cached and cached > now:
         return True
     if is_email_processed(message_id):
         _processed_cache[message_id] = now + _PROCESSED_CACHE_TTL
+        _prune_processed_cache(now)
         return True
     return False
 
@@ -117,7 +132,9 @@ def is_email_processed_cached(message_id: str) -> bool:
 def cache_email_processed(message_id: str) -> None:
     import time
 
-    _processed_cache[message_id] = time.time() + _PROCESSED_CACHE_TTL
+    now = time.time()
+    _processed_cache[message_id] = now + _PROCESSED_CACHE_TTL
+    _prune_processed_cache(now)
 
 
 def mark_email_processed(
@@ -166,7 +183,15 @@ def insert_assignment(data: dict[str, Any]) -> dict[str, Any] | None:
     try:
         db = get_db()
         result = db.table("assignments").insert(data).execute()
-        return result.data[0]
+        rows = result.data or []
+        if not rows:
+            logger.error(
+                "insert_assignment returned no rows for message %s (task=%s)",
+                message_id,
+                data.get("task"),
+            )
+            return None
+        return rows[0]
     except Exception as exc:
         logger.exception("insert_assignment failed: %s", exc)
         return None
@@ -365,7 +390,7 @@ def dequeue_pending_email(message_id: str) -> None:
 
 
 @_safe_read([])
-def list_pending_email_ids(limit: int = 30) -> list[str]:
+def list_pending_email_ids(limit: int = 100) -> list[str]:
     db = get_db()
     result = (
         db.table("pending_emails")
@@ -584,6 +609,53 @@ def get_digest_state() -> dict[str, date | None]:
         "last_morning": _parse_day(row.get("last_morning")),
         "last_evening": _parse_day(row.get("last_evening")),
     }
+
+
+def claim_digest(kind: str, sent_on: date | None = None) -> bool:
+    """Atomically claim today's digest slot. Returns True if this caller should send."""
+    global _digest_state_table_missing
+    if kind not in ("morning", "evening"):
+        return False
+
+    day = sent_on or datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    column = "last_morning" if kind == "morning" else "last_evening"
+
+    if _digest_state_table_missing:
+        if _digest_state_fallback.get(column) == day:
+            return False
+        _digest_state_fallback[column] = day
+        return True
+
+    try:
+        db = get_db()
+        result = (
+            db.table("digest_state")
+            .update(
+                {
+                    column: day.isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            .eq("id", 1)
+            .or_(f"{column}.is.null,{column}.neq.{day.isoformat()}")
+            .execute()
+        )
+        rows = result.data or []
+        if rows:
+            _digest_state_fallback[column] = day
+            return True
+        return False
+    except Exception as exc:
+        err = str(exc).lower()
+        if "digest_state" in err or "does not exist" in err or "42p01" in err:
+            _digest_state_table_missing = True
+            logger.warning("digest_state table missing — using in-memory fallback: %s", exc)
+            if _digest_state_fallback.get(column) == day:
+                return False
+            _digest_state_fallback[column] = day
+            return True
+        logger.exception("claim_digest failed for %s: %s", kind, exc)
+        return False
 
 
 def mark_digest_sent(kind: str, sent_on: date | None = None) -> None:

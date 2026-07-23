@@ -35,9 +35,13 @@ def test_reading_attachment_intent():
 
 
 def test_priority_categories():
+    from datetime import datetime, timedelta, timezone
+
+    near = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
     assert is_priority_item("placement", task="Upload CV")
     assert is_priority_item("certification", task="Complete NSE cert")
-    assert is_priority_item("deadline", task="Read Brady case", summary="Prepare reading")
+    assert is_priority_item("deadline", task="Submit report", deadline_date=near)
+    assert not is_priority_item("deadline", task="Read Brady case", summary="Prepare reading")
     assert not is_priority_item("other", task="Newsletter")
 
 

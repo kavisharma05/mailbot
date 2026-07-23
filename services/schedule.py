@@ -855,7 +855,8 @@ def format_schedule_share(sessions: list[dict[str, Any]]) -> str:
 
     by_day: dict[str, list[dict[str, Any]]] = {}
     for s in sessions:
-        by_day.setdefault(s["session_date"], []).append(s)
+        day_key = s.get("session_date") or "unknown"
+        by_day.setdefault(day_key, []).append(s)
 
     lines = ["<b>📅 Class schedule received</b>", ""]
     for day in sorted(by_day.keys()):

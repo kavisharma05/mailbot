@@ -48,6 +48,7 @@ def _priority_items(*lists: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 item.get("category") or "other",
                 task=item.get("task"),
                 summary=item.get("summary"),
+                deadline_date=item.get("deadline_date"),
             ):
                 out.append(item)
     return out
@@ -181,13 +182,6 @@ async def _send_owner_digest(bot, text: str) -> bool:
     return await send_html(bot, owner, text)
 
 
-def _digest_already_sent_today(kind: str, today: date) -> bool:
-    state = get_digest_state() or {}
-    key = "last_morning" if kind == "morning" else "last_evening"
-    last = state.get(key)
-    return last == today
-
-
 async def _tomorrow_classes_text(tomorrow: date) -> str:
     section = await asyncio.to_thread(get_preferred_section)
     info: dict[str, Any] = {}
@@ -201,6 +195,12 @@ async def _tomorrow_classes_text(tomorrow: date) -> str:
         return ""
     label = tomorrow.strftime("%a, %d %b %Y")
     return _format_session_block(sessions, f"<b>📚 Tomorrow's classes — {label}</b>")
+
+
+def _digest_already_sent_today(kind: str, today: date) -> bool:
+    state = get_digest_state() or {}
+    key = "last_morning" if kind == "morning" else "last_evening"
+    return state.get(key) == today
 
 
 async def run_morning_digest(bot, *, dry_run: bool = False, force: bool = False) -> dict[str, Any]:

@@ -87,10 +87,11 @@ def _person_to_gmail_from(person: str | None) -> tuple[str | None, str | None]:
 
 
 def _filter_emails_for_person(emails: list[dict[str, Any]], person: str | None) -> list[dict[str, Any]]:
-    if not person or not emails:
+    if not person:
         return emails
-    filtered = [m for m in emails if sender_matches_name(m.get("sender"), person)]
-    return filtered or emails
+    if not emails:
+        return []
+    return [m for m in emails if sender_matches_name(m.get("sender"), person)]
 
 
 def lookup_contact_email(person: str | None) -> str:
@@ -99,6 +100,9 @@ def lookup_contact_email(person: str | None) -> str:
         return "Who should I look up? Try: what is santhi mam's email?"
     matches = resolve_contact(person)
     return format_contact_lookup_answer(person, matches)
+
+
+def _looks_like_pasted_email(text: str) -> bool:
     lower = text.lower()
     return len(text) > 180 and (
         "dear " in lower
@@ -287,8 +291,9 @@ def _extract_person_query(question: str) -> str | None:
 
     # "what did Saleena Khan say" / "Saleena's mail"
     m = re.search(
-        r"(?:what did|did)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:say|write|mention|send)",
+        r"(?:what did|did)\s+([A-Za-z][A-Za-z.'-]+(?:\s+[A-Za-z][A-Za-z.'-]+){0,2})\s+(?:say|write|mention|send)",
         q,
+        flags=re.IGNORECASE,
     )
     if m:
         return m.group(1).strip()
@@ -556,6 +561,10 @@ def _gather_mailbox_context(
         "resolved_email": resolve_contact_email(person) if person and "@" not in person else person,
     }
     emails = _filter_emails_for_person(emails, person)
+    if person and not emails and seen:
+        stats["person_no_match"] = True
+        stats["listed"] = 0
+        return stats, []
     if wants_attachments:
         emails = _apply_attachment_budget(emails, wants_attachments=True)
     return stats, emails
@@ -564,6 +573,8 @@ def _gather_mailbox_context(
 def _format_mailbox_fallback(stats: dict[str, Any], emails: list[dict[str, Any]], question: str) -> str:
     """Deterministic mailbox answer when LLM is down."""
     person = stats.get("person_filter")
+    if stats.get("person_no_match") and person:
+        return f"I couldn't find any mail from {person} in the searches I tried."
     count = stats.get("count", 0)
     capped = stats.get("capped")
     lines = []
@@ -1178,6 +1189,9 @@ def answer_question(
         question, scan_gmail=scan_gmail, pasted_email=pasted_email, convo=convo
     )
     person = person_hint or _resolve_person_query(question, convo)
+    if stats and stats.get("person_no_match"):
+        label = person or stats.get("person_filter") or "that person"
+        return f"I couldn't find any mail from {label} in the searches I tried."
     resolved = resolve_contact(person) if person and "@" not in person else []
     user = _build_user_prompt(
         question,

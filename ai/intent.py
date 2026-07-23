@@ -52,8 +52,17 @@ _DUE_KEYWORDS = (
     "what is due",
     "due today",
     "due tomorrow",
-    "deadline",
-    "pending",
+    "due this week",
+    "deadlines today",
+    "deadlines tomorrow",
+    "deadline for today",
+    "deadline for tomorrow",
+    "what are my deadline",
+    "check deadline",
+    "refresh deadline",
+    "pending deadline",
+    "open items",
+    "what do i need to do",
 )
 
 
@@ -177,9 +186,31 @@ def _is_schedule_intent(text: str, last_intent: str | None = None) -> bool:
     return False
 
 
-def _is_due_intent(text: str) -> bool:
+def _is_specific_deadline_question(text: str) -> bool:
+    """Single-item deadline Q&A — not a /due list refresh."""
+    from ai.assistant import _is_due_list_question
+
+    if _is_due_list_question(text):
+        return False
     q = text.lower()
-    return any(w in q for w in _DUE_KEYWORDS)
+    return any(
+        p in q
+        for p in (
+            "when is",
+            "when's",
+            "what is the deadline",
+            "what's the deadline",
+            "deadline for the",
+            "due date for",
+            "due date of",
+        )
+    ) and ("deadline" in q or "due date" in q or " due " in f" {q} ")
+
+
+def _is_due_intent(text: str) -> bool:
+    from ai.assistant import _is_due_list_question
+
+    return _is_due_list_question(text)
 
 
 def _llm_classify(text: str, convo: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -259,6 +290,15 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
             "confidence": "high",
         }
 
+    if _is_specific_deadline_question(cleaned):
+        return {
+            "intent": INTENT_MAILBOX_QA,
+            "recipient": None,
+            "person": None,
+            "content": None,
+            "confidence": "high",
+        }
+
     if _is_due_intent(cleaned):
         return {
             "intent": INTENT_DUE_LIST,
@@ -281,6 +321,8 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
     llm = _llm_classify(cleaned, convo)
     if llm:
         intent = llm.get("intent", INTENT_MAILBOX_QA)
+        if intent == INTENT_DUE_LIST and _is_specific_deadline_question(cleaned):
+            intent = INTENT_MAILBOX_QA
         if intent not in {
             INTENT_COMPOSE,
             INTENT_CONTACT_LOOKUP,

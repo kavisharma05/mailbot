@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from services.timeutil import IST, format_deadline_display
+from datetime import timedelta
+
+from services.timeutil import IST, format_deadline_display, now_ist, parse_iso_deadline
 
 VALID_CATEGORIES = ("deadline", "placement", "certification", "admin", "other")
 
@@ -14,7 +16,7 @@ CATEGORY_LABELS = {
     "other": "Other",
 }
 
-PRIORITY_CATEGORIES = frozenset({"deadline", "placement", "certification"})
+PRIORITY_CATEGORIES = frozenset({"placement", "certification"})
 
 
 def escape_html(text: str) -> str:
@@ -58,13 +60,26 @@ def is_priority_item(
     *,
     task: str | None = None,
     summary: str | None = None,
+    deadline_date: str | None = None,
 ) -> bool:
-    if is_priority_category(category):
+    if category in ("placement", "certification"):
         return True
-    return category == "deadline" and is_reading_task(task, summary)
+    if category == "deadline" and deadline_date:
+        dt = parse_iso_deadline(deadline_date)
+        if dt is not None:
+            delta = dt - now_ist()
+            if timedelta(0) <= delta <= timedelta(hours=48):
+                return True
+    return False
 
 
-def priority_prefix(category: str, *, task: str | None = None, summary: str | None = None) -> str:
-    if is_priority_item(category, task=task, summary=summary):
+def priority_prefix(
+    category: str,
+    *,
+    task: str | None = None,
+    summary: str | None = None,
+    deadline_date: str | None = None,
+) -> str:
+    if is_priority_item(category, task=task, summary=summary, deadline_date=deadline_date):
         return "🔴 <b>IMPORTANT</b>\n"
     return ""

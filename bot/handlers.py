@@ -14,7 +14,12 @@ from telegram.ext import (
     filters,
 )
 
-from ai.assistant import answer_question, lookup_contact_email, split_question_and_paste
+from ai.assistant import (
+    _is_due_list_question,
+    answer_question,
+    lookup_contact_email,
+    split_question_and_paste,
+)
 from ai.composer import compose_email
 from ai.intent import (
     INTENT_COMPOSE,
@@ -23,6 +28,7 @@ from ai.intent import (
     INTENT_MAILBOX_QA,
     INTENT_SCHEDULE,
     INTENT_SMALLTALK,
+    _is_specific_deadline_question,
     classify_message,
 )
 from config import get_settings
@@ -71,7 +77,7 @@ CANCEL_CB = "send_cancel"
 CLEAR_CHAT_CB = "ui:clear_chat"
 
 # How many recent message IDs to try when clearing bot clutter in owner DM
-_CLEAR_CHAT_SCAN_LIMIT = 80
+_CLEAR_CHAT_SCAN_LIMIT = 25
 
 CATEGORY_TITLES = CATEGORY_LABELS
 
@@ -123,13 +129,20 @@ def _category_for_chat(chat_id: int | str | None) -> str | None:
         return None
     settings = get_settings()
     chat = str(chat_id)
-    mapping = {
-        str(settings.telegram_chat_deadlines): "deadline",
-        str(settings.telegram_chat_placements): "placement",
-        str(settings.telegram_chat_certification or settings.telegram_chat_placements): "certification",
-        str(settings.telegram_chat_admin): "admin",
-        str(settings.telegram_chat_other): "other",
-    }
+    # Build imperatively so certification's "fallback to placements" env default
+    # never overwrites the placements group's category mapping.
+    mapping: dict[str, str] = {}
+    for cid, category in (
+        (settings.telegram_chat_deadlines, "deadline"),
+        (settings.telegram_chat_placements, "placement"),
+        (settings.telegram_chat_admin, "admin"),
+        (settings.telegram_chat_other, "other"),
+    ):
+        if cid:
+            mapping[str(cid)] = category
+    cert_chat = settings.telegram_chat_certification
+    if cert_chat:
+        mapping[str(cert_chat)] = "certification"
     return mapping.get(chat)
 
 
@@ -140,6 +153,7 @@ def _sort_items_priority_first(items: list[dict]) -> list[dict]:
             cat,
             task=item.get("task"),
             summary=item.get("summary"),
+            deadline_date=item.get("deadline_date"),
         ) else 1
         due = item.get("deadline_date") or "9999"
         return (pri, due)
@@ -160,7 +174,12 @@ def _format_due_list(items: list[dict], category: str | None) -> str:
         due = format_deadline_display(item.get("deadline_date"), item.get("deadline_text"), tz=IST)
         cat = item.get("category") or "other"
         prefix = f"[{CATEGORY_TITLES.get(cat, cat)}] " if not category else ""
-        pri = "🔴 " if is_priority_item(cat, task=task, summary=item.get("summary")) else ""
+        pri = "🔴 " if is_priority_item(
+            cat,
+            task=task,
+            summary=item.get("summary"),
+            deadline_date=item.get("deadline_date"),
+        ) else ""
         lines.append(f"{i}. {pri}{prefix}<b>{html.escape(str(task))}</b>")
         lines.append(f"   Course: {html.escape(str(course))}")
         lines.append(f"   Due: {html.escape(str(due))}")
@@ -388,9 +407,20 @@ async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         remind_at = datetime.now(timezone.utc) + timedelta(hours=hours)
         updated = await asyncio.to_thread(schedule_assignment_reminder, assignment_id, remind_at)
         if updated:
-            await query.answer(f"Reminder set for {hours}h from now.")
+            confirm = f"⏰ Reminding in {hours}h"
+            try:
+                prior = query.message.text or query.message.caption or ""
+                await query.edit_message_text(
+                    f"{prior}\n\n<i>{confirm}</i>",
+                    parse_mode="HTML",
+                    reply_markup=query.message.reply_markup,
+                )
+            except Exception:
+                pass
+            await query.answer(confirm)
         else:
             await query.answer("Could not schedule reminder.")
+        return
 
 
 def _start_keyboard() -> InlineKeyboardMarkup:
@@ -417,9 +447,10 @@ async def _clear_bot_messages(
     anchor_message_id: int,
     extra_ids: list[int] | None = None,
 ) -> int:
-    """Delete recent messages the bot sent (best-effort scan + tracked IDs)."""
+    """Delete tracked bot messages plus a small scan window (best-effort)."""
     seen: set[int] = set()
     to_try: list[int] = list(extra_ids or [])
+    # Small backward scan from the button message as a fallback for untracked sends.
     for mid in range(anchor_message_id, max(anchor_message_id - _CLEAR_CHAT_SCAN_LIMIT, 0), -1):
         to_try.append(mid)
 
@@ -481,17 +512,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     msg = await update.message.reply_text(
         "Mailbot ready.\n\n"
+        "Morning digest (7:00 IST) and evening digest (20:00 IST) land here in your DM.\n"
+        "Free text works here too — ask about deadlines, mail, or senders.\n\n"
         "Commands:\n"
-        "/due — open items (priority first)\n"
-        "/list — same as /due\n"
+        "/due — open deadlines & tasks (priority first)\n"
         "/done <n> — mark item #n from /due as complete\n"
         "/classes — today's classes for your section (tap to set it first time)\n"
         "/section — change or check your section\n"
-        "/ask <question> — ask about deadlines, mails today, senders, or email content\n"
+        "/ask <question> — ask about deadlines, mails, senders, or email content\n"
         "Add #verify to any question for a fresh Gmail answer with cited sources\n"
-        "/send — compose and send an email (DM preferred)\n"
-        "/cancel — cancel the current compose flow\n"
-        "/reset — clear conversation context for a fresh topic\n\n"
+        "/send — compose and send an email\n"
+        "/cancel — cancel an in-progress email draft only\n"
+        "/reset (or /new) — clear conversation context; discards any draft\n\n"
         "Actionable alerts have DONE / NOT IMPORTANT / REMIND AGAIN buttons.\n"
         "Marks in attachments show as text; readings are forwarded as files.\n\n"
         "In groups: reply to my messages, or mention me:\n"
@@ -632,6 +664,42 @@ def _get_compose(user_data: dict) -> dict | None:
 
 def _clear_compose(user_data: dict) -> None:
     user_data.pop("compose", None)
+
+
+_COMPOSE_CANCEL_WORDS = frozenset({"cancel", "stop", "discard", "abort", "/cancel"})
+
+
+def _looks_like_compose_breakout(text: str) -> bool:
+    """True when free text during compose is clearly not part of drafting."""
+    q = text.lower().strip()
+    if any(m in q for m in SCHEDULE_KEYWORDS):
+        return True
+    if _is_due_list_question(text):
+        return True
+    if any(
+        m in q
+        for m in (
+            "what's her email",
+            "what is her email",
+            "what's his email",
+            "what is his email",
+            "what did ",
+            " from ",
+            "when is",
+            "when's",
+            "what's the deadline",
+            "what is the deadline",
+            "#verify",
+        )
+    ):
+        return True
+    classified = classify_message(text, None)
+    return classified.get("intent") in {
+        INTENT_CONTACT_LOOKUP,
+        INTENT_MAILBOX_QA,
+        INTENT_SCHEDULE,
+        INTENT_DUE_LIST,
+    }
 
 
 def _compose_keyboard() -> InlineKeyboardMarkup:
@@ -800,6 +868,30 @@ async def _continue_compose_flow(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
+    if step == COMPOSE_CONFIRM:
+        lower = text.strip().lower()
+        if lower in _COMPOSE_CANCEL_WORDS:
+            _clear_compose(context.user_data)
+            await update.message.reply_text("Cancelled. Draft discarded.")
+            return
+        if any(w in lower for w in ("edit", "change", "revise", "regenerate", "redo")):
+            if any(w in lower for w in ("regenerate", "redo")):
+                compose.pop("draft", None)
+                context.user_data["compose"] = compose
+                await _draft_and_show_compose(update, context)
+            else:
+                compose["step"] = COMPOSE_NEED_CONTENT
+                context.user_data["compose"] = compose
+                await update.message.reply_text("What should I change? Describe the new content.")
+            remember_turn(context.user_data, user_text=text, intent="compose")
+            return
+        await update.message.reply_text(
+            "Draft waiting for approval. Tap Approve & Send, Cancel, or type edit / cancel.",
+            reply_markup=_compose_keyboard(),
+        )
+        remember_turn(context.user_data, user_text=text, intent="compose")
+        return
+
 
 async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Answer free-text questions in DMs, mentions, or replies to the bot."""
@@ -807,8 +899,17 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if _get_compose(context.user_data):
-        await _continue_compose_flow(update, context, update.message.text)
-        return
+        text = update.message.text
+        lower = text.strip().lower()
+        if lower in _COMPOSE_CANCEL_WORDS:
+            _clear_compose(context.user_data)
+            await update.message.reply_text("Cancelled. Draft discarded.")
+            return
+        if _looks_like_compose_breakout(text):
+            _clear_compose(context.user_data)
+        else:
+            await _continue_compose_flow(update, context, text)
+            return
 
     text = update.message.text
     bot_username = context.bot.username
@@ -878,6 +979,15 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if intent == INTENT_DUE_LIST:
+        if _is_specific_deadline_question(question):
+            await _answer_chat_question(
+                update,
+                context,
+                question,
+                person_hint=classified.get("person"),
+                intent=INTENT_MAILBOX_QA,
+            )
+            return
         await due_command(update, context)
         remember_turn(context.user_data, user_text=question, intent="due_list", query=question)
         return
@@ -970,14 +1080,7 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     convo = get_convo(context.user_data)
-    seed_content = None
-    seed_recipient = None
-    if convo:
-        seed_recipient = convo.get("last_person_email") or convo.get("last_person")
-        for turn in reversed(convo.get("history") or []):
-            if turn.get("role") == "user" and len(turn.get("text") or "") > 20:
-                seed_content = turn.get("text")
-                break
+    seed_recipient = convo.get("last_person_email") if convo else None
 
     args = " ".join(context.args).strip() if context.args else ""
     if args:
@@ -991,7 +1094,6 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         update,
         context,
         recipient=seed_recipient,
-        content=seed_content,
     )
 
 
@@ -1034,17 +1136,27 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+    if not _get_compose(context.user_data):
+        await update.message.reply_text("No compose in progress.")
+        return
     _clear_compose(context.user_data)
-    await update.message.reply_text("Cancelled compose flow.")
+    await update.message.reply_text("Cancelled. Draft discarded.")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update) or not update.message:
         return
+    had_compose = bool(_get_compose(context.user_data))
     clear_convo(context.user_data)
-    await update.message.reply_text(
-        "Context cleared. You can start a fresh topic — deadlines, mail lookup, or /send."
-    )
+    msg = "Context cleared. You can start a fresh topic — deadlines, mail lookup, or /send."
+    if had_compose:
+        msg = (
+            "Context cleared (any in-progress draft was discarded). "
+            "Start fresh — deadlines, mail lookup, or /send."
+        )
+    await update.message.reply_text(msg)
 
 
 def register_handlers(application) -> None:

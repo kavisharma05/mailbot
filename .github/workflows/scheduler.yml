@@ -16,7 +16,17 @@ jobs:
           RENDER_URL: ${{ secrets.RENDER_URL }}
           TASK_SECRET: ${{ secrets.TASK_SECRET }}
         run: |
-          curl -fsS -X POST "${RENDER_URL}/tasks/watch-gmail" \
+          set -euo pipefail
+          if [ -z "${RENDER_URL:-}" ]; then
+            echo "::error::GitHub secret RENDER_URL is missing or empty. Set it to your Render URL (e.g. https://mailbot-xxxx.onrender.com) under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          if [ -z "${TASK_SECRET:-}" ]; then
+            echo "::error::GitHub secret TASK_SECRET is missing or empty. Set it to the same value as Render's TASK_SECRET."
+            exit 1
+          fi
+          BASE="${RENDER_URL%/}"
+          curl -fsS -X POST "${BASE}/tasks/watch-gmail" \
             -H "x-task-secret: ${TASK_SECRET}"
 
   morning_digest:
@@ -28,7 +38,17 @@ jobs:
           RENDER_URL: ${{ secrets.RENDER_URL }}
           TASK_SECRET: ${{ secrets.TASK_SECRET }}
         run: |
-          curl -fsS -X POST "${RENDER_URL}/tasks/digest-morning" \
+          set -euo pipefail
+          if [ -z "${RENDER_URL:-}" ]; then
+            echo "::error::GitHub secret RENDER_URL is missing or empty."
+            exit 1
+          fi
+          if [ -z "${TASK_SECRET:-}" ]; then
+            echo "::error::GitHub secret TASK_SECRET is missing or empty."
+            exit 1
+          fi
+          BASE="${RENDER_URL%/}"
+          curl -fsS -X POST "${BASE}/tasks/digest-morning" \
             -H "x-task-secret: ${TASK_SECRET}"
 
   evening_digest:
@@ -40,5 +60,15 @@ jobs:
           RENDER_URL: ${{ secrets.RENDER_URL }}
           TASK_SECRET: ${{ secrets.TASK_SECRET }}
         run: |
-          curl -fsS -X POST "${RENDER_URL}/tasks/digest-evening" \
+          set -euo pipefail
+          if [ -z "${RENDER_URL:-}" ]; then
+            echo "::error::GitHub secret RENDER_URL is missing or empty."
+            exit 1
+          fi
+          if [ -z "${TASK_SECRET:-}" ]; then
+            echo "::error::GitHub secret TASK_SECRET is missing or empty."
+            exit 1
+          fi
+          BASE="${RENDER_URL%/}"
+          curl -fsS -X POST "${BASE}/tasks/digest-evening" \
             -H "x-task-secret: ${TASK_SECRET}"

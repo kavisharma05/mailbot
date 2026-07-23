@@ -9,17 +9,15 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 BOT_COMMANDS = [
-    BotCommand("help", "Commands and tips"),
-    BotCommand("due", "Open items (priority first)"),
-    BotCommand("list", "Same as /due"),
+    BotCommand("start", "Welcome + help"),
+    BotCommand("due", "Open deadlines & tasks"),
     BotCommand("done", "Mark item #n from /due as complete"),
     BotCommand("classes", "Today's classes for your section"),
     BotCommand("section", "Change or check your section"),
     BotCommand("ask", "Ask about deadlines, mail, senders, or content"),
     BotCommand("send", "Compose and send an email"),
-    BotCommand("cancel", "Cancel the current compose flow"),
+    BotCommand("cancel", "Cancel email draft"),
     BotCommand("reset", "Clear conversation context"),
-    BotCommand("start", "Welcome + help"),
 ]
 
 

@@ -65,6 +65,48 @@ def _category_group_chat_id(category: str, settings: Settings) -> str | None:
     return chat_id or None
 
 
+def format_mail_alert(
+    *,
+    header: str,
+    subject: str | None = None,
+    sender: str | None = None,
+    category: str,
+    course_or_topic: str | None = None,
+    task: str | None = None,
+    deadline_date: str | None = None,
+    deadline_text: str | None = None,
+    summary: str | None = None,
+    confidence: str | None = None,
+) -> str:
+    """Unified owner/group alert body."""
+    label = CATEGORY_LABELS.get(category, "Mail")
+    lines = [
+        priority_prefix(
+            category,
+            task=task,
+            summary=summary,
+            deadline_date=deadline_date,
+        ),
+        header,
+        f"<b>From:</b> {escape_html(sender or 'Unknown sender')}",
+        f"<b>Subject:</b> {escape_html(subject or '(no subject)')}",
+    ]
+    if task:
+        lines.append(f"<b>Task:</b> {escape_html(str(task))}")
+    due = format_deadline(deadline_date, deadline_text)
+    if due and due != "Not specified":
+        lines.append(f"<b>Due:</b> {escape_html(due)}")
+    lines.append(f"<b>Category:</b> {escape_html(label)}")
+    if confidence == "low":
+        lines.append("<i>Low confidence — please review</i>")
+    if course_or_topic:
+        lines.append(f"<b>Course:</b> {escape_html(str(course_or_topic))}")
+    if summary:
+        lines.append("")
+        lines.append(escape_html(str(summary)))
+    return "\n".join(lines)
+
+
 def format_incoming_mail_message(
     *,
     subject: str | None,
@@ -77,29 +119,18 @@ def format_incoming_mail_message(
     summary: str | None = None,
     confidence: str | None = None,
 ) -> str:
-    label = CATEGORY_LABELS.get(category, "Mail")
-    lines = [priority_prefix(category, task=task, summary=summary)]
-    lines.append("📩 <b>New mail</b>")
-    lines.append(f"<b>From:</b> {escape_html(sender or 'Unknown sender')}")
-    lines.append(f"<b>Subject:</b> {escape_html(subject or '(no subject)')}")
-    lines.append(f"<b>Category:</b> {escape_html(label)}")
-    if confidence == "low":
-        lines.append("<i>Low confidence — please review</i>")
-
-    if course_or_topic:
-        lines.append(f"<b>Course:</b> {escape_html(str(course_or_topic))}")
-    if task:
-        lines.append(f"<b>Task:</b> {escape_html(str(task))}")
-
-    due = format_deadline(deadline_date, deadline_text)
-    if due and due != "Not specified":
-        lines.append(f"<b>Due:</b> {escape_html(due)}")
-
-    if summary:
-        lines.append("")
-        lines.append(escape_html(str(summary)))
-
-    return "\n".join(lines)
+    return format_mail_alert(
+        header="📩 <b>New mail</b>",
+        subject=subject,
+        sender=sender,
+        category=category,
+        course_or_topic=course_or_topic,
+        task=task,
+        deadline_date=deadline_date,
+        deadline_text=deadline_text,
+        summary=summary,
+        confidence=confidence,
+    )
 
 
 def format_alert_message(
@@ -112,29 +143,19 @@ def format_alert_message(
     summary: str | None,
     sender: str | None,
     subject: str | None = None,
+    header: str | None = None,
 ) -> str:
-    label = CATEGORY_LABELS.get(category, "Mail")
-    lines = [priority_prefix(category, task=task, summary=summary)]
-    lines.append(f"<b>{escape_html(label)}</b>")
-    if subject:
-        lines.append(f"<b>Subject:</b> {escape_html(subject)}")
-
-    if course_or_topic:
-        lines.append(f"<b>Course:</b> {escape_html(str(course_or_topic))}")
-    if task:
-        lines.append(f"<b>Task:</b> {escape_html(str(task))}")
-
-    due = format_deadline(deadline_date, deadline_text)
-    lines.append(f"<b>Due:</b> {escape_html(due)}")
-
-    if sender:
-        lines.append(f"<b>From:</b> {escape_html(str(sender))}")
-
-    if summary:
-        lines.append("")
-        lines.append(escape_html(str(summary)))
-
-    return "\n".join(lines)
+    return format_mail_alert(
+        header=header or "📩 <b>New mail</b>",
+        subject=subject,
+        sender=sender,
+        category=category,
+        course_or_topic=course_or_topic,
+        task=task,
+        deadline_date=deadline_date,
+        deadline_text=deadline_text,
+        summary=summary,
+    )
 
 
 async def send_category_alert(
@@ -165,7 +186,12 @@ async def send_category_alert(
         sender=sender,
         subject=subject,
     )
-    pin = is_priority_item(category, task=task, summary=summary)
+    pin = is_priority_item(
+        category,
+        task=task,
+        summary=summary,
+        deadline_date=deadline_date,
+    )
     await send_actionable_alert(
         bot,
         chat_id,
@@ -224,7 +250,12 @@ def _should_owner_dm(
         return True
     if is_actionable:
         return True
-    return is_priority_item(category, task=task, summary=summary)
+    return is_priority_item(
+        category,
+        task=task,
+        summary=summary,
+        deadline_date=None,
+    )
 
 
 def _assignment_payload(
@@ -305,7 +336,12 @@ async def _process_message(
         summary=summary,
         confidence=confidence,
     )
-    pin_owner = is_priority_item(category, task=result.get("task"), summary=summary)
+    pin_owner = is_priority_item(
+        category,
+        task=result.get("task"),
+        summary=summary,
+        deadline_date=deadline_date,
+    )
 
     # Timetable / weekly schedule path
     if looks_like_schedule(
@@ -522,6 +558,13 @@ async def run_gmail_watcher(bot) -> dict:
             logger.exception("Processing failed for %s: %s", message_id, exc)
             failed += 1
             continue
+        if outcome.get("transient"):
+            failed += 1
+            logger.warning(
+                "Deferred history advance: transient failure for %s (classification retry pending)",
+                message_id,
+            )
+            continue
         processed += outcome["processed"]
         alerts += outcome["alerts"]
 
@@ -600,28 +643,27 @@ async def run_due_reminders(bot) -> dict:
             deadline_date=item.get("deadline_date"),
             deadline_text=item.get("deadline_text"),
             summary=item.get("summary"),
-            sender=None,
-            subject="Reminder",
+            sender=item.get("sender"),
+            subject=item.get("subject"),
+            header="⏰ <b>Reminder</b>",
         )
-        text = f"⏰ <b>Reminder</b>\n\n{text}"
-        chat_id = _category_group_chat_id(category, settings)
-        if chat_id:
-            await send_actionable_alert(
-                bot,
-                chat_id,
-                text,
-                assignment_id=str(assignment_id),
-                pin=is_priority_item(category, task=item.get("task"), summary=item.get("summary")),
-            )
+        sent_id = None
         if settings.telegram_owner_chat_id:
-            await send_actionable_alert(
+            sent_id = await send_actionable_alert(
                 bot,
                 settings.telegram_owner_chat_id,
                 text,
                 assignment_id=str(assignment_id),
+                pin=is_priority_item(
+                    category,
+                    task=item.get("task"),
+                    summary=item.get("summary"),
+                    deadline_date=item.get("deadline_date"),
+                ),
             )
-        await asyncio.to_thread(clear_assignment_reminder, str(assignment_id))
-        sent += 1
+        if sent_id:
+            await asyncio.to_thread(clear_assignment_reminder, str(assignment_id))
+            sent += 1
 
     return {"status": "ok", "reminders_sent": sent}
 

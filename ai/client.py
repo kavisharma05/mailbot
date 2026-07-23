@@ -239,6 +239,10 @@ def _call_groq(
                 _cooldown(provider, daily=_is_daily_limit_text(text), seconds=180)
                 logger.error("%s rate/daily limit: %s", provider, exc)
                 return None
+            if exc.status_code in (401, 403):
+                _cooldown(provider, seconds=3600)
+                logger.error("%s auth failed (%s): %s", provider, exc.status_code, exc)
+                return None
             if exc.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS:
                 delay = min(2 ** (attempt - 1), 2)
                 logger.warning(

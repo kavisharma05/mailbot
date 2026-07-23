@@ -35,8 +35,12 @@ KEEP_ALIVE_RETRY_SECONDS = 30
 KEEP_ALIVE_MAX_RETRIES = 3
 DIGEST_SCHEDULER_INTERVAL_SECONDS = 60
 MORNING_DIGEST_HOUR = 7
+MORNING_DIGEST_END_HOUR = 9
 EVENING_DIGEST_HOUR = 20
+EVENING_DIGEST_END_HOUR = 22
 PING_BODY = b"ok"
+
+digest_scheduler_lock = asyncio.Lock()
 
 
 class InstantPingMiddleware:
@@ -127,22 +131,23 @@ async def _background_watcher_loop() -> None:
 
 
 async def _digest_scheduler_loop() -> None:
-    """Fire morning (07:00 IST) and evening (20:00 IST) digests while the app is awake."""
+    """Fire morning (07:00-09:00 IST) and evening (20:00-22:00 IST) digests while awake."""
     while True:
         try:
             now = now_ist()
-            if now.hour >= MORNING_DIGEST_HOUR:
-                result = await run_morning_digest(ptb_app.bot)
-                if result.get("sent"):
-                    logger.info("In-app morning digest: %s", result)
-                elif result.get("skipped"):
-                    pass  # already sent today — expected on subsequent ticks
-            if now.hour >= EVENING_DIGEST_HOUR:
-                result = await run_evening_digest(ptb_app.bot)
-                if result.get("sent"):
-                    logger.info("In-app evening digest: %s", result)
-                elif result.get("skipped"):
-                    pass
+            async with digest_scheduler_lock:
+                if MORNING_DIGEST_HOUR <= now.hour < MORNING_DIGEST_END_HOUR:
+                    result = await run_morning_digest(ptb_app.bot)
+                    if result.get("sent"):
+                        logger.info("In-app morning digest: %s", result)
+                    elif result.get("skipped"):
+                        pass  # already sent today — expected on subsequent ticks
+                if EVENING_DIGEST_HOUR <= now.hour < EVENING_DIGEST_END_HOUR:
+                    result = await run_evening_digest(ptb_app.bot)
+                    if result.get("sent"):
+                        logger.info("In-app evening digest: %s", result)
+                    elif result.get("skipped"):
+                        pass
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -213,6 +218,8 @@ async def watch_gmail(x_task_secret: str = Header(..., alias="x-task-secret")):
             status_code=503,
             detail="Gmail refresh token expired or revoked; re-run scripts/get_gmail_token.py and update GMAIL_REFRESH_TOKEN",
         ) from exc
+    remind_result = await run_due_reminders(ptb_app.bot)
+    result["reminders"] = remind_result
     logger.info("Gmail watcher result: %s", result)
     return result
 
