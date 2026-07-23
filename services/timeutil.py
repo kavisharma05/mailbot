@@ -214,7 +214,31 @@ def format_deadline_display(
     if dt is None and deadline_text:
         dt = resolve_deadline_text(deadline_text)
     if dt is not None:
-        formatted = dt.astimezone(tz).strftime("%a, %d %b %Y %I:%M %p")
+        local = dt.astimezone(tz)
+        formatted = local.strftime("%a, %d %b %Y %I:%M %p")
+        now = now_ist()
+        delta = local - now
+        relative = ""
+        if timedelta(0) < delta <= timedelta(hours=48):
+            total_minutes = int(delta.total_seconds() // 60)
+            if total_minutes < 60:
+                relative = f"Due in {total_minutes}m"
+            elif total_minutes < 24 * 60:
+                hours = total_minutes // 60
+                mins = total_minutes % 60
+                relative = f"Due in {hours}h" + (f" {mins}m" if mins else "")
+            else:
+                days = total_minutes // (24 * 60)
+                hours = (total_minutes % (24 * 60)) // 60
+                relative = f"Due in {days}d" + (f" {hours}h" if hours else "")
+        elif delta <= timedelta(0) and delta >= timedelta(hours=-24):
+            overdue_mins = int(abs(delta.total_seconds()) // 60)
+            if overdue_mins < 60:
+                relative = f"Overdue {overdue_mins}m ago"
+            else:
+                relative = f"Overdue {overdue_mins // 60}h ago"
+        if relative:
+            formatted = f"{relative} — {formatted}"
         if deadline_text and deadline_text.strip():
             return f"{formatted} ({deadline_text.strip()})"
         return formatted

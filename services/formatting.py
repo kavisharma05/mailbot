@@ -16,6 +16,18 @@ CATEGORY_LABELS = {
     "other": "Other",
 }
 
+CATEGORY_ICONS = {
+    "deadline": "⏰",
+    "placement": "💼",
+    "certification": "🎓",
+    "admin": "📢",
+    "other": "📋",
+}
+
+
+def category_icon(category: str) -> str:
+    return CATEGORY_ICONS.get(normalize_category(category), "📋")
+
 PRIORITY_CATEGORIES = frozenset({"placement", "certification"})
 
 

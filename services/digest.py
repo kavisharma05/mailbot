@@ -20,7 +20,7 @@ from services.schedule import (
     refresh_schedule_from_gmail,
     sessions_for_day,
 )
-from services.formatting import CATEGORY_LABELS, escape_html, format_deadline, is_priority_item
+from services.formatting import CATEGORY_LABELS, category_icon, escape_html, format_deadline, is_priority_item
 from services.telegram_util import send_html
 
 logger = logging.getLogger(__name__)
@@ -72,10 +72,11 @@ def _format_item_line(item: dict[str, Any], *, overdue: bool = False) -> str:
     course = item.get("course_or_topic") or "—"
     due = _format_deadline_display(item.get("deadline_date"), item.get("deadline_text"))
     cat = CATEGORY_LABELS.get(item.get("category") or "other", "Other")
+    icon = category_icon(item.get("category") or "other")
     prefix = "⚠️ " if overdue else "• "
     return (
         f"{prefix}<b>{_escape_html(str(task))}</b>\n"
-        f"   [{_escape_html(cat)}] Course: {_escape_html(str(course))}\n"
+        f"   {icon} [{_escape_html(cat)}] Course: {_escape_html(str(course))}\n"
         f"   Due: {_escape_html(due)}"
     )
 
@@ -131,8 +132,10 @@ def _format_morning_owner_message(
         for item in recent_items[:8]:
             task = item.get("task") or item.get("summary") or "Untitled"
             due = _format_deadline_display(item.get("deadline_date"), item.get("deadline_text"))
-            cat = CATEGORY_LABELS.get(item.get("category") or "other", "Other")
-            lines.append(f"• <b>{_escape_html(str(task))}</b> [{_escape_html(cat)}]")
+            cat_key = item.get("category") or "other"
+            icon = category_icon(cat_key)
+            cat = CATEGORY_LABELS.get(cat_key, "Other")
+            lines.append(f"• <b>{_escape_html(str(task))}</b> {icon} [{_escape_html(cat)}]")
             lines.append(f"   Due: {_escape_html(due)}")
             lines.append("")
 

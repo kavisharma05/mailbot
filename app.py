@@ -2,6 +2,8 @@ import asyncio
 import logging
 import hmac
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -14,10 +16,14 @@ from services.db import check_db_health
 from services.digest import run_evening_digest, run_morning_digest
 from services.telegram_dedupe import should_process_update
 from services.timeutil import now_ist
+from services.monitoring import ping_heartbeat
+from services.reminders import run_scheduled_reminders
 from services.watcher import (
     WATCHER_INTERVAL_SECONDS,
+    notify_gmail_auth_failure,
     run_due_reminders,
     run_gmail_backfill,
+    run_gmail_reconnect_backfill,
     run_gmail_watcher,
     watcher_lock,
 )
@@ -113,12 +119,21 @@ async def _background_watcher_loop() -> None:
     """Poll Gmail every ~60s while the process is awake."""
     reminder_counter = 0
     while True:
+        watcher_ok = False
         try:
             async with watcher_lock:
                 result = await run_gmail_watcher(ptb_app.bot)
+            watcher_ok = True
             logger.info("Background watcher result: %s", result)
+            await ping_heartbeat(ok=True)
+            from services.db import update_watch_state
+
+            await asyncio.to_thread(
+                update_watch_state,
+                last_heartbeat_at=datetime.now(timezone.utc),
+            )
             reminder_counter += 1
-            if reminder_counter >= 5:
+            if reminder_counter >= 3:
                 reminder_counter = 0
                 try:
                     remind_result = await run_due_reminders(ptb_app.bot)
@@ -126,10 +141,24 @@ async def _background_watcher_loop() -> None:
                         logger.info("Due reminders: %s", remind_result)
                 except Exception as exc:
                     logger.exception("Due reminders failed: %s", exc)
+                try:
+                    sched_result = await run_scheduled_reminders(ptb_app.bot)
+                    if sched_result.get("reminders_sent"):
+                        logger.info("Scheduled reminders: %s", sched_result)
+                except Exception as exc:
+                    logger.exception("Scheduled reminders failed: %s", exc)
         except asyncio.CancelledError:
             raise
+        except RefreshError:
+            await ping_heartbeat(ok=False)
+            try:
+                await notify_gmail_auth_failure(ptb_app.bot)
+            except Exception as exc:
+                logger.exception("Gmail auth alert failed: %s", exc)
         except Exception as exc:
             logger.exception("Background watcher failed: %s", exc)
+            if watcher_ok:
+                await ping_heartbeat(ok=False)
         await asyncio.sleep(WATCHER_INTERVAL_SECONDS)
 
 
@@ -217,12 +246,20 @@ async def watch_gmail(x_task_secret: str = Header(..., alias="x-task-secret")):
             result = await run_gmail_watcher(ptb_app.bot)
     except RefreshError as exc:
         logger.exception("Gmail auth failed during watch-gmail: %s", exc)
+        await notify_gmail_auth_failure(ptb_app.bot)
+        await ping_heartbeat(ok=False)
         raise HTTPException(
             status_code=503,
-            detail="Gmail refresh token expired or revoked; re-run scripts/get_gmail_token.py and update GMAIL_REFRESH_TOKEN",
+            detail="Gmail refresh token expired or revoked; use /oauth/start to reconnect",
         ) from exc
+    await ping_heartbeat(ok=True)
+    from services.db import update_watch_state
+
+    await asyncio.to_thread(update_watch_state, last_heartbeat_at=datetime.now(timezone.utc))
     remind_result = await run_due_reminders(ptb_app.bot)
     result["reminders"] = remind_result
+    sched_result = await run_scheduled_reminders(ptb_app.bot)
+    result["scheduled_reminders"] = sched_result
     logger.info("Gmail watcher result: %s", result)
     return result
 
@@ -276,6 +313,99 @@ async def digest_evening(
     )
     logger.info("Evening digest result: %s", result)
     return result
+
+
+@fastapi_app.post("/tasks/run-reminders")
+async def run_reminders_task(x_task_secret: str = Header(..., alias="x-task-secret")):
+    settings = get_settings()
+    if not hmac.compare_digest(x_task_secret, settings.task_secret):
+        raise HTTPException(status_code=403, detail="Invalid task secret")
+
+    due_result = await run_due_reminders(ptb_app.bot)
+    sched_result = await run_scheduled_reminders(ptb_app.bot)
+    return {"due_reminders": due_result, "scheduled_reminders": sched_result}
+
+
+@fastapi_app.get("/oauth/start")
+async def oauth_start():
+    """Redirect owner to Google consent screen for one-tap Gmail reconnect."""
+    settings = get_settings()
+    redirect_uri = settings.gmail_oauth_redirect_uri
+    if not redirect_uri:
+        raise HTTPException(
+            status_code=503,
+            detail="Set GMAIL_OAUTH_REDIRECT_URI to enable one-tap reconnect",
+        )
+    params = urlencode(
+        {
+            "client_id": settings.gmail_client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": " ".join(
+                [
+                    "https://www.googleapis.com/auth/gmail.readonly",
+                    "https://www.googleapis.com/auth/gmail.send",
+                    "https://www.googleapis.com/auth/gmail.modify",
+                ]
+            ),
+            "access_type": "offline",
+            "prompt": "consent",
+            "include_granted_scopes": "true",
+        }
+    )
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
+
+
+@fastapi_app.get("/oauth/callback")
+async def oauth_callback(code: str | None = None, error: str | None = None):
+    """Exchange OAuth code for refresh token and run reconnect backfill."""
+    from fastapi.responses import HTMLResponse
+
+    if error or not code:
+        return HTMLResponse(
+            f"<h1>Gmail reconnect failed</h1><p>{error or 'No authorization code'}</p>",
+            status_code=400,
+        )
+
+    settings = get_settings()
+    redirect_uri = settings.gmail_oauth_redirect_uri
+    if not redirect_uri:
+        raise HTTPException(status_code=503, detail="GMAIL_OAUTH_REDIRECT_URI not configured")
+
+    token_url = "https://oauth2.googleapis.com/token"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            token_url,
+            data={
+                "code": code,
+                "client_id": settings.gmail_client_id,
+                "client_secret": settings.gmail_client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+        )
+    if resp.status_code >= 400:
+        logger.error("OAuth token exchange failed: %s", resp.text)
+        return HTMLResponse("<h1>Token exchange failed</h1>", status_code=502)
+
+    data = resp.json()
+    refresh_token = data.get("refresh_token")
+    if not refresh_token:
+        return HTMLResponse(
+            "<h1>No refresh token returned</h1><p>Try again with prompt=consent.</p>",
+            status_code=502,
+        )
+
+    from gmail_api.auth import store_refresh_token
+
+    store_refresh_token(refresh_token)
+    backfill = await run_gmail_reconnect_backfill(ptb_app.bot)
+    logger.info("Gmail reconnected; backfill: %s", backfill)
+    return HTMLResponse(
+        "<h1>Gmail reconnected</h1><p>You can close this tab and return to Telegram.</p>"
+    )
 
 
 app = InstantPingMiddleware(fastapi_app)

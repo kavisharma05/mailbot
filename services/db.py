@@ -16,7 +16,7 @@ T = TypeVar("T")
 _db_client: Client | None = None
 
 _ASSIGNMENT_COLUMNS = (
-    "id, category, course_or_topic, task, deadline_text, deadline_date, "
+    "id, category, item_type, priority, course_or_topic, task, deadline_text, deadline_date, "
     "summary, confidence, status, remind_at, gmail_message_id, gmail_thread_id, created_at"
 )
 
@@ -78,13 +78,29 @@ def get_watch_state() -> dict[str, Any] | None:
 
 
 @_safe_write
-def update_watch_state(last_history_id: str | None = None, last_checked_at: datetime | None = None) -> None:
+def update_watch_state(
+    last_history_id: str | None = None,
+    last_checked_at: datetime | None = None,
+    *,
+    gmail_disconnected_at: datetime | None = None,
+    gmail_reconnected_at: datetime | None = None,
+    last_heartbeat_at: datetime | None = None,
+    clear_gmail_disconnected: bool = False,
+) -> None:
     db = get_db()
     payload: dict[str, Any] = {}
     if last_history_id is not None:
         payload["last_history_id"] = last_history_id
     if last_checked_at is not None:
         payload["last_checked_at"] = last_checked_at.isoformat()
+    if gmail_disconnected_at is not None:
+        payload["gmail_disconnected_at"] = gmail_disconnected_at.isoformat()
+    if gmail_reconnected_at is not None:
+        payload["gmail_reconnected_at"] = gmail_reconnected_at.isoformat()
+    if last_heartbeat_at is not None:
+        payload["last_heartbeat_at"] = last_heartbeat_at.isoformat()
+    if clear_gmail_disconnected:
+        payload["gmail_disconnected_at"] = None
     if payload:
         db.table("watch_state").update(payload).eq("id", 1).execute()
 
@@ -193,6 +209,16 @@ def insert_assignment(data: dict[str, Any]) -> dict[str, Any] | None:
             return None
         return rows[0]
     except Exception as exc:
+        err = str(exc).lower()
+        if "item_type" in err or "priority" in err:
+            slim = {k: v for k, v in data.items() if k not in ("item_type", "priority")}
+            try:
+                result = db.table("assignments").insert(slim).execute()
+                rows = result.data or []
+                return rows[0] if rows else None
+            except Exception as exc2:
+                logger.exception("insert_assignment fallback failed: %s", exc2)
+                return None
         logger.exception("insert_assignment failed: %s", exc)
         return None
 
@@ -296,6 +322,8 @@ def mark_assignment_done(assignment_id: str) -> dict[str, Any] | None:
         .execute()
     )
     rows = result.data or []
+    if rows:
+        cancel_scheduled_reminders(assignment_id)
     return rows[0] if rows else None
 
 
@@ -310,6 +338,8 @@ def dismiss_assignment(assignment_id: str) -> dict[str, Any] | None:
         .execute()
     )
     rows = result.data or []
+    if rows:
+        cancel_scheduled_reminders(assignment_id)
     return rows[0] if rows else None
 
 
@@ -757,3 +787,171 @@ def delete_user_data_state(user_id: str) -> None:
             logger.warning("user_data_state table missing — using in-memory fallback: %s", exc)
         else:
             logger.exception("delete_user_data_state failed for %s: %s", uid, exc)
+
+
+# --- Scheduled reminders ---
+
+_scheduled_reminders_table_missing = False
+
+
+@_safe_read([])
+def insert_scheduled_reminders(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    global _scheduled_reminders_table_missing
+    if not rows or _scheduled_reminders_table_missing:
+        return []
+    try:
+        db = get_db()
+        result = db.table("scheduled_reminders").insert(rows).execute()
+        return result.data or []
+    except Exception as exc:
+        err = str(exc).lower()
+        if "scheduled_reminders" in err or "does not exist" in err or "42p01" in err:
+            _scheduled_reminders_table_missing = True
+            logger.warning("scheduled_reminders table missing: %s", exc)
+            return []
+        logger.exception("insert_scheduled_reminders failed: %s", exc)
+        return []
+
+
+@_safe_read([])
+def get_due_scheduled_reminders(before: datetime | None = None, limit: int = 30) -> list[dict[str, Any]]:
+    global _scheduled_reminders_table_missing
+    if _scheduled_reminders_table_missing:
+        return []
+    try:
+        db = get_db()
+        cutoff = (before or datetime.now(timezone.utc)).isoformat()
+        result = (
+            db.table("scheduled_reminders")
+            .select("id, assignment_id, fire_at, tier, status")
+            .eq("status", "pending")
+            .lte("fire_at", cutoff)
+            .order("fire_at")
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception as exc:
+        err = str(exc).lower()
+        if "scheduled_reminders" in err or "does not exist" in err or "42p01" in err:
+            _scheduled_reminders_table_missing = True
+            logger.warning("scheduled_reminders table missing: %s", exc)
+            return []
+        logger.exception("get_due_scheduled_reminders failed: %s", exc)
+        return []
+
+
+@_safe_write
+def mark_scheduled_reminder_sent(reminder_id: str) -> None:
+    global _scheduled_reminders_table_missing
+    if _scheduled_reminders_table_missing:
+        return
+    try:
+        db = get_db()
+        db.table("scheduled_reminders").update({"status": "sent"}).eq("id", reminder_id).execute()
+    except Exception as exc:
+        err = str(exc).lower()
+        if "scheduled_reminders" in err or "does not exist" in err or "42p01" in err:
+            _scheduled_reminders_table_missing = True
+        else:
+            logger.exception("mark_scheduled_reminder_sent failed: %s", exc)
+
+
+@_safe_write
+def cancel_scheduled_reminders(assignment_id: str) -> None:
+    global _scheduled_reminders_table_missing
+    if _scheduled_reminders_table_missing:
+        return
+    try:
+        db = get_db()
+        db.table("scheduled_reminders").update({"status": "cancelled"}).eq(
+            "assignment_id", assignment_id
+        ).eq("status", "pending").execute()
+    except Exception as exc:
+        err = str(exc).lower()
+        if "scheduled_reminders" in err or "does not exist" in err or "42p01" in err:
+            _scheduled_reminders_table_missing = True
+        else:
+            logger.exception("cancel_scheduled_reminders failed: %s", exc)
+
+
+@_safe_read(0)
+def count_pending_scheduled_reminders() -> int:
+    global _scheduled_reminders_table_missing
+    if _scheduled_reminders_table_missing:
+        return 0
+    try:
+        db = get_db()
+        result = (
+            db.table("scheduled_reminders")
+            .select("id", count="exact")
+            .eq("status", "pending")
+            .execute()
+        )
+        return int(result.count or 0)
+    except Exception as exc:
+        err = str(exc).lower()
+        if "scheduled_reminders" in err or "does not exist" in err or "42p01" in err:
+            _scheduled_reminders_table_missing = True
+            return 0
+        logger.exception("count_pending_scheduled_reminders failed: %s", exc)
+        return 0
+
+
+# --- OAuth tokens ---
+
+_oauth_tokens_table_missing = False
+
+
+@_safe_read(None)
+def get_stored_refresh_token(provider: str = "gmail") -> str | None:
+    global _oauth_tokens_table_missing
+    if _oauth_tokens_table_missing:
+        return None
+    try:
+        db = get_db()
+        result = (
+            db.table("oauth_tokens")
+            .select("refresh_token")
+            .eq("id", 1)
+            .eq("provider", provider)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if rows and rows[0].get("refresh_token"):
+            return str(rows[0]["refresh_token"])
+        return None
+    except Exception as exc:
+        err = str(exc).lower()
+        if "oauth_tokens" in err or "does not exist" in err or "42p01" in err:
+            _oauth_tokens_table_missing = True
+            logger.warning("oauth_tokens table missing: %s", exc)
+            return None
+        logger.exception("get_stored_refresh_token failed: %s", exc)
+        return None
+
+
+@_safe_write
+def persist_refresh_token(refresh_token: str, provider: str = "gmail") -> None:
+    global _oauth_tokens_table_missing
+    if _oauth_tokens_table_missing:
+        return
+    try:
+        db = get_db()
+        db.table("oauth_tokens").upsert(
+            {
+                "id": 1,
+                "provider": provider,
+                "refresh_token": refresh_token,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="id",
+        ).execute()
+    except Exception as exc:
+        err = str(exc).lower()
+        if "oauth_tokens" in err or "does not exist" in err or "42p01" in err:
+            _oauth_tokens_table_missing = True
+            logger.warning("oauth_tokens table missing: %s", exc)
+        else:
+            logger.exception("persist_refresh_token failed: %s", exc)

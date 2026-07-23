@@ -11,6 +11,7 @@ from typing import Any
 from ai.client import call_json
 from ai.prompts import SCHEDULE_PROMPT
 from gmail_api.client import get_message_details, search_message_ids
+from config import get_settings
 from services.db import (
     delete_class_sessions_for_message,
     get_class_sessions_for_message,
@@ -186,12 +187,31 @@ def sessions_for_day(
 _parse_cache: dict[str, dict[str, Any]] = {}
 
 # Newest-first Gmail searches for timetable mails (incl. PDF attachments)
-_SCHEDULE_QUERIES = (
+_SCHEDULE_QUERIES_BASE = (
     'subject:(timetable OR "time table" OR "class schedule" OR "weekly schedule" OR "class timings") newer_than:90d',
     '("timetable" OR "time table" OR "class schedule" OR "weekly schedule") has:attachment newer_than:90d',
     '(filename:timetable OR filename:schedule OR filename:"time table") newer_than:90d',
     'subject:(MBA OR PGDM OR "batch") (timetable OR schedule OR classroom) newer_than:60d',
 )
+
+
+def _schedule_queries() -> tuple[str, ...]:
+    settings = get_settings()
+    allowed = [s.strip() for s in settings.admin_schedule_sender.split(",") if s.strip()]
+    if not allowed:
+        return _SCHEDULE_QUERIES_BASE
+    from_clause = " OR ".join(f"from:{a}" for a in allowed)
+    return tuple(f"({from_clause}) {q}" for q in _SCHEDULE_QUERIES_BASE)
+
+
+def is_trusted_schedule_sender(sender: str) -> bool:
+    """Return True if sender is allowed to update class_sessions."""
+    settings = get_settings()
+    allowed = [s.strip().lower() for s in settings.admin_schedule_sender.split(",") if s.strip()]
+    if not allowed:
+        return True
+    sender_lower = (sender or "").lower()
+    return any(a in sender_lower for a in allowed)
 
 
 def looks_like_schedule(subject: str, body: str, attachment_text: str, result: dict[str, Any]) -> bool:
@@ -670,10 +690,25 @@ def store_schedule_sessions(
         return sessions
 
 
+def _next_day_with_classes(
+    sessions: list[dict[str, Any]], from_day: date
+) -> tuple[date | None, list[dict[str, Any]]]:
+    """Find the next calendar day (within 7 days) that has sessions."""
+    by_day: dict[str, list[dict[str, Any]]] = {}
+    for s in sessions:
+        by_day.setdefault(s["session_date"], []).append(s)
+    for offset in range(1, 8):
+        candidate_date = from_day + timedelta(days=offset)
+        candidate_key = candidate_date.isoformat()
+        if candidate_key in by_day:
+            return candidate_date, by_day[candidate_key]
+    return None, []
+
+
 def find_latest_schedule_message_ids(*, max_candidates: int = 8) -> list[str]:
     """Return newest-ish candidate message ids for timetable emails."""
     seen: list[str] = []
-    for query in _SCHEDULE_QUERIES:
+    for query in _schedule_queries():
         try:
             ids = search_message_ids(query, max_results=6)
         except Exception as exc:
@@ -998,15 +1033,23 @@ def classes_command_text(*, refresh: bool = True, section: str | None = None) ->
         return today_text + _source_footer(info)
 
     if template:
-        upcoming_text = format_upcoming_classes(day, days=7, section=section, template=template)
-        if upcoming_text:
-            return upcoming_text + _source_footer(info)
-
-        label = day.strftime("%a, %d %b %Y")
+        week_end = day + timedelta(days=7)
+        raw_sessions = info.get("sessions") or template
+        if not raw_sessions:
+            try:
+                raw_sessions = get_classes_between(day.isoformat(), week_end.isoformat())
+            except Exception:
+                raw_sessions = []
+        sessions = filter_by_section(raw_sessions, section)
+        next_day, next_sessions = _next_day_with_classes(sessions, day)
+        no_today_line = f"No classes today ({day.strftime('%a, %d %b')})."
+        if next_day:
+            label = next_day.strftime("%a, %d %b %Y")
+            body = _format_session_block(next_sessions, f"<b>📚 Next classes — {label}</b>")
+            return f"{no_today_line}\n\n{body}" + _source_footer(info)
         return (
-            f"No classes scheduled for {label} in your section"
-            f"{f' (Sec. {section})' if section else ''}.\n"
-            "Your timetable is loaded — try asking about another day, or run /section."
+            f"{no_today_line}\n"
+            "No upcoming classes found in the latest timetable either."
         ) + _source_footer(info)
 
     reason = info.get("reason")

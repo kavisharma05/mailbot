@@ -29,6 +29,7 @@ from services.db import (
 )
 from services.formatting import (
     CATEGORY_LABELS,
+    category_icon,
     escape_html,
     format_deadline,
     is_priority_item,
@@ -37,10 +38,12 @@ from services.formatting import (
 )
 from services.schedule import (
     format_schedule_share,
+    is_trusted_schedule_sender,
     looks_like_schedule,
     parse_schedule_sessions,
     store_schedule_sessions,
 )
+from services.reminders import run_scheduled_reminders, schedule_deadline_reminders
 from services.telegram_util import send_html
 from services.timeutil import IST, now_ist, parse_iso_deadline
 
@@ -80,6 +83,7 @@ def format_mail_alert(
 ) -> str:
     """Unified owner/group alert body."""
     label = CATEGORY_LABELS.get(category, "Mail")
+    icon = category_icon(category)
     lines = [
         priority_prefix(
             category,
@@ -96,7 +100,7 @@ def format_mail_alert(
     due = format_deadline(deadline_date, deadline_text)
     if due and due != "Not specified":
         lines.append(f"<b>Due:</b> {escape_html(due)}")
-    lines.append(f"<b>Category:</b> {escape_html(label)}")
+    lines.append(f"<b>Category:</b> {icon} {escape_html(label)}")
     if confidence == "low":
         lines.append("<i>Low confidence — please review</i>")
     if course_or_topic:
@@ -267,6 +271,8 @@ def _assignment_payload(
     return {
         "source": "email",
         "category": category,
+        "item_type": result.get("item_type"),
+        "priority": result.get("priority"),
         "course_or_topic": result.get("course_or_topic"),
         "task": result.get("task"),
         "deadline_text": result.get("deadline_text"),
@@ -344,7 +350,7 @@ async def _process_message(
     )
 
     # Timetable / weekly schedule path
-    if looks_like_schedule(
+    if is_trusted_schedule_sender(details.get("sender", "")) and looks_like_schedule(
         details["subject"],
         details["body"],
         attachment_text,
@@ -425,6 +431,7 @@ async def _process_message(
         )
         if assignment:
             assignment_id = assignment["id"]
+            await asyncio.to_thread(schedule_deadline_reminders, assignment)
 
         if assignment_id and _should_owner_dm(
             settings,
@@ -514,6 +521,17 @@ async def _collect_message_ids(state: dict[str, Any] | None) -> tuple[list[str],
 
 async def run_gmail_watcher(bot) -> dict:
     """Poll Gmail for new emails, classify, route alerts by category."""
+    from google.auth.exceptions import RefreshError
+
+    try:
+        return await _run_gmail_watcher_inner(bot)
+    except RefreshError as exc:
+        logger.exception("Gmail auth failed during watcher: %s", exc)
+        await notify_gmail_auth_failure(bot)
+        raise
+
+
+async def _run_gmail_watcher_inner(bot) -> dict:
     state = await asyncio.to_thread(get_watch_state)
     now = datetime.now(timezone.utc)
 
@@ -666,6 +684,124 @@ async def run_due_reminders(bot) -> dict:
             sent += 1
 
     return {"status": "ok", "reminders_sent": sent}
+
+
+_gmail_auth_alert_sent = False
+
+
+def _oauth_start_url() -> str | None:
+    settings = get_settings()
+    base = (settings.render_url or settings.gmail_oauth_redirect_uri or "").rstrip("/")
+    if not base or "your-app" in base:
+        return None
+    if settings.gmail_oauth_redirect_uri:
+        # redirect_uri host is the app base
+        from urllib.parse import urlparse
+
+        parsed = urlparse(settings.gmail_oauth_redirect_uri)
+        if parsed.scheme and parsed.netloc:
+            base = f"{parsed.scheme}://{parsed.netloc}"
+    return f"{base}/oauth/start"
+
+
+async def notify_gmail_auth_failure(bot) -> None:
+    """Alert owner once when Gmail refresh token is revoked/expired."""
+    global _gmail_auth_alert_sent
+    if _gmail_auth_alert_sent:
+        return
+    settings = get_settings()
+    owner = settings.telegram_owner_chat_id
+    if not owner:
+        return
+
+    now = datetime.now(timezone.utc)
+    await asyncio.to_thread(update_watch_state, gmail_disconnected_at=now)
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    text = (
+        "⚠️ <b>Gmail access lost</b>\n\n"
+        "Your refresh token expired or was revoked. Mail watching is paused until you reconnect."
+    )
+    oauth_url = _oauth_start_url()
+    markup = None
+    if oauth_url:
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔗 Reconnect Gmail", url=oauth_url)]]
+        )
+
+    try:
+        await bot.send_message(
+            chat_id=owner,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        _gmail_auth_alert_sent = True
+    except Exception as exc:
+        logger.warning("Failed to send Gmail auth failure alert: %s", exc)
+
+
+async def run_gmail_reconnect_backfill(bot) -> dict:
+    """After reconnect, scan outage window and alert on missed + future deadlines."""
+    state = await asyncio.to_thread(get_watch_state)
+    if not state or not state.get("gmail_disconnected_at"):
+        return {"status": "skipped", "reason": "no_outage"}
+
+    disconnected_raw = state["gmail_disconnected_at"]
+    try:
+        disconnected_at = datetime.fromisoformat(str(disconnected_raw).replace("Z", "+00:00"))
+    except ValueError:
+        return {"status": "skipped", "reason": "bad_timestamp"}
+
+    days = max(1, min(30, (datetime.now(timezone.utc) - disconnected_at).days + 1))
+    result = await run_gmail_backfill(bot, days=days)
+
+    from services.db import get_open_assignments
+
+    missed: list[dict] = []
+    now = now_ist()
+    items = await asyncio.to_thread(get_open_assignments, limit=100)
+    for item in items:
+        dt = parse_iso_deadline(item.get("deadline_date"))
+        if dt is None:
+            continue
+        created_raw = item.get("created_at")
+        if created_raw:
+            try:
+                created = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+                if created >= disconnected_at:
+                    continue
+            except ValueError:
+                pass
+        if dt < now:
+            missed.append(item)
+
+    settings = get_settings()
+    if missed and settings.telegram_owner_chat_id:
+        lines = [
+            "⚠️ <b>While Gmail was disconnected, you may have missed:</b>",
+            "",
+        ]
+        for item in missed[:15]:
+            task = escape_html(str(item.get("task") or item.get("summary") or "Untitled"))
+            due = escape_html(format_deadline(item.get("deadline_date"), item.get("deadline_text")))
+            lines.append(f"• <b>{task}</b>")
+            lines.append(f"   Due: {due}")
+        if len(missed) > 15:
+            lines.append(f"\n…and {len(missed) - 15} more.")
+        await send_html(bot, settings.telegram_owner_chat_id, "\n".join(lines))
+
+    await asyncio.to_thread(
+        update_watch_state,
+        gmail_reconnected_at=datetime.now(timezone.utc),
+        clear_gmail_disconnected=True,
+    )
+    global _gmail_auth_alert_sent
+    _gmail_auth_alert_sent = False
+    result["missed_deadlines"] = len(missed)
+    result["status"] = "reconnected"
+    return result
 
 
 # Re-export for digest imports

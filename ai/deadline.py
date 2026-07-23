@@ -14,6 +14,8 @@ from services.timeutil import (
 
 VALID_CATEGORIES = ("deadline", "placement", "certification", "admin", "other")
 VALID_CONFIDENCE = ("high", "medium", "low")
+VALID_ITEM_TYPES = ("assignment", "exam", "fee", "form", "other")
+VALID_PRIORITIES = ("high", "normal", "low")
 
 
 def _normalize_category(value: str | None) -> str:
@@ -69,6 +71,66 @@ def _boost_category_from_signals(
         result["sender"] = sender.split("<")[0].strip().strip('"')
 
     return result
+
+
+def _normalize_item_type(value: str | None) -> str:
+    if value in VALID_ITEM_TYPES:
+        return value
+    return "other"
+
+
+def _normalize_priority(value: str | None) -> str:
+    if value in VALID_PRIORITIES:
+        return value
+    return "normal"
+
+
+def _boost_priority_from_signals(
+    subject: str,
+    body: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    blob = f"{subject}\n{body}\n{result.get('task') or ''}\n{result.get('summary') or ''}".lower()
+    priority = _normalize_priority(result.get("priority"))
+    high_signals = (
+        "weightage",
+        "weightage:",
+        "mandatory",
+        "compulsory",
+        "graded",
+        "final exam",
+        "midterm",
+        "mid-term",
+        "must submit",
+        "critical",
+    )
+    low_signals = ("optional", "if interested", "fyi", "no penalty")
+    if any(s in blob for s in high_signals):
+        result["priority"] = "high"
+    elif any(s in blob for s in low_signals):
+        result["priority"] = "low"
+    elif result.get("category") in ("placement", "certification"):
+        result["priority"] = "high"
+    else:
+        result["priority"] = priority
+    return result
+
+
+def _infer_item_type(result: dict[str, Any]) -> str:
+    item_type = _normalize_item_type(result.get("item_type"))
+    if item_type != "other":
+        return item_type
+    blob = f"{result.get('task') or ''} {result.get('summary') or ''}".lower()
+    category = result.get("category")
+    if any(w in blob for w in ("exam", "quiz", "midterm", "final")):
+        return "exam"
+    if any(w in blob for w in ("fee", "payment", "remittance")):
+        return "fee"
+    if any(w in blob for w in ("form", "registration", "register")):
+        return "form"
+    if category == "deadline":
+        return "assignment"
+    return "other"
 
 
 def _normalize_confidence(value: str | None) -> str:
@@ -166,6 +228,8 @@ def normalize_classification(
         "is_actionable": bool(result.get("is_actionable")),
         "is_schedule": bool(result.get("is_schedule")),
         "category": category,
+        "item_type": _infer_item_type(result),
+        "priority": result.get("priority") or _normalize_priority(result.get("priority")),
         "course_or_topic": course,
         "task": task,
         "deadline_text": deadline_text,
@@ -207,5 +271,6 @@ def classify_email(
         return None
 
     result = _boost_category_from_signals(subject, body, sender, result)
+    result = _boost_priority_from_signals(subject, body, result)
     combined_body = f"{body}\n{attachment_text or ''}"
     return normalize_classification(result, received_at=ref, body=combined_body)

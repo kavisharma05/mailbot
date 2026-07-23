@@ -52,6 +52,15 @@ class Settings(BaseSettings):
 
     render_url: str = ""
 
+    # healthchecks.io ping URL (no-op when blank)
+    heartbeat_url: str = ""
+
+    # Comma-separated trusted senders for timetable mail (e.g. registrar@mycollege.ac.in)
+    admin_schedule_sender: str = ""
+
+    # Web OAuth redirect URI for one-tap Gmail reconnect (e.g. https://app.onrender.com/oauth/callback)
+    gmail_oauth_redirect_uri: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

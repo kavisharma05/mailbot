@@ -10,20 +10,21 @@ from services.persistence import SupabasePersistence
 logger = logging.getLogger(__name__)
 
 BOT_COMMANDS = [
-    BotCommand("start", "Welcome + help"),
-    BotCommand("due", "Open deadlines & tasks"),
+    BotCommand("start", "Welcome message and quick-action buttons"),
+    BotCommand("due", "Open deadlines and tasks (priority first)"),
     BotCommand("done", "Mark item #n from /due as complete"),
     BotCommand("classes", "Today's classes for your section"),
-    BotCommand("section", "Change or check your section"),
+    BotCommand("section", "Change or check your class section"),
     BotCommand("ask", "Ask about deadlines, mail, senders, or content"),
-    BotCommand("send", "Compose and send an email"),
-    BotCommand("cancel", "Cancel email draft"),
-    BotCommand("reset", "Clear conversation context"),
+    BotCommand("send", "Compose and send an email to faculty"),
+    BotCommand("status", "Last check times and system health"),
+    BotCommand("cancel", "Cancel an in-progress email draft"),
+    BotCommand("reset", "Clear conversation context for a fresh topic"),
 ]
 
 
 async def register_bot_commands(application: Application) -> None:
-    """Populate the Telegram '/' command menu.
+    """Populate the Telegram '/' command menu and bot profile metadata.
 
     Called explicitly from the app lifespan because this app drives PTB's
     lifecycle manually (initialize/start under FastAPI), and PTB only invokes
@@ -34,6 +35,25 @@ async def register_bot_commands(application: Application) -> None:
         logger.info("Registered %d Telegram bot commands", len(BOT_COMMANDS))
     except Exception as exc:
         logger.warning("Could not set bot commands: %s", exc)
+
+    for fn_name, args in (
+        ("set_my_name", {"name": "Mailbot"}),
+        ("set_my_short_description", {"short_description": "Never miss a deadline again"}),
+        (
+            "set_my_description",
+            {
+                "description": (
+                    "Your MBA mail assistant — deadlines, class timetables, "
+                    "morning/evening digests, and one-tap email compose."
+                )
+            },
+        ),
+    ):
+        try:
+            fn = getattr(application.bot, fn_name)
+            await fn(**args)
+        except Exception as exc:
+            logger.warning("Could not %s: %s", fn_name, exc)
 
 
 def build_telegram_application() -> Application:

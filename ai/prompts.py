@@ -125,6 +125,7 @@ student. Rules:
 - Use a respectful, simple academic tone. No flowery language.
 - Always include a proper greeting and sign-off. Sign off as "{student_name}"
 if the student's name isn't given.
+- Separate greeting, each paragraph, and sign-off with a blank line.
 - Infer a clear, specific subject line.
 - Respond ONLY with strict JSON, no markdown fences, no preamble:
 {{"subject": "...", "body": "..."}}"""
@@ -171,11 +172,16 @@ set "deadline_text"/"deadline_date" to null when none is stated.
 when (if any). No preamble, no restating the sender.
 - "confidence" reflects how sure you are this classification and action item
 are correct.
+- "item_type": assignment|exam|fee|form|other — finer type within category
+  (assignment/project/case → assignment, quiz/midterm/final → exam, fee payment → fee,
+  registration/form → form).
+- "priority": high|normal|low — high if weightage %, "mandatory", "graded", placement/cert
+  deadlines, or exam; low for optional/FYI prep; else normal.
 
 Examples (follow this JSON shape exactly):
 
 Email: "Submit Marketing case study by 20 July."
-{{"is_actionable":true,"category":"deadline","course_or_topic":"Marketing","task":"Submit case study","deadline_text":"by 20 July","deadline_date":"{today_year}-07-20T23:59+05:30","sender":null,"summary":"Marketing case study due 20 July","confidence":"high"}}
+{{"is_actionable":true,"is_schedule":false,"category":"deadline","item_type":"assignment","priority":"normal","course_or_topic":"Marketing","task":"Submit case study","deadline_text":"by 20 July","deadline_date":"{today_year}-07-20T23:59+05:30","sender":null,"summary":"Marketing case study due 20 July","confidence":"high"}}
 
 Email: "Tomorrow's OB session at 9:45 AM — read Brady Training case."
 {{"is_actionable":true,"category":"deadline","course_or_topic":"Organisational Behaviour","task":"Read Brady Training case","deadline_text":"tomorrow 9:45 AM","deadline_date":"TOMORROW_0945","sender":null,"summary":"Read Brady case before tomorrow 9:45 AM OB session","confidence":"high"}}
@@ -199,6 +205,8 @@ Respond ONLY with strict JSON, no markdown fences, no preamble:
 "is_actionable": true/false,
 "is_schedule": true/false,
 "category": "deadline|placement|certification|admin|other",
+"item_type": "assignment|exam|fee|form|other",
+"priority": "high|normal|low",
 "course_or_topic": "string or null",
 "task": "string or null",
 "deadline_text": "string or null (as stated in the email)",
@@ -216,6 +224,8 @@ Today: {today}. Now: {now}.
 "is_actionable": true/false,
 "is_schedule": true/false,
 "category": "deadline|placement|certification|admin|other",
+"item_type": "assignment|exam|fee|form|other",
+"priority": "high|normal|low",
 "course_or_topic": "string or null",
 "task": "string or null",
 "deadline_text": "string or null",

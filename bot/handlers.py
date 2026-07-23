@@ -4,7 +4,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatType
 from telegram.ext import (
     CallbackQueryHandler,
@@ -50,19 +50,23 @@ from services.alert_actions import (
     ACT_DISMISS,
     ACT_DONE,
     ACT_REMIND,
+    ACT_SNOOZE,
     parse_action_callback,
 )
 from services.db import (
+    count_pending_scheduled_reminders,
     dismiss_assignment,
     get_assignments_for_qa,
+    get_digest_state,
     get_open_assignments,
     get_preferred_section,
+    get_watch_state,
     log_low_confidence,
     mark_assignment_done,
     schedule_assignment_reminder,
     set_preferred_section,
 )
-from services.formatting import CATEGORY_LABELS, is_priority_item
+from services.formatting import CATEGORY_LABELS, category_icon, is_priority_item
 from services.schedule import (
     _format_session_block,
     _session_section,
@@ -86,6 +90,8 @@ COMPOSE_CONFIRM = "confirm"
 APPROVE_CB = "send_approve"
 CANCEL_CB = "send_cancel"
 CLEAR_CHAT_CB = "ui:clear_chat"
+
+QUICK_ACTION_LABELS = ("📚 Classes", "⏰ Due", "✉️ Send", "📋 Section")
 
 # How many recent message IDs to try when clearing bot clutter in owner DM
 _CLEAR_CHAT_SCAN_LIMIT = 25
@@ -184,6 +190,7 @@ def _format_due_list(items: list[dict], category: str | None) -> str:
         course = item.get("course_or_topic") or "—"
         due = format_deadline_display(item.get("deadline_date"), item.get("deadline_text"), tz=IST)
         cat = item.get("category") or "other"
+        icon = category_icon(cat)
         prefix = f"[{CATEGORY_TITLES.get(cat, cat)}] " if not category else ""
         pri = "🔴 " if is_priority_item(
             cat,
@@ -191,7 +198,7 @@ def _format_due_list(items: list[dict], category: str | None) -> str:
             summary=item.get("summary"),
             deadline_date=item.get("deadline_date"),
         ) else ""
-        lines.append(f"{i}. {pri}{prefix}<b>{html.escape(str(task))}</b>")
+        lines.append(f"{i}. {pri}{icon} {prefix}<b>{html.escape(str(task))}</b>")
         lines.append(f"   Course: {html.escape(str(course))}")
         lines.append(f"   Due: {html.escape(str(due))}")
         lines.append("")
@@ -368,7 +375,7 @@ async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.answer()
         return
 
-    action, assignment_id = parsed
+    action, assignment_id, extra = parsed
     settings = get_settings()
 
     if action == ACT_DONE:
@@ -433,10 +440,41 @@ async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer("Could not schedule reminder.")
         return
 
+    if action == ACT_SNOOZE:
+        try:
+            hours = max(1, int(extra or "1"))
+        except ValueError:
+            hours = 1
+        remind_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+        updated = await asyncio.to_thread(schedule_assignment_reminder, assignment_id, remind_at)
+        if updated:
+            confirm = f"💤 Snoozed for {hours}h"
+            try:
+                prior = query.message.text or query.message.caption or ""
+                await query.edit_message_text(
+                    f"{prior}\n\n<i>{confirm}</i>",
+                    parse_mode="HTML",
+                    reply_markup=query.message.reply_markup,
+                )
+            except Exception:
+                pass
+            await query.answer(confirm)
+        else:
+            await query.answer("Could not snooze.")
+        return
+
 
 def _start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🧹 Clear chat", callback_data=CLEAR_CHAT_CB)]]
+    )
+
+
+def _quick_action_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(label) for label in QUICK_ACTION_LABELS]],
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -534,15 +572,69 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Add #verify to any question for a fresh Gmail answer with cited sources\n"
         "/send — compose and send an email\n"
         "/cancel — cancel an in-progress email draft only\n"
-        "/reset (or /new) — clear conversation context; discards any draft\n\n"
-        "Actionable alerts have DONE / NOT IMPORTANT / REMIND AGAIN buttons.\n"
+        "/reset (or /new) — clear conversation context; discards any draft\n"
+        "/status — last check times and system health\n\n"
+        "Actionable alerts have Done / Snooze / Remind again buttons.\n"
         "Marks in attachments show as text; readings are forwarded as files.\n\n"
         "In groups: reply to my messages, or mention me:\n"
         "@IMTAssistant_bot what's due this week?\n\n"
         "Tip: In BotFather → /setprivacy → Disable, so I can see all group messages.",
-        reply_markup=_start_keyboard(),
+        reply_markup=_quick_action_keyboard(),
     )
     _track_bot_message(context, msg.message_id)
+    clear_row = await update.message.reply_text(
+        "Quick actions are pinned above your keyboard.",
+        reply_markup=_start_keyboard(),
+    )
+    _track_bot_message(context, clear_row.message_id)
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+
+    state = await asyncio.to_thread(get_watch_state) or {}
+    digest = await asyncio.to_thread(get_digest_state) or {}
+    pending = await asyncio.to_thread(count_pending_scheduled_reminders)
+
+    def _fmt_ts(raw) -> str:
+        if not raw:
+            return "never"
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            return dt.astimezone(IST).strftime("%a %d %b %I:%M %p IST")
+        except ValueError:
+            return str(raw)[:40]
+
+    gmail_status = "✅ connected"
+    if state.get("gmail_disconnected_at"):
+        gmail_status = f"❌ disconnected since {_fmt_ts(state.get('gmail_disconnected_at'))}"
+
+    lines = [
+        "<b>📊 Mailbot status</b>",
+        "",
+        f"<b>Gmail:</b> {gmail_status}",
+        f"<b>Last mail check:</b> {_fmt_ts(state.get('last_checked_at'))}",
+        f"<b>Last heartbeat:</b> {_fmt_ts(state.get('last_heartbeat_at'))}",
+        f"<b>Last morning digest:</b> {digest.get('last_morning') or 'never'}",
+        f"<b>Last evening digest:</b> {digest.get('last_evening') or 'never'}",
+        f"<b>Pending scheduled reminders:</b> {pending}",
+    ]
+    await reply_long(update.message, "\n".join(lines), parse_mode="HTML")
+
+
+async def quick_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message or not update.message.text:
+        return
+    label = update.message.text.strip()
+    if label == "📚 Classes":
+        await classes_command(update, context)
+    elif label == "⏰ Due":
+        await due_command(update, context)
+    elif label == "✉️ Send":
+        await send_command(update, context)
+    elif label == "📋 Section":
+        await section_command(update, context)
 
 
 async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1319,6 +1411,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def register_handlers(application) -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("due", due_command))
     application.add_handler(CommandHandler("list", due_command))
     application.add_handler(CommandHandler("done", done_command))
@@ -1334,5 +1427,11 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("new", reset_command))
     application.add_handler(
         CallbackQueryHandler(confirm_callback, pattern=f"^({APPROVE_CB}|{CANCEL_CB})$")
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex("^(" + "|".join(map(re.escape, QUICK_ACTION_LABELS)) + ")$"),
+            quick_action_message,
+        )
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_message))

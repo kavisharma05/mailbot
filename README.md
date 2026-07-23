@@ -16,7 +16,7 @@ Email categories: `deadline`, `placement`, `certification`, `admin`, `other`.
 
 - **Marks attachments** — score sheets / results are posted as readable text in Telegram
 - **Reading attachments** — cases, chapters, and books are forwarded as files with the alert
-- **Action buttons** — DONE / NOT IMPORTANT / REMIND AGAIN on actionable alerts (placement, certification, deadlines)
+- **Action buttons** — Done / Not important / Remind again / Snooze on actionable alerts
 - **Priority surfacing** — important mail is pinned, highlighted in digests, and sorted first in `/due`
 - **Quiet owner DMs** — set `OWNER_DM_ALL_MAIL=true` to DM owner for **every** email (recommended if you cannot miss any mail); default is actionable/priority only
 
@@ -171,20 +171,51 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `RENDER_URL` | Public URL (for set_webhook.py) |
 | `OWNER_DM_ALL_MAIL` | `true` to DM owner for **every** classified email (set on Render too); default `false` = actionable/priority only |
 | `REMIND_AGAIN_HOURS` | Hours until REMIND AGAIN re-alerts (default: 4) |
+| `HEARTBEAT_URL` | healthchecks.io ping URL (optional; alerts if watcher stops) |
+| `ADMIN_SCHEDULE_SENDER` | Comma-separated trusted timetable sender(s), e.g. `registrar@mycollege.ac.in` |
+| `GMAIL_OAUTH_REDIRECT_URI` | Web OAuth callback, e.g. `https://your-app.onrender.com/oauth/callback` |
 
 Run `supabase/migration_reliability_polish.sql` once when upgrading an existing project.
 Run `supabase/migration_contacts.sql` once to enable learned name→email contact resolution.
 Run `supabase/migration_digest_state.sql` once to enable digest idempotency (prevents double morning/evening sends).
+Run `supabase/migration_precision_reliability.sql` once for scheduled reminders, item priority/type, OAuth tokens, and heartbeat columns.
+
+### Heartbeat monitoring (recommended)
+
+1. Create a free check at [healthchecks.io](https://healthchecks.io) (5-minute interval).
+2. Set `HEARTBEAT_URL` on Render to the ping URL.
+3. Add GitHub secret `HEARTBEAT_URL` (same value) so the cron workflow pings after each watch.
+4. Optionally add a second external pinger at [cron-job.org](https://cron-job.org) hitting `POST /tasks/watch-gmail` every 5 min as redundant backup.
+
+If the watcher stops, healthchecks.io emails you — you won't discover a dead scheduler days later.
+
+### One-tap Gmail reconnect
+
+When Gmail access breaks, the bot DMs you with a **Reconnect Gmail** button.
+
+Setup (one time):
+
+1. In Google Cloud Console, create a **Web application** OAuth client (in addition to your Desktop client).
+2. Add authorized redirect URI: `https://your-app.onrender.com/oauth/callback`
+3. Set `GMAIL_OAUTH_REDIRECT_URI` to that exact URL on Render.
+4. Run `supabase/migration_precision_reliability.sql` so refresh tokens can be stored in Supabase.
+
+After reconnect, mail from the outage window is backfilled and missed deadlines get one batched summary.
+
+### Bot profile picture
+
+Set manually in BotFather: `/setuserpic` → upload your Mailbot icon. Name/description are set automatically on startup.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Welcome + help |
+| `/start` | Welcome + persistent quick-action buttons |
 | `/due` or `/list` | Show numbered open items for this chat's category |
 | `/done <n>` | Mark item #n from the last `/due` list as complete |
 | `/classes` | Today's classes with time and room (from timetable emails) |
 | `/section` | Change or check your class section |
+| `/status` | Last mail check, heartbeat, digests, pending reminders |
 | `/ask <question>` | Ask about deadlines, today's mails, senders, or email content |
 | `/send` | Compose and send an email |
 | `/cancel` | Cancel the current compose flow |
