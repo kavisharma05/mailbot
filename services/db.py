@@ -113,8 +113,11 @@ def update_watch_state(
         db.table("watch_state").update(payload).eq("id", 1).execute()
 
 
-@_safe_read(False)
 def _is_email_processed_db(message_id: str) -> bool:
+    # Intentionally NOT wrapped in _safe_read: callers must be able to tell a
+    # genuine "not processed" (False) apart from a DB read failure (raises ->
+    # is_email_processed returns None). Swallowing errors to False here causes
+    # already-alerted mail to be treated as new and re-alerted every tick.
     db = get_db()
     result = db.table("processed_emails").select("message_id").eq("message_id", message_id).limit(1).execute()
     return bool(result.data)

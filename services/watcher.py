@@ -52,6 +52,10 @@ logger = logging.getLogger(__name__)
 WATCHER_INTERVAL_SECONDS = 60
 CATCHUP_DAYS = 14
 CATCHUP_MAX_RESULTS = 300
+# Safety valve: cap fresh alerts emitted in a single watcher run. A healthy
+# tick sends at most a handful; anything approaching this means we are
+# reprocessing already-seen mail (loop) and must stop before spamming.
+MAX_ALERTS_PER_RUN = 12
 watcher_lock = asyncio.Lock()
 
 _REUSE_CLASSIFICATION_ERRORS = frozenset({"alert_delivery_failed", "mark_failed"})
@@ -662,7 +666,16 @@ async def _run_gmail_watcher_inner(bot) -> dict:
         processed = 0
         alerts = 0
         failed = 0
+        hit_cap = False
         for message_id in message_ids:
+            if alerts >= MAX_ALERTS_PER_RUN:
+                hit_cap = True
+                logger.error(
+                    "Alert cap (%d) hit during init catch-up — stopping this tick to "
+                    "prevent duplicate-alert storm; remaining mail will retry next tick",
+                    MAX_ALERTS_PER_RUN,
+                )
+                break
             processed_state = await _processed_lookup(message_id)
             if processed_state is None:
                 logger.warning(
@@ -685,7 +698,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
             processed += outcome["processed"]
             alerts += outcome["alerts"]
 
-        if failed == 0:
+        if failed == 0 and not hit_cap:
             await asyncio.to_thread(
                 update_watch_state,
                 last_history_id=history_id,
@@ -695,15 +708,17 @@ async def _run_gmail_watcher_inner(bot) -> dict:
         else:
             await asyncio.to_thread(update_watch_state, last_checked_at=now)
             logger.warning(
-                "Deferred init history advance: %d message(s) failed and will retry",
+                "Deferred init history advance: %d failed, hit_cap=%s — will retry",
                 failed,
+                hit_cap,
             )
         return {
             "status": "initialized",
-            "history_id": history_id if failed == 0 else None,
+            "history_id": history_id if (failed == 0 and not hit_cap) else None,
             "processed": processed,
             "alerts": alerts,
             "failed_retries": failed,
+            "alert_cap_hit": hit_cap,
             "catchup_candidates": len(message_ids),
         }
 
@@ -711,8 +726,17 @@ async def _run_gmail_watcher_inner(bot) -> dict:
     processed = 0
     alerts = 0
     failed = 0
+    hit_cap = False
 
     for message_id in message_ids:
+        if alerts >= MAX_ALERTS_PER_RUN:
+            hit_cap = True
+            logger.error(
+                "Alert cap (%d) hit during watcher run — stopping this tick to prevent "
+                "duplicate-alert storm; remaining mail will retry next tick",
+                MAX_ALERTS_PER_RUN,
+            )
+            break
         processed_state = await _processed_lookup(message_id)
         if processed_state is None:
             logger.warning(
@@ -740,7 +764,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
         processed += outcome["processed"]
         alerts += outcome["alerts"]
 
-    if failed == 0 and not history_failed:
+    if failed == 0 and not history_failed and not hit_cap:
         new_history_id = latest_or_init or await asyncio.to_thread(get_profile_history_id)
         await asyncio.to_thread(
             update_watch_state,
@@ -759,6 +783,10 @@ async def _run_gmail_watcher_inner(bot) -> dict:
                 "Deferred history advance: %d message(s) raised errors and will retry",
                 failed,
             )
+        if hit_cap:
+            logger.error(
+                "Deferred history advance: alert cap hit — investigate reprocessing loop"
+            )
 
     return {
         "status": "ok",
@@ -766,6 +794,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
         "alerts": alerts,
         "failed_retries": failed,
         "history_failed": history_failed,
+        "alert_cap_hit": hit_cap,
         "history_id": new_history_id,
     }
 

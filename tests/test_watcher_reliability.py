@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from services.contacts import backfill_contacts_from_inbox
 from services.watcher import (
     CATCHUP_DAYS,
+    MAX_ALERTS_PER_RUN,
     _process_message,
     _recent_unprocessed_message_ids,
     run_gmail_watcher,
@@ -689,3 +690,46 @@ def test_enqueue_pending_email_falls_back_without_delivered_channels_column():
     assert table.select.call_count == 2
     insert_payload = table.insert.call_args.args[0]
     assert "delivered_channels" not in insert_payload
+
+
+def test_is_email_processed_returns_none_on_real_db_error():
+    """DB read failure must be 'unknown' (None), never a false 'not processed' (False)."""
+    import services.db as db_module
+
+    with patch("services.db.get_db", side_effect=RuntimeError("supabase read timeout")):
+        assert db_module.is_email_processed("msg-x") is None
+        assert db_module.is_email_processed_cached("msg-x") is None
+
+
+def test_watcher_alert_cap_stops_storm_and_defers_history():
+    update_calls: list[dict] = []
+
+    def fake_update_watch_state(**kwargs):
+        update_calls.append(kwargs)
+
+    async def fake_process(_message_id, _bot, **kwargs):
+        return {"processed": 1, "alerts": 1}
+
+    async def _run():
+        many_ids = [f"msg-{i}" for i in range(MAX_ALERTS_PER_RUN + 25)]
+        with (
+            patch("services.watcher.get_watch_state", return_value={"last_history_id": "1000"}),
+            patch(
+                "services.watcher._collect_message_ids",
+                new=AsyncMock(return_value=(many_ids, "2000", False)),
+            ),
+            patch("services.watcher.is_email_processed_cached", return_value=False),
+            patch("services.watcher._process_message", side_effect=fake_process) as mock_proc,
+            patch("services.watcher.update_watch_state", side_effect=fake_update_watch_state),
+            patch("services.watcher.get_profile_history_id", return_value="2000"),
+        ):
+            result = await run_gmail_watcher(bot=object())
+
+        assert result["alert_cap_hit"] is True
+        assert result["alerts"] == MAX_ALERTS_PER_RUN
+        assert mock_proc.call_count == MAX_ALERTS_PER_RUN
+        # history must NOT advance while a storm is suspected
+        assert result["history_id"] == "1000"
+        assert update_calls[0].get("last_history_id") is None
+
+    asyncio.run(_run())
