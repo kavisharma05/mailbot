@@ -554,3 +554,138 @@ def test_send_actionable_alert_returns_id_when_attachments_fail():
         assert msg_id == 42
 
     asyncio.run(_run())
+
+
+def test_send_actionable_alert_dedupes_identical_content():
+    async def _run():
+        from services import telegram_dedupe
+        from services.alert_delivery import _DEDUPE_SENTINEL, send_actionable_alert
+
+        telegram_dedupe._content_seen.clear()
+
+        bot = MagicMock()
+        sent_msg = MagicMock(message_id=42)
+        bot.send_message = AsyncMock(return_value=sent_msg)
+
+        first = await send_actionable_alert(bot, "123", "<b>Same alert</b>", assignment_id="a1")
+        second = await send_actionable_alert(bot, "123", "<b>Same alert</b>", assignment_id="a1")
+
+        assert first == 42
+        assert second == _DEDUPE_SENTINEL
+        assert bot.send_message.call_count == 1
+
+    asyncio.run(_run())
+
+
+def test_send_actionable_alert_dedupe_allows_different_chat_or_text():
+    async def _run():
+        from services import telegram_dedupe
+        from services.alert_delivery import send_actionable_alert
+
+        telegram_dedupe._content_seen.clear()
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(side_effect=[MagicMock(message_id=1), MagicMock(message_id=2)])
+
+        await send_actionable_alert(bot, "123", "<b>Alert A</b>")
+        await send_actionable_alert(bot, "456", "<b>Alert A</b>")
+        await send_actionable_alert(bot, "123", "<b>Alert B</b>")
+
+        assert bot.send_message.call_count == 3
+
+    asyncio.run(_run())
+
+
+def test_send_actionable_alert_failed_send_not_deduped():
+    async def _run():
+        from services import telegram_dedupe
+        from services.alert_delivery import send_actionable_alert
+        from services.telegram_util import DeliveryResult
+
+        telegram_dedupe._content_seen.clear()
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=MagicMock(message_id=99))
+
+        with patch(
+            "services.alert_delivery.deliver_message",
+            side_effect=[
+                DeliveryResult(ok=False, chunks_attempted=1, chunks_sent=0),
+                DeliveryResult(ok=True, chunks_attempted=1, chunks_sent=1, first_message_id=99),
+            ],
+        ) as mock_deliver:
+            first = await send_actionable_alert(bot, "123", "<b>Retry me</b>")
+            second = await send_actionable_alert(bot, "123", "<b>Retry me</b>")
+
+        assert first is None
+        assert second == 99
+        assert mock_deliver.call_count == 2
+
+    asyncio.run(_run())
+
+
+def test_pending_email_db_falls_back_without_delivered_channels_column():
+    import services.db as db_module
+
+    db_module._pending_delivered_channels_missing = False
+
+    table = MagicMock()
+    select_chain = MagicMock()
+    table.select.return_value = select_chain
+    select_chain.eq.return_value = select_chain
+    select_chain.limit.return_value = select_chain
+
+    row = {
+        "message_id": "msg-1",
+        "attempts": 1,
+        "last_error": "alert_delivery_failed",
+        "dead_letter": False,
+        "classified_result": {"task": "x"},
+        "already_alerted": False,
+    }
+
+    select_chain.execute.side_effect = [
+        RuntimeError("column pending_emails.delivered_channels does not exist"),
+        MagicMock(data=[row]),
+    ]
+
+    with patch("services.db.get_db", return_value=MagicMock(table=MagicMock(return_value=table))):
+        result = db_module.get_pending_email("msg-1")
+
+    assert result == row
+    assert db_module._pending_delivered_channels_missing is True
+    assert table.select.call_count == 2
+    assert "delivered_channels" not in table.select.call_args_list[1].args[0]
+
+
+def test_enqueue_pending_email_falls_back_without_delivered_channels_column():
+    import services.db as db_module
+
+    db_module._pending_delivered_channels_missing = False
+
+    table = MagicMock()
+    select_chain = MagicMock()
+    insert_chain = MagicMock()
+    table.select.return_value = select_chain
+    table.insert.return_value = insert_chain
+    select_chain.eq.return_value = select_chain
+    select_chain.limit.return_value = select_chain
+    insert_chain.execute.return_value = MagicMock(data=[{"message_id": "msg-2"}])
+
+    select_chain.execute.side_effect = [
+        RuntimeError("column pending_emails.delivered_channels does not exist"),
+        MagicMock(data=[]),
+    ]
+
+    with patch("services.db.get_db", return_value=MagicMock(table=MagicMock(return_value=table))):
+        db_module.enqueue_pending_email(
+            "msg-2",
+            "alert_delivery_failed",
+            classified_result={"task": "x"},
+            delivered_channels={"owner": True},
+        )
+
+    assert db_module._pending_delivered_channels_missing is True
+    assert table.select.call_count == 2
+    insert_payload = table.insert.call_args.args[0]
+    assert "delivered_channels" not in insert_payload

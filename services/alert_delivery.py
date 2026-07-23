@@ -9,9 +9,12 @@ from typing import Any
 from services.alert_actions import build_action_keyboard
 from services.attachments import format_marks_for_telegram, should_forward_attachment
 from services.formatting import escape_html
+from services.telegram_dedupe import already_sent_content, record_content_sent
 from services.telegram_util import deliver_message, send_html_detailed
 
 logger = logging.getLogger(__name__)
+
+_DEDUPE_SENTINEL = -1
 
 
 async def send_actionable_alert(
@@ -27,6 +30,8 @@ async def send_actionable_alert(
     """Send HTML alert; return message_id of first chunk only if all chunks and attachments sent."""
     if not chat_id:
         return None
+    if await already_sent_content(chat_id, text):
+        return _DEDUPE_SENTINEL
 
     reply_markup = build_action_keyboard(assignment_id) if assignment_id else None
     from services.telegram_util import chunk_text
@@ -69,6 +74,8 @@ async def send_actionable_alert(
 
     if not all_ok:
         return None
+
+    await record_content_sent(chat_id, text)
 
     attach_ok = await deliver_attachments(
         bot,
@@ -161,9 +168,12 @@ async def send_owner_update(
             pin=pin,
         )
         return msg_id is not None
+    if await already_sent_content(chat_id, text):
+        return True
     result = await send_html_detailed(bot, chat_id, text)
     if not result.ok:
         return False
+    await record_content_sent(chat_id, text)
     if attachments:
         return await deliver_attachments(bot, chat_id, attachments)
     return True

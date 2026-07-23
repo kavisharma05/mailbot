@@ -12,6 +12,11 @@ from services.timeutil import item_effective_deadline_dt, now_ist, parse_iso_dea
 logger = logging.getLogger(__name__)
 
 MAX_PENDING_EMAIL_ATTEMPTS = 10
+_pending_delivered_channels_missing = False
+_PENDING_EMAIL_BASE_COLUMNS = "message_id, attempts, dead_letter, already_alerted, classified_result"
+_PENDING_EMAIL_GET_COLUMNS = (
+    "message_id, attempts, last_error, dead_letter, classified_result, already_alerted"
+)
 DIGEST_LEASE_SECONDS = 900
 
 T = TypeVar("T")
@@ -534,6 +539,33 @@ def clear_assignment_reminder(assignment_id: str) -> None:
     db.table("assignments").update({"remind_at": None}).eq("id", assignment_id).execute()
 
 
+def _pending_email_missing_column_error(exc: Exception) -> bool:
+    err = str(exc).lower()
+    return "delivered_channels" in err or "42703" in err or "column" in err
+
+
+def _pending_email_select_columns(*, include_delivered: bool | None = None) -> str:
+    use_delivered = (
+        include_delivered
+        if include_delivered is not None
+        else not _pending_delivered_channels_missing
+    )
+    if use_delivered:
+        return f"{_PENDING_EMAIL_BASE_COLUMNS}, delivered_channels"
+    return _PENDING_EMAIL_BASE_COLUMNS
+
+
+def _pending_email_get_select_columns(*, include_delivered: bool | None = None) -> str:
+    use_delivered = (
+        include_delivered
+        if include_delivered is not None
+        else not _pending_delivered_channels_missing
+    )
+    if use_delivered:
+        return f"{_PENDING_EMAIL_GET_COLUMNS}, delivered_channels"
+    return _PENDING_EMAIL_GET_COLUMNS
+
+
 def enqueue_pending_email(
     message_id: str,
     error: str | None = None,
@@ -542,13 +574,14 @@ def enqueue_pending_email(
     already_alerted: bool = False,
     delivered_channels: dict[str, Any] | None = None,
 ) -> None:
-    try:
+    global _pending_delivered_channels_missing
+
+    def _enqueue(*, include_delivered: bool) -> None:
         db = get_db()
+        select_columns = _pending_email_select_columns(include_delivered=include_delivered)
         existing = (
             db.table("pending_emails")
-            .select(
-                "message_id, attempts, dead_letter, already_alerted, classified_result, delivered_channels"
-            )
+            .select(select_columns)
             .eq("message_id", message_id)
             .limit(1)
             .execute()
@@ -568,7 +601,7 @@ def enqueue_pending_email(
                 payload["classified_result"] = classified_result
             if already_alerted or rows[0].get("already_alerted"):
                 payload["already_alerted"] = True
-            if delivered_channels is not None:
+            if include_delivered and delivered_channels is not None:
                 merged = dict(rows[0].get("delivered_channels") or {})
                 merged.update(delivered_channels)
                 payload["delivered_channels"] = merged
@@ -581,18 +614,32 @@ def enqueue_pending_email(
                 )
             db.table("pending_emails").update(payload).eq("message_id", message_id).execute()
         else:
-            db.table("pending_emails").insert(
-                {
-                    "message_id": message_id,
-                    "attempts": 1,
-                    "last_error": error,
-                    "dead_letter": False,
-                    "classified_result": classified_result,
-                    "already_alerted": already_alerted,
-                    "delivered_channels": delivered_channels or {},
-                }
-            ).execute()
+            insert_payload: dict[str, Any] = {
+                "message_id": message_id,
+                "attempts": 1,
+                "last_error": error,
+                "dead_letter": False,
+                "classified_result": classified_result,
+                "already_alerted": already_alerted,
+            }
+            if include_delivered:
+                insert_payload["delivered_channels"] = delivered_channels or {}
+            db.table("pending_emails").insert(insert_payload).execute()
+
+    try:
+        _enqueue(include_delivered=not _pending_delivered_channels_missing)
     except Exception as exc:
+        if not _pending_delivered_channels_missing and _pending_email_missing_column_error(exc):
+            _pending_delivered_channels_missing = True
+            logger.warning(
+                "pending_emails.delivered_channels missing — using legacy enqueue fallback: %s",
+                exc,
+            )
+            try:
+                _enqueue(include_delivered=False)
+            except Exception as exc2:
+                logger.exception("enqueue_pending_email failed for %s: %s", message_id, exc2)
+            return
         logger.exception("enqueue_pending_email failed for %s: %s", message_id, exc)
 
 
@@ -628,18 +675,36 @@ def list_pending_email_ids(limit: int = 100) -> list[str]:
 
 @_safe_read(None)
 def get_pending_email(message_id: str) -> dict[str, Any] | None:
-    db = get_db()
-    result = (
-        db.table("pending_emails")
-        .select(
-            "message_id, attempts, last_error, dead_letter, classified_result, already_alerted, delivered_channels"
+    global _pending_delivered_channels_missing
+
+    def _fetch(*, include_delivered: bool) -> dict[str, Any] | None:
+        db = get_db()
+        result = (
+            db.table("pending_emails")
+            .select(_pending_email_get_select_columns(include_delivered=include_delivered))
+            .eq("message_id", message_id)
+            .limit(1)
+            .execute()
         )
-        .eq("message_id", message_id)
-        .limit(1)
-        .execute()
-    )
-    rows = result.data or []
-    return rows[0] if rows else None
+        rows = result.data or []
+        return rows[0] if rows else None
+
+    try:
+        return _fetch(include_delivered=not _pending_delivered_channels_missing)
+    except Exception as exc:
+        if not _pending_delivered_channels_missing and _pending_email_missing_column_error(exc):
+            _pending_delivered_channels_missing = True
+            logger.warning(
+                "pending_emails.delivered_channels missing — using legacy get fallback: %s",
+                exc,
+            )
+            try:
+                return _fetch(include_delivered=False)
+            except Exception as exc2:
+                logger.exception("get_pending_email failed for %s: %s", message_id, exc2)
+                return None
+        logger.exception("get_pending_email failed for %s: %s", message_id, exc)
+        return None
 
 
 @_safe_read([])

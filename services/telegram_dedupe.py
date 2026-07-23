@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections import OrderedDict
 
@@ -11,6 +12,25 @@ _DEDUPE_TTL_SECONDS = 600
 _MAX_ENTRIES = 2000
 _seen: OrderedDict[int, float] = OrderedDict()
 _lock = asyncio.Lock()
+
+# Outbound alert dedupe: suppress identical text to the same chat within TTL.
+_CONTENT_TTL_SECONDS = 600
+_CONTENT_MAX_ENTRIES = 2000
+_content_seen: OrderedDict[tuple[str, str], float] = OrderedDict()
+_content_lock = asyncio.Lock()
+
+
+def _content_key(chat_id: str | int, text: str) -> tuple[str, str]:
+    digest = hashlib.blake2b(str(text).encode("utf-8"), digest_size=16).hexdigest()
+    return str(chat_id), digest
+
+
+def _prune_content_seen(now: float) -> None:
+    expired = [key for key, ts in _content_seen.items() if now - ts > _CONTENT_TTL_SECONDS]
+    for key in expired:
+        _content_seen.pop(key, None)
+    while len(_content_seen) > _CONTENT_MAX_ENTRIES:
+        _content_seen.popitem(last=False)
 
 
 async def should_process_update(update_id: int | None) -> bool:
@@ -31,3 +51,29 @@ async def should_process_update(update_id: int | None) -> bool:
         while len(_seen) > _MAX_ENTRIES:
             _seen.popitem(last=False)
         return True
+
+
+async def already_sent_content(chat_id: str | int, text: str) -> bool:
+    """Return True when identical text was recently sent to this chat."""
+    if not chat_id or not text or not str(text).strip():
+        return False
+
+    key = _content_key(chat_id, text)
+    now = time.monotonic()
+    async with _content_lock:
+        _prune_content_seen(now)
+        return key in _content_seen
+
+
+async def record_content_sent(chat_id: str | int, text: str) -> None:
+    """Record a successful outbound alert after delivery."""
+    if not chat_id or not text or not str(text).strip():
+        return
+
+    key = _content_key(chat_id, text)
+    now = time.monotonic()
+    async with _content_lock:
+        _prune_content_seen(now)
+        _content_seen[key] = now
+        while len(_content_seen) > _CONTENT_MAX_ENTRIES:
+            _content_seen.popitem(last=False)
