@@ -60,15 +60,23 @@ def test_category_for_chat_skips_blank_ids():
 
 
 def test_claim_digest_in_memory_only_one_winner():
-    db_module._digest_state_table_missing = True
-    db_module._digest_state_fallback["last_morning"] = None
-    db_module._digest_state_fallback["last_evening"] = None
-    db_module._digest_leases_fallback.clear()
     day = date(2026, 7, 23)
+    original_state = dict(db_module._digest_state_fallback)
 
-    assert claim_digest("morning", day) is True
-    assert claim_digest("morning", day) is False
-    db_module._digest_leases_fallback.clear()
+    with (
+        patch.object(db_module, "_digest_state_table_missing", True),
+        patch.object(db_module, "_delivery_claims_table_missing", True),
+    ):
+        db_module._digest_state_fallback["last_morning"] = None
+        db_module._digest_state_fallback["last_evening"] = None
+        db_module._digest_leases_fallback.clear()
+        try:
+            assert claim_digest("morning", day) is True
+            assert claim_digest("morning", day) is False
+        finally:
+            db_module._digest_state_fallback.clear()
+            db_module._digest_state_fallback.update(original_state)
+            db_module._digest_leases_fallback.clear()
 
 
 def test_processed_cache_evicts_expired_and_caps_size():
