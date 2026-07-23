@@ -62,6 +62,8 @@ from services.db import (
     create_manual_assignment,
     dismiss_assignment,
     get_assignment_by_id,
+    get_assignments_due_between,
+    get_assignments_due_on,
     get_assignments_for_qa,
     get_digest_state,
     get_missed_assignments,
@@ -78,6 +80,7 @@ from services.db import (
 from services.formatting import (
     CATEGORY_LABELS,
     VALID_CATEGORIES,
+    format_dated_due_list,
     format_deadline,
     format_due_list,
     format_missed_list,
@@ -94,7 +97,7 @@ from services.schedule import (
     sessions_for_day,
 )
 from services.telegram_util import reply_long, safe_user_error_message
-from services.timeutil import IST, today_ist
+from services.timeutil import DayWindow, IST, parse_day_window, today_ist
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +224,36 @@ async def _fetch_assignment_list(
         return _format_undated_list(items, category)
     items = await asyncio.to_thread(get_upcoming_assignments, category=category)
     return _format_due_list(items, category)
+
+
+async def _fetch_dated_due_list(
+    window: DayWindow,
+    category: str | None,
+) -> tuple[str, list[str]]:
+    if window.single:
+        items = await asyncio.to_thread(get_assignments_due_on, window.start, IST, category)
+    else:
+        items = await asyncio.to_thread(
+            get_assignments_due_between,
+            window.start,
+            window.end,
+            IST,
+            category,
+        )
+    return format_dated_due_list(items, window.label, category)
+
+
+async def _reply_dated_due_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    window: DayWindow,
+) -> None:
+    if not update.message:
+        return
+    category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
+    text, due_ids = await _fetch_dated_due_list(window, category)
+    _store_assignment_list(context, due_ids, source="due")
+    await reply_long(update.message, text, parse_mode="HTML")
 
 
 def _store_assignment_list(context: ContextTypes.DEFAULT_TYPE, due_ids: list[str], *, source: str) -> None:
@@ -510,52 +543,16 @@ async def _available_sections() -> list[str]:
 def _resolve_target_day(question: str, *, fallback_iso: str | None = None):
     from datetime import date as date_cls
 
-    q = question.lower()
-    day = today_ist()
-    if "tomorrow" in q:
-        return day + timedelta(days=1)
-    if "today" in q:
-        return day
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", q)
-    if m:
-        try:
-            return date_cls(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            pass
-    # "21st", "21 Jul", "for 21"
-    m = re.search(
-        r"\b(\d{1,2})(?:st|nd|rd|th)?(?:\s*(?:of\s+)?(jan|january|feb|february|mar|march|"
-        r"apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|"
-        r"nov|november|dec|december))?\b",
-        q,
-    )
-    if m and ("class" in q or "schedule" in q or "for" in q or m.group(2)):
-        try:
-            dom = int(m.group(1))
-            if m.group(2):
-                months = {
-                    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-                    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-                    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
-                    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
-                }
-                month = months[m.group(2)]
-            else:
-                month = day.month
-            return date_cls(day.year, month, dom)
-        except ValueError:
-            pass
-    for i, name in enumerate(WEEKDAYS):
-        if name in q:
-            days_ahead = (i - day.weekday()) % 7
-            days_ahead = days_ahead or 7  # "monday" said on a Monday means next Monday
-            return day + timedelta(days=days_ahead)
+    window = parse_day_window(question)
+    if window is not None:
+        return window.start
+
     if fallback_iso:
         try:
             return date_cls.fromisoformat(fallback_iso)
         except ValueError:
             pass
-    return day
+    return today_ist()
 
 
 def _wants_schedule_refresh(question: str) -> bool:
@@ -1722,7 +1719,11 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 intent=INTENT_MAILBOX_QA,
             )
             return
-        await due_command(update, context)
+        window = parse_day_window(question)
+        if window is not None:
+            await _reply_dated_due_list(update, context, window)
+        else:
+            await due_command(update, context)
         remember_turn(context.user_data, user_text=question, intent="due_list", query=question)
         return
 

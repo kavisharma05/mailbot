@@ -2,25 +2,27 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
 
-from ai.assistant import _is_missed_list_question
-from ai.intent import INTENT_MISSED_LIST, classify_message
+from ai.assistant import _deterministic_deadline_answer, _is_due_list_question, _is_missed_list_question
+from ai.intent import INTENT_DUE_LIST, INTENT_MISSED_LIST, classify_message
 from services.db import (
     _filter_assignments_by_deadline,
+    get_assignments_due_on,
     get_missed_assignments,
     get_upcoming_assignments,
 )
 from services.formatting import (
+    format_dated_due_list,
     format_due_list,
     format_missed_list,
     sort_missed_assignments,
     sort_upcoming_assignments,
 )
-from services.timeutil import IST, to_storage_iso
+from services.timeutil import IST, normalize_date_words, parse_day_window, to_storage_iso
 
 
 def _iso(dt: datetime) -> str:
@@ -163,3 +165,89 @@ def test_missed_list_question_not_triggered_for_mail_lookup():
 def test_classify_message_routes_missed_intent():
     result = classify_message("what deadlines did I miss?", None)
     assert result["intent"] == INTENT_MISSED_LIST
+
+
+REF = datetime(2026, 7, 23, 15, 0, tzinfo=IST)
+
+
+def test_normalize_date_words_fixes_typos():
+    assert "tomorrow" in normalize_date_words("deadlines tmrw")
+    assert "today" in normalize_date_words("due tdy")
+    assert "yesterday" in normalize_date_words("anything yest")
+
+
+@pytest.mark.parametrize(
+    "question,expected_start,expected_end,single",
+    [
+        ("deadlines for tomorrow", date(2026, 7, 24), date(2026, 7, 24), True),
+        ("what's due today", date(2026, 7, 23), date(2026, 7, 23), True),
+        ("deadlines yesterday", date(2026, 7, 22), date(2026, 7, 22), True),
+        ("deadlines tmrw", date(2026, 7, 24), date(2026, 7, 24), True),
+        ("today and tomorrow deadlines", date(2026, 7, 23), date(2026, 7, 24), False),
+        ("deadlines this week", date(2026, 7, 23), date(2026, 7, 26), False),
+        ("deadlines for 24 Jul", date(2026, 7, 24), date(2026, 7, 24), True),
+        ("do we have some deadlines for tomorrow", date(2026, 7, 24), date(2026, 7, 24), True),
+    ],
+)
+def test_parse_day_window(question, expected_start, expected_end, single):
+    window = parse_day_window(question, ref=REF)
+    assert window is not None
+    assert window.start == expected_start
+    assert window.end == expected_end
+    assert window.single is single
+
+
+def test_parse_day_window_none_without_date_signal():
+    assert parse_day_window("show all deadlines", ref=REF) is None
+    assert parse_day_window("refresh deadline list", ref=REF) is None
+
+
+def test_is_due_list_question_accepts_typos():
+    assert _is_due_list_question("any deadline tmrw") is True
+    assert _is_due_list_question("deadlines tdy") is True
+
+
+def test_classify_message_routes_dated_due_intent():
+    result = classify_message("do we have some deadlines for tomorrow", None)
+    assert result["intent"] == INTENT_DUE_LIST
+
+
+def test_get_assignments_due_on_filters_by_calendar_day(monkeypatch):
+    today = REF.date()
+    tomorrow = today + timedelta(days=1)
+    open_items = [
+        _item("today", datetime.combine(today, datetime.min.time(), tzinfo=IST)),
+        _item("tomorrow", datetime.combine(tomorrow, datetime.min.time(), tzinfo=IST)),
+    ]
+    monkeypatch.setattr("services.db.get_open_assignments", lambda **kwargs: open_items)
+
+    tomorrow_items = get_assignments_due_on(tomorrow, IST)
+    assert [i["id"] for i in tomorrow_items] == ["tomorrow"]
+
+
+def test_format_dated_due_list_empty_state():
+    text, ids = format_dated_due_list([], "tomorrow (IST)", None)
+    assert ids == []
+    assert "Deadlines — tomorrow (IST)" in text
+    assert "No deadlines due tomorrow (IST)." in text
+
+
+def test_format_dated_due_list_shows_only_matching_items():
+    tomorrow = REF.date() + timedelta(days=1)
+    items = [_item("tomorrow-task", datetime.combine(tomorrow, datetime.min.time(), tzinfo=IST))]
+    text, ids = format_dated_due_list(items, "tomorrow (IST)", None)
+    assert ids == ["tomorrow-task"]
+    assert "tomorrow-task" in text.lower() or "Task tomorrow-task" in text
+
+
+def test_deterministic_deadline_answer_filters_tomorrow_only():
+    today = REF.date()
+    tomorrow = today + timedelta(days=1)
+    items = [
+        {**_item("today-task", datetime.combine(today, datetime.min.time(), tzinfo=IST)), "status": "open"},
+        {**_item("tomorrow-task", datetime.combine(tomorrow, datetime.min.time(), tzinfo=IST)), "status": "open"},
+    ]
+    answer = _deterministic_deadline_answer("deadlines for tomorrow", items)
+    assert answer is not None
+    assert "tomorrow-task" in answer or "Task tomorrow-task" in answer
+    assert "today-task" not in answer

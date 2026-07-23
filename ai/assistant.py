@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from ai.client import call_json, call_text, get_last_groq_error
@@ -26,9 +26,12 @@ from services.contacts import (
 from services.conversation import history_for_prompt, MAX_HISTORY
 from services.timeutil import (
     IST,
+    DayWindow,
     format_deadline_display,
     item_effective_deadline_dt,
+    normalize_date_words,
     now_ist,
+    parse_day_window,
     resolve_deadline_text,
     today_ist,
 )
@@ -522,6 +525,16 @@ def _gmail_day_bounds_query(day: datetime | None = None) -> str:
     return f"after:{d.year}/{d.month:02d}/{d.day:02d} before:{nxt.year}/{nxt.month:02d}/{nxt.day:02d}"
 
 
+def _gmail_range_bounds_query(window: DayWindow) -> str:
+    """Gmail after:/before: window for an inclusive IST calendar-day range."""
+    start = window.start
+    end_exclusive = window.end + timedelta(days=1)
+    return (
+        f"after:{start.year}/{start.month:02d}/{start.day:02d} "
+        f"before:{end_exclusive.year}/{end_exclusive.month:02d}/{end_exclusive.day:02d}"
+    )
+
+
 def _sanitize_gmail_query(query: str) -> str | None:
     q = (query or "").strip()
     if not q or len(q) > 240:
@@ -552,22 +565,19 @@ def _build_mailbox_queries(question: str, convo: dict[str, Any] | None = None) -
     q = question.lower()
     person = _resolve_person_query(question, convo)
     queries: list[str] = []
+    window = parse_day_window(question)
 
-    if "today" in q or "got today" in q or "received today" in q:
-        day_q = _gmail_day_bounds_query()
+    if window is not None:
+        if window.single:
+            day_q = _gmail_day_bounds_query(datetime.combine(window.start, time.min, tzinfo=IST))
+        else:
+            day_q = _gmail_range_bounds_query(window)
         if person:
             from_clause, _ = _person_to_gmail_from(person)
             if from_clause:
                 queries.append(f"{from_clause} {day_q}")
         queries.append(day_q)
         queries.append(f"(in:inbox OR in:spam) {day_q}")
-    elif "yesterday" in q:
-        day_q = _gmail_day_bounds_query(now_ist() - timedelta(days=1))
-        if person:
-            from_clause, _ = _person_to_gmail_from(person)
-            if from_clause:
-                queries.append(f"{from_clause} {day_q}")
-        queries.append(day_q)
     elif person:
         from_clause, email = _person_to_gmail_from(person)
         if from_clause:
@@ -822,7 +832,7 @@ def _format_sources_block(emails: list[dict[str, Any]], *, limit: int = 5) -> st
 
 def _is_due_list_question(question: str) -> bool:
     """True only for clear 'what's due' refreshes — not every mention of 'deadline'."""
-    q = question.lower().strip()
+    q = normalize_date_words(question).lower().strip()
     if _asks_undated_tasks(q):
         return False
     # Follow-ups / analytical questions should go to full AI, not the due-list shortcut
@@ -979,33 +989,9 @@ def build_gmail_queries(
 
 def _parse_target_date(question: str) -> datetime | None:
     """Resolve 'tomorrow' / 'today' / explicit dates in the question to IST midnight."""
-    q = question.lower()
-    ref = now_ist()
-    if "tomorrow" in q:
-        return (ref + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    if "today" in q:
-        return ref.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    m = re.search(
-        r"(\d{1,2})(?:st|nd|rd|th)?\s+(jan|january|feb|february|mar|march|apr|april|"
-        r"may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|"
-        r"nov|november|dec|december)(?:\s+(\d{4}))?",
-        q,
-    )
-    if m:
-        months = {
-            "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-            "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-            "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
-            "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
-        }
-        day, mon = int(m.group(1)), months[m.group(2)]
-        year = int(m.group(3)) if m.group(3) else ref.year
-        return datetime(year, mon, day, tzinfo=IST)
-
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", q)
-    if m:
-        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=IST)
+    window = parse_day_window(question)
+    if window is not None:
+        return datetime.combine(window.start, time.min, tzinfo=IST)
     return None
 
 
@@ -1083,23 +1069,27 @@ def _deterministic_undated_answer(items: list[dict[str, Any]]) -> str:
 
 def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -> str | None:
     """Structured DB answers for clear due-list / undated-task questions."""
-    q = question.lower()
-
     if _asks_undated_tasks(question):
         return _deterministic_undated_answer(items)
 
-    if not _is_due_list_question(question) and _parse_target_date(question) is None:
+    if not _is_due_list_question(question) and parse_day_window(question) is None:
+        q = question.lower()
         if not any(w in q for w in ("need to do today", "need to do tomorrow", "what's due", "refresh")):
             return None
 
-    target = _parse_target_date(question)
+    window = parse_day_window(question)
     day_set: set | None = None
-    if "today" in q and "tomorrow" in q:
-        day_set = {today_ist(), today_ist() + timedelta(days=1)}
-        label = "today and tomorrow (IST)"
-    elif target is not None:
-        day_set = {target.astimezone(IST).date()}
-        label = target.strftime("%d %b %Y")
+    if window is not None:
+        if window.single:
+            day_set = {window.start}
+            label = window.label
+        else:
+            day_set = set()
+            cursor = window.start
+            while cursor <= window.end:
+                day_set.add(cursor)
+                cursor += timedelta(days=1)
+            label = window.label
     elif _is_due_list_question(question):
         # Default refresh → today + tomorrow, not an unfiltered dump
         day_set = {today_ist(), today_ist() + timedelta(days=1)}

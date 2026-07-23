@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -40,6 +41,211 @@ _VAGUE_PHRASES = (
     "coming week",
     "in a few days",
 )
+
+_DATE_TYPO_MAP: dict[str, str] = {
+    "tmrw": "tomorrow",
+    "tmr": "tomorrow",
+    "tmw": "tomorrow",
+    "2moro": "tomorrow",
+    "2morow": "tomorrow",
+    "tomo": "tomorrow",
+    "tomm": "tomorrow",
+    "tommorow": "tomorrow",
+    "tommorrow": "tomorrow",
+    "tdy": "today",
+    "tday": "today",
+    "todays": "today",
+    "yest": "yesterday",
+    "ystrday": "yesterday",
+    "yesterday's": "yesterday",
+}
+
+_WEEKDAY_NAMES = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+_MONTHS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+
+@dataclass(frozen=True)
+class DayWindow:
+    """Inclusive calendar-day range in IST."""
+
+    start: date
+    end: date
+    label: str
+    single: bool
+
+
+def normalize_date_words(text: str) -> str:
+    """Replace common date typos/shorthand with canonical words."""
+    if not text:
+        return text
+    result = text
+    for typo, canonical in _DATE_TYPO_MAP.items():
+        result = re.sub(rf"\b{re.escape(typo)}\b", canonical, result, flags=re.IGNORECASE)
+    return result
+
+
+def _format_day_label(day: date) -> str:
+    return day.strftime("%a, %d %b %Y")
+
+
+def _this_week_end(ref: date) -> date:
+    return ref + timedelta(days=(6 - ref.weekday()))
+
+
+def _next_week_window(ref: date) -> tuple[date, date]:
+    this_sunday = _this_week_end(ref)
+    start = this_sunday + timedelta(days=1)
+    end = start + timedelta(days=6)
+    return start, end
+
+
+def _parse_explicit_date(q: str, ref: date) -> date | None:
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", q)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+
+    m = re.search(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?(?:\s*(?:of\s+)?"
+        r"(jan|january|feb|february|mar|march|apr|april|may|jun|june|"
+        r"jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december))?\b",
+        q,
+    )
+    if not m:
+        return None
+    if not m.group(2) and not any(
+        token in q
+        for token in (
+            "deadline",
+            "due",
+            "class",
+            "classes",
+            "schedule",
+            "mail",
+            "email",
+            "for ",
+            "on ",
+        )
+    ):
+        return None
+    try:
+        dom = int(m.group(1))
+        if m.group(2):
+            month = _MONTHS[m.group(2)]
+            year = ref.year
+        else:
+            month = ref.month
+            year = ref.year
+            if dom < ref.day:
+                month += 1
+                if month > 12:
+                    month = 1
+                    year += 1
+        return date(year, month, dom)
+    except ValueError:
+        return None
+
+
+def _parse_weekday(q: str, ref: date) -> date | None:
+    m = re.search(
+        r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"mon|tue|tues|wed|thu|thurs|fri|sat|sun)\b",
+        q,
+    )
+    if m:
+        weekday = _WEEKDAY_MAP[m.group(1)]
+        return (ref + relativedelta(weekday=weekday(+1))).date()
+
+    for name, weekday in _WEEKDAY_MAP.items():
+        if re.search(rf"\b{re.escape(name)}\b", q):
+            days_ahead = (weekday.weekday - ref.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            return ref + timedelta(days=days_ahead)
+    return None
+
+
+def parse_day_window(text: str, *, ref: datetime | None = None) -> DayWindow | None:
+    """Resolve natural-language day/range phrases to an IST calendar window."""
+    if not text or not str(text).strip():
+        return None
+
+    ref_dt = ref.astimezone(IST) if ref else now_ist()
+    ref_day = ref_dt.date()
+    q = normalize_date_words(text).lower()
+
+    if re.search(r"\btoday\b.*\btomorrow\b|\btomorrow\b.*\btoday\b", q):
+        end = ref_day + timedelta(days=1)
+        return DayWindow(ref_day, end, "today and tomorrow (IST)", single=False)
+
+    if re.search(r"\bthis week\b", q):
+        end = _this_week_end(ref_day)
+        return DayWindow(ref_day, end, "this week (IST)", single=False)
+
+    if re.search(r"\bnext week\b|\bcoming week\b", q):
+        start, end = _next_week_window(ref_day)
+        return DayWindow(start, end, "next week (IST)", single=False)
+
+    if re.search(r"\bday after tomorrow\b", q):
+        target = ref_day + timedelta(days=2)
+        return DayWindow(target, target, _format_day_label(target), single=True)
+
+    if re.search(r"\btoday\b", q):
+        return DayWindow(ref_day, ref_day, "today (IST)", single=True)
+
+    if re.search(r"\btomorrow\b", q):
+        target = ref_day + timedelta(days=1)
+        return DayWindow(target, target, "tomorrow (IST)", single=True)
+
+    if re.search(r"\byesterday\b", q):
+        target = ref_day - timedelta(days=1)
+        return DayWindow(target, target, "yesterday (IST)", single=True)
+
+    explicit = _parse_explicit_date(q, ref_day)
+    if explicit is not None:
+        return DayWindow(explicit, explicit, _format_day_label(explicit), single=True)
+
+    weekday = _parse_weekday(q, ref_day)
+    if weekday is not None:
+        return DayWindow(weekday, weekday, _format_day_label(weekday), single=True)
+
+    return None
 
 
 def now_ist() -> datetime:

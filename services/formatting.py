@@ -384,6 +384,26 @@ def format_due_list(items: list[dict[str, Any]], category: str | None) -> tuple[
     )
 
 
+def format_dated_due_list(
+    items: list[dict[str, Any]],
+    label: str,
+    category: str | None,
+) -> tuple[str, list[str]]:
+    """Formatted deadline list for a specific day or range."""
+    title = _list_title(f"Deadlines — {label}", category)
+    empty_detail = f"No deadlines due {label}."
+    return format_assignment_list(
+        items,
+        title=title,
+        category=category,
+        numbered=True,
+        limit=DEFAULT_LIST_LIMIT,
+        show_category=category is None,
+        sort_fn=sort_upcoming_assignments,
+        empty_detail=empty_detail,
+    )
+
+
 def format_missed_list(items: list[dict[str, Any]], category: str | None) -> tuple[str, list[str]]:
     return format_assignment_list(
         items,
