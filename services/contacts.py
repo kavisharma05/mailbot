@@ -359,13 +359,13 @@ def resolve_email_robust(
     )
 
 
-def backfill_contacts_from_inbox(*, days: int = 365, max_messages: int = 500) -> dict[str, int]:
+def backfill_contacts_from_inbox(*, days: int = 365, max_messages: int = 200) -> dict[str, int]:
     """Scan recent inbox senders and upsert contacts (one-time/manual admin use)."""
-    from gmail_api.client import list_message_summaries
+    from gmail_api.client import list_message_senders
 
     query = f"in:inbox newer_than:{days}d"
     try:
-        batch = list_message_summaries(query, max_results=max_messages, include_body=False)
+        batch = list_message_senders(query, max_results=max_messages)
     except Exception as exc:
         logger.warning("backfill_contacts_from_inbox failed: %s", exc)
         return {"scanned": 0, "upserted": 0, "error": 1}

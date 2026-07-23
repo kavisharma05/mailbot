@@ -34,8 +34,8 @@ def get_profile_history_id() -> str:
     return str(profile["historyId"])
 
 
-def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | None]:
-    """Return new message IDs since start_history_id and the latest historyId."""
+def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | None, bool]:
+    """Return (message_ids, latest_history_id, history_api_failed)."""
     message_ids: list[str] = []
     latest_history_id: str | None = None
     page_token = None
@@ -58,9 +58,12 @@ def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | No
             for record in response.get("history", []):
                 for added in record.get("messagesAdded", []):
                     msg = added.get("message", {})
-                    labels = msg.get("labelIds", [])
-                    if "INBOX" in labels or "SPAM" in labels:
-                        message_ids.append(msg["id"])
+                    msg_id = msg.get("id")
+                    if not msg_id:
+                        continue
+                    labels = msg.get("labelIds") or []
+                    if not labels or "INBOX" in labels or "SPAM" in labels:
+                        message_ids.append(msg_id)
 
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -70,13 +73,13 @@ def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | No
         raise
     except Exception as exc:
         logger.warning("History list failed (%s), falling back to recent messages", exc)
-        return list_recent_inbox_message_ids(), None
+        return list_recent_inbox_message_ids(), None, True
 
-    return list(dict.fromkeys(message_ids)), latest_history_id
+    return list(dict.fromkeys(message_ids)), latest_history_id, False
 
 
-def list_recent_inbox_message_ids() -> list[str]:
-    return list_inbox_message_ids_since(days=1, max_results=50)
+def list_recent_inbox_message_ids(*, days: int = 14, max_results: int = 300) -> list[str]:
+    return list_inbox_message_ids_since(days=days, max_results=max_results)
 
 
 def list_inbox_message_ids_since(days: int = 14, max_results: int = 200) -> list[str]:
@@ -108,6 +111,58 @@ def list_inbox_message_ids_since(days: int = 14, max_results: int = 200) -> list
             break
 
     return list(dict.fromkeys(message_ids))
+
+
+def list_message_senders(query: str, *, max_results: int = 200) -> list[dict[str, Any]]:
+    """Lightweight From-header fetch for contact backfill (metadata only)."""
+    service = get_gmail_service()
+    message_ids: list[str] = []
+    page_token = None
+
+    while len(message_ids) < max_results:
+        page_size = min(100, max_results - len(message_ids))
+        kwargs: dict[str, Any] = {
+            "userId": "me",
+            "q": query,
+            "maxResults": page_size,
+            "includeSpamTrash": True,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        response = service.users().messages().list(**kwargs).execute()
+        for message in response.get("messages", []):
+            message_ids.append(message["id"])
+            if len(message_ids) >= max_results:
+                break
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    senders: list[dict[str, Any]] = []
+    for message_id in message_ids:
+        try:
+            msg = (
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=message_id,
+                    format="metadata",
+                    metadataHeaders=["From"],
+                )
+                .execute()
+            )
+        except Exception as exc:
+            logger.warning("Failed loading sender metadata for %s: %s", message_id, exc)
+            continue
+        headers = {
+            h["name"].lower(): h["value"]
+            for h in (msg.get("payload") or {}).get("headers", [])
+        }
+        senders.append({"message_id": message_id, "sender": headers.get("from", "")})
+    return senders
 
 
 def search_message_ids(query: str, max_results: int = 8) -> list[str]:
@@ -339,6 +394,7 @@ def get_message_details(message_id: str, *, load_attachments: bool = True) -> di
         "body": body[:8000],
         "attachments": attachments,
         "attachment_text": attachment_text,
+        "label_ids": msg.get("labelIds") or [],
     }
 
 

@@ -109,7 +109,7 @@ def test_watcher_defers_history_advance_on_transient_failure():
             patch("services.watcher.get_watch_state", return_value=state),
             patch(
                 "services.watcher._collect_message_ids",
-                new=AsyncMock(return_value=(["msg-1"], "1005")),
+                new=AsyncMock(return_value=(["msg-1"], "1005", False)),
             ),
             patch("services.watcher.is_email_processed_cached", return_value=False),
             patch("services.watcher._process_message", side_effect=fake_process),

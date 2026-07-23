@@ -10,15 +10,15 @@ from gmail_api.client import (
     get_profile_history_id,
     list_history_message_ids,
     list_inbox_message_ids_since,
-    search_message_ids,
 )
 from services.alert_delivery import deliver_attachments, send_actionable_alert, send_owner_update
 from services.attachments import annotate_attachment_intents
-from services.contacts import upsert_contact_from_sender
+from services.contacts import parse_sender, upsert_contact_from_sender
 from services.db import (
     clear_assignment_reminder,
     dequeue_pending_email,
     enqueue_pending_email,
+    get_pending_email,
     get_watch_state,
     insert_assignment,
     is_email_processed_cached,
@@ -50,9 +50,11 @@ from services.timeutil import IST, now_ist, parse_iso_deadline
 logger = logging.getLogger(__name__)
 
 WATCHER_INTERVAL_SECONDS = 60
-CATCHUP_DAYS = 3
-CATCHUP_MAX_RESULTS = 120
+CATCHUP_DAYS = 14
+CATCHUP_MAX_RESULTS = 300
 watcher_lock = asyncio.Lock()
+
+_REUSE_CLASSIFICATION_ERRORS = frozenset({"alert_delivery_failed", "mark_failed"})
 
 
 def _category_group_chat_id(category: str, settings: Settings) -> str | None:
@@ -175,11 +177,11 @@ async def send_category_alert(
     sender: str | None = None,
     subject: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
-) -> None:
+) -> bool:
     settings = get_settings()
     chat_id = _category_group_chat_id(category, settings)
     if not chat_id:
-        return
+        return True
     text = format_alert_message(
         category=category,
         course_or_topic=course_or_topic,
@@ -196,7 +198,7 @@ async def send_category_alert(
         summary=summary,
         deadline_date=deadline_date,
     )
-    await send_actionable_alert(
+    msg_id = await send_actionable_alert(
         bot,
         chat_id,
         text,
@@ -205,6 +207,7 @@ async def send_category_alert(
         caption_prefix=summary or task,
         pin=pin,
     )
+    return msg_id is not None
 
 
 async def share_schedule(
@@ -213,15 +216,17 @@ async def share_schedule(
     sessions: list[dict[str, Any]],
     summary: str | None,
     attachments: list[dict[str, Any]] | None = None,
-) -> None:
+) -> bool:
     settings = get_settings()
     text = format_schedule_share(sessions)
     if summary:
         text = f"{text}\n\n<i>{escape_html(summary)}</i>"
     chat_id = _category_group_chat_id("admin", settings)
-    if chat_id:
-        await send_html(bot, chat_id, text)
-        await deliver_attachments(bot, chat_id, attachments or [], caption_prefix="Class schedule")
+    if not chat_id:
+        return True
+    html_ok = await send_html(bot, chat_id, text)
+    attach_ok = await deliver_attachments(bot, chat_id, attachments or [], caption_prefix="Class schedule")
+    return html_ok and attach_ok
 
 
 def _deadline_is_past(deadline_date: str | None) -> bool:
@@ -285,6 +290,18 @@ def _assignment_payload(
     }
 
 
+def _is_own_sent_mail(details: dict[str, Any], settings: Settings) -> bool:
+    """True for outbound mail you sent that did not land in inbox."""
+    label_ids = details.get("label_ids") or []
+    if "INBOX" in label_ids:
+        return False
+    if "SENT" in label_ids:
+        return True
+    _, sender_email = parse_sender(details.get("sender"))
+    owner = (settings.gmail_user or "").strip().lower()
+    return bool(owner and sender_email and sender_email.lower() == owner)
+
+
 async def _process_message(
     message_id: str,
     bot,
@@ -292,7 +309,33 @@ async def _process_message(
     skip_past_deadlines: bool = False,
 ) -> dict[str, Any]:
     """Classify one email, persist results, optionally alert + forward attachments."""
+    pending_row = await asyncio.to_thread(get_pending_email, message_id)
+    if pending_row and pending_row.get("dead_letter"):
+        await asyncio.to_thread(
+            mark_email_processed,
+            message_id,
+            False,
+            None,
+            None,
+            delivery_failed=True,
+        )
+        await asyncio.to_thread(dequeue_pending_email, message_id)
+        return {"processed": 1, "alerts": 0}
+
     details = await asyncio.to_thread(get_message_details, message_id, load_attachments=True)
+
+    settings = get_settings()
+    if _is_own_sent_mail(details, settings):
+        await asyncio.to_thread(dequeue_pending_email, message_id)
+        await asyncio.to_thread(
+            mark_email_processed,
+            message_id,
+            False,
+            "high",
+            None,
+        )
+        return {"processed": 0, "alerts": 0}
+
     await asyncio.to_thread(upsert_contact_from_sender, details.get("sender"))
     attachments = annotate_attachment_intents(
         details.get("attachments") or [],
@@ -301,14 +344,22 @@ async def _process_message(
     )
     attachment_text = details.get("attachment_text") or ""
 
-    result = await asyncio.to_thread(
-        classify_email,
-        details["subject"],
-        details["body"],
-        details["sender"],
-        received_at=details.get("received_at_iso") or details.get("received_at"),
-        attachment_text=attachment_text,
-    )
+    already_alerted = bool((pending_row or {}).get("already_alerted"))
+    cached_result = None
+    if pending_row and pending_row.get("last_error") in _REUSE_CLASSIFICATION_ERRORS:
+        cached_result = pending_row.get("classified_result")
+
+    if cached_result:
+        result = cached_result
+    else:
+        result = await asyncio.to_thread(
+            classify_email,
+            details["subject"],
+            details["body"],
+            details["sender"],
+            received_at=details.get("received_at_iso") or details.get("received_at"),
+            attachment_text=attachment_text,
+        )
 
     if result is None:
         await asyncio.to_thread(
@@ -329,7 +380,8 @@ async def _process_message(
     alerts = 0
     sender = result.get("sender") or details.get("sender")
     summary = result.get("summary")
-    settings = get_settings()
+    delivery_ok = True
+    skip_alerts = already_alerted
 
     owner_text = format_incoming_mail_message(
         subject=details.get("subject"),
@@ -348,6 +400,28 @@ async def _process_message(
         summary=summary,
         deadline_date=deadline_date,
     )
+
+    async def _fail_delivery(*, error: str = "alert_delivery_failed") -> dict[str, Any]:
+        await asyncio.to_thread(
+            enqueue_pending_email,
+            message_id,
+            error,
+            classified_result=result,
+            already_alerted=skip_alerts or error == "mark_failed",
+        )
+        return {"processed": 0, "alerts": 0, "transient": True}
+
+    async def _finalize_processed() -> dict[str, Any] | None:
+        marked = await asyncio.to_thread(
+            mark_email_processed,
+            message_id,
+            is_actionable,
+            confidence,
+            assignment_id,
+        )
+        if marked:
+            return None
+        return await _fail_delivery(error="mark_failed")
 
     # Timetable / weekly schedule path
     if is_trusted_schedule_sender(details.get("sender", "")) and looks_like_schedule(
@@ -369,26 +443,31 @@ async def _process_message(
                 sessions,
                 gmail_message_id=message_id,
             )
-            if _should_owner_dm(
-                settings,
-                is_actionable=is_actionable,
-                category=category,
-                task=result.get("task"),
-                summary=summary,
-            ):
-                await send_owner_update(
+            if not skip_alerts:
+                if _should_owner_dm(
+                    settings,
+                    is_actionable=is_actionable,
+                    category=category,
+                    task=result.get("task"),
+                    summary=summary,
+                ):
+                    owner_sent = await send_owner_update(
+                        bot,
+                        settings.telegram_owner_chat_id,
+                        owner_text,
+                        attachments=attachments if is_actionable else None,
+                        pin=pin_owner,
+                    )
+                    if not owner_sent:
+                        delivery_ok = False
+                schedule_sent = await share_schedule(
                     bot,
-                    settings.telegram_owner_chat_id,
-                    owner_text,
-                    attachments=attachments if is_actionable else None,
-                    pin=pin_owner,
+                    sessions=stored or sessions,
+                    summary=summary,
+                    attachments=attachments,
                 )
-            await share_schedule(
-                bot,
-                sessions=stored or sessions,
-                summary=summary,
-                attachments=attachments,
-            )
+                if not schedule_sent:
+                    delivery_ok = False
             alerts = 1
             if is_actionable and confidence in ("high", "medium"):
                 assignment = await asyncio.to_thread(
@@ -401,28 +480,30 @@ async def _process_message(
                 )
                 if assignment:
                     assignment_id = assignment["id"]
-            await asyncio.to_thread(
-                mark_email_processed,
-                message_id,
-                True,
-                confidence or "medium",
-                assignment_id,
-            )
+                elif not skip_alerts:
+                    return await _fail_delivery(error="assignment_insert_failed")
+            if not delivery_ok:
+                return await _fail_delivery()
+            finalize = await _finalize_processed()
+            if finalize:
+                return finalize
             return {"processed": 1, "alerts": alerts}
 
-    if _should_owner_dm(
+    if not skip_alerts and _should_owner_dm(
         settings,
         is_actionable=is_actionable,
         category=category,
         task=result.get("task"),
         summary=summary,
     ) and not is_actionable:
-        await send_owner_update(
+        owner_sent = await send_owner_update(
             bot,
             settings.telegram_owner_chat_id,
             owner_text,
             pin=pin_owner,
         )
+        if not owner_sent:
+            delivery_ok = False
 
     if is_actionable:
         assignment = await asyncio.to_thread(
@@ -432,15 +513,17 @@ async def _process_message(
         if assignment:
             assignment_id = assignment["id"]
             await asyncio.to_thread(schedule_deadline_reminders, assignment)
+        elif not skip_alerts:
+            return await _fail_delivery(error="assignment_insert_failed")
 
-        if assignment_id and _should_owner_dm(
+        if not skip_alerts and assignment_id and _should_owner_dm(
             settings,
             is_actionable=True,
             category=category,
             task=result.get("task"),
             summary=summary,
         ):
-            await send_owner_update(
+            owner_sent = await send_owner_update(
                 bot,
                 settings.telegram_owner_chat_id,
                 owner_text,
@@ -448,11 +531,13 @@ async def _process_message(
                 attachments=attachments,
                 pin=pin_owner,
             )
+            if not owner_sent:
+                delivery_ok = False
 
-        if assignment_id and _should_alert(
+        if not skip_alerts and assignment_id and _should_alert(
             confidence, deadline_date, skip_past_deadlines=skip_past_deadlines
         ):
-            await send_category_alert(
+            category_sent = await send_category_alert(
                 bot,
                 category,
                 assignment_id=str(assignment_id),
@@ -465,7 +550,10 @@ async def _process_message(
                 subject=details.get("subject"),
                 attachments=attachments,
             )
-            alerts = 1
+            if not category_sent:
+                delivery_ok = False
+            else:
+                alerts = 1
     elif confidence == "low":
         await asyncio.to_thread(
             log_low_confidence,
@@ -477,34 +565,37 @@ async def _process_message(
             },
         )
 
-    await asyncio.to_thread(
-        mark_email_processed,
-        message_id,
-        is_actionable,
-        confidence,
-        assignment_id,
-    )
+    if not delivery_ok:
+        return await _fail_delivery()
+
+    finalize = await _finalize_processed()
+    if finalize:
+        return finalize
     return {"processed": 1, "alerts": alerts}
 
 
 def _recent_unprocessed_message_ids(max_results: int = CATCHUP_MAX_RESULTS) -> list[str]:
     try:
-        return search_message_ids(f"newer_than:{CATCHUP_DAYS}d", max_results=max_results)
+        return list_inbox_message_ids_since(days=CATCHUP_DAYS, max_results=max_results)
     except Exception as exc:
         logger.warning("Recent catch-up Gmail search failed: %s", exc)
         return []
 
 
-async def _collect_message_ids(state: dict[str, Any] | None) -> tuple[list[str], str | None]:
+async def _collect_message_ids(
+    state: dict[str, Any] | None,
+) -> tuple[list[str], str | None, bool]:
     if not state or not state.get("last_history_id"):
         history_id = await asyncio.to_thread(get_profile_history_id)
         catchup_ids = await asyncio.to_thread(_recent_unprocessed_message_ids)
         pending = await asyncio.to_thread(list_pending_email_ids)
         merged = list(dict.fromkeys(pending + catchup_ids))
-        return merged, history_id
+        return merged, history_id, False
 
     start_id = state["last_history_id"]
-    message_ids, latest_history_id = await asyncio.to_thread(list_history_message_ids, start_id)
+    message_ids, latest_history_id, history_failed = await asyncio.to_thread(
+        list_history_message_ids, start_id
+    )
 
     seen: set[str] = set(message_ids)
     for mid in await asyncio.to_thread(_recent_unprocessed_message_ids):
@@ -516,7 +607,7 @@ async def _collect_message_ids(state: dict[str, Any] | None) -> tuple[list[str],
             message_ids.append(mid)
             seen.add(mid)
 
-    return message_ids, latest_history_id
+    return message_ids, latest_history_id, history_failed
 
 
 async def run_gmail_watcher(bot) -> dict:
@@ -539,21 +630,22 @@ async def _run_gmail_watcher_inner(bot) -> dict:
     state = await asyncio.to_thread(get_watch_state)
     now = datetime.now(timezone.utc)
 
-    message_ids, latest_or_init = await _collect_message_ids(state)
+    message_ids, latest_or_init, history_failed = await _collect_message_ids(state)
 
     if not state or not state.get("last_history_id"):
         history_id = latest_or_init or await asyncio.to_thread(get_profile_history_id)
-        await asyncio.to_thread(update_watch_state, last_history_id=history_id, last_checked_at=now)
-        logger.info("Initialized watch state at historyId=%s — running catch-up", history_id)
+        logger.info("Running init catch-up before setting historyId=%s", history_id)
         processed = 0
         alerts = 0
+        failed = 0
         for message_id in message_ids:
             processed_state = await _processed_lookup(message_id)
             if processed_state is None:
                 logger.warning(
-                    "Skipping %s — processed state unknown (DB unavailable)",
+                    "Deferring %s — processed state unknown (DB unavailable)",
                     message_id,
                 )
+                failed += 1
                 continue
             if processed_state:
                 continue
@@ -561,14 +653,33 @@ async def _run_gmail_watcher_inner(bot) -> dict:
                 outcome = await _process_message(message_id, bot)
             except Exception as exc:
                 logger.exception("Catch-up processing failed for %s: %s", message_id, exc)
+                failed += 1
+                continue
+            if outcome.get("transient"):
+                failed += 1
                 continue
             processed += outcome["processed"]
             alerts += outcome["alerts"]
+
+        if failed == 0:
+            await asyncio.to_thread(
+                update_watch_state,
+                last_history_id=history_id,
+                last_checked_at=now,
+            )
+            logger.info("Initialized watch state at historyId=%s", history_id)
+        else:
+            await asyncio.to_thread(update_watch_state, last_checked_at=now)
+            logger.warning(
+                "Deferred init history advance: %d message(s) failed and will retry",
+                failed,
+            )
         return {
             "status": "initialized",
-            "history_id": history_id,
+            "history_id": history_id if failed == 0 else None,
             "processed": processed,
             "alerts": alerts,
+            "failed_retries": failed,
             "catchup_candidates": len(message_ids),
         }
 
@@ -605,7 +716,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
         processed += outcome["processed"]
         alerts += outcome["alerts"]
 
-    if failed == 0:
+    if failed == 0 and not history_failed:
         new_history_id = latest_or_init or await asyncio.to_thread(get_profile_history_id)
         await asyncio.to_thread(
             update_watch_state,
@@ -615,16 +726,22 @@ async def _run_gmail_watcher_inner(bot) -> dict:
     else:
         new_history_id = start_id
         await asyncio.to_thread(update_watch_state, last_checked_at=now)
-        logger.warning(
-            "Deferred history advance: %d message(s) raised errors and will retry",
-            failed,
-        )
+        if history_failed:
+            logger.warning(
+                "Deferred history advance: Gmail history API failed; catch-up will retry next tick"
+            )
+        if failed:
+            logger.warning(
+                "Deferred history advance: %d message(s) raised errors and will retry",
+                failed,
+            )
 
     return {
         "status": "ok",
         "processed": processed,
         "alerts": alerts,
         "failed_retries": failed,
+        "history_failed": history_failed,
         "history_id": new_history_id,
     }
 

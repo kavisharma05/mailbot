@@ -24,7 +24,7 @@ async def send_actionable_alert(
     caption_prefix: str | None = None,
     pin: bool = False,
 ) -> int | None:
-    """Send HTML alert; return message_id of first chunk only if all chunks sent."""
+    """Send HTML alert; return message_id of first chunk only if all chunks and attachments sent."""
     if not chat_id:
         return None
 
@@ -67,15 +67,18 @@ async def send_actionable_alert(
         except Exception as exc:
             logger.warning("pin_chat_message failed for %s: %s", chat_id, exc)
 
-    if all_ok:
-        await deliver_attachments(
-            bot,
-            chat_id,
-            attachments or [],
-            caption_prefix=caption_prefix,
-        )
-        return sent_id
-    return None
+    if not all_ok:
+        return None
+
+    attach_ok = await deliver_attachments(
+        bot,
+        chat_id,
+        attachments or [],
+        caption_prefix=caption_prefix,
+    )
+    if not attach_ok:
+        return None
+    return sent_id
 
 
 async def deliver_attachments(
@@ -84,8 +87,12 @@ async def deliver_attachments(
     attachments: list[dict[str, Any]],
     *,
     caption_prefix: str | None = None,
-) -> int:
-    """Marks as text; readings/other as files."""
+) -> bool:
+    """Marks as text; readings/other as files. True when all intended attachments were delivered."""
+    if not attachments:
+        return True
+
+    attempted = 0
     sent = 0
     for att in attachments:
         intent = att.get("intent") or "other"
@@ -93,6 +100,7 @@ async def deliver_attachments(
         extracted = (att.get("extracted_text") or "").strip()
 
         if intent == "marks" and extracted:
+            attempted += 1
             try:
                 ok = await send_html_detailed(
                     bot,
@@ -111,6 +119,7 @@ async def deliver_attachments(
             data = att.get("data")
             if not data:
                 continue
+            attempted += 1
             caption = filename
             if caption_prefix:
                 caption = f"{str(caption_prefix)[:80]}\n{filename}"
@@ -125,7 +134,7 @@ async def deliver_attachments(
                 sent += 1
             except Exception as exc:
                 logger.warning("Failed sending attachment %s to %s: %s", filename, chat_id, exc)
-    return sent
+    return attempted == 0 or sent == attempted
 
 
 async def send_owner_update(
@@ -150,6 +159,8 @@ async def send_owner_update(
         )
         return msg_id is not None
     result = await send_html_detailed(bot, chat_id, text)
-    if result.ok and attachments:
-        await deliver_attachments(bot, chat_id, attachments)
-    return result.ok
+    if not result.ok:
+        return False
+    if attachments:
+        return await deliver_attachments(bot, chat_id, attachments)
+    return True

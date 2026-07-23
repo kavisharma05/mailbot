@@ -46,6 +46,7 @@ from services.contacts import (
     resolve_email_robust,
     canonical_person_name,
 )
+from services.watcher import watcher_lock
 from services.conversation import clear_convo, get_convo, remember_turn
 from services.alert_actions import (
     ACT_DISMISS,
@@ -55,6 +56,8 @@ from services.alert_actions import (
     parse_action_callback,
 )
 from services.db import (
+    count_dead_letter_emails,
+    count_pending_emails,
     count_pending_scheduled_reminders,
     create_manual_assignment,
     dismiss_assignment,
@@ -867,6 +870,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = await asyncio.to_thread(get_watch_state) or {}
     digest = await asyncio.to_thread(get_digest_state) or {}
     pending = await asyncio.to_thread(count_pending_scheduled_reminders)
+    pending_emails = await asyncio.to_thread(count_pending_emails)
+    dead_letters = await asyncio.to_thread(count_dead_letter_emails)
 
     def _fmt_ts(raw) -> str:
         if not raw:
@@ -876,6 +881,15 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return dt.astimezone(IST).strftime("%a %d %b %I:%M %p IST")
         except ValueError:
             return str(raw)[:40]
+
+    def _checked_age_minutes(raw) -> float | None:
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 60.0
+        except ValueError:
+            return None
 
     gmail_status = "✅ connected"
     if state.get("gmail_disconnected_at"):
@@ -890,7 +904,27 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"<b>Last morning digest:</b> {digest.get('last_morning') or 'never'}",
         f"<b>Last evening digest:</b> {digest.get('last_evening') or 'never'}",
         f"<b>Pending scheduled reminders:</b> {pending}",
+        f"<b>Pending email retries:</b> {pending_emails}",
+        f"<b>Dead-letter emails:</b> {dead_letters}",
     ]
+
+    checked_age = _checked_age_minutes(state.get("last_checked_at"))
+    if checked_age is not None and checked_age > 15:
+        lines.extend(
+            [
+                "",
+                "⚠️ <b>Automatic polling looks stale</b> — last mail check was "
+                f"{int(checked_age)} minutes ago. The 5-minute cron/pinger may not be reaching the app.",
+            ]
+        )
+    elif state.get("last_checked_at") is None:
+        lines.extend(
+            [
+                "",
+                "⚠️ <b>No automatic mail check recorded yet.</b> Confirm GitHub Actions "
+                "Mailbot Scheduler is enabled and RENDER_URL/TASK_SECRET are set.",
+            ]
+        )
     await reply_long(update.message, "\n".join(lines), parse_mode="HTML")
 
 
@@ -1902,7 +1936,8 @@ async def backfill_contacts_command(update: Update, context: ContextTypes.DEFAUL
     if not _is_owner(update) or not update.message:
         return
     await update.message.reply_text("Scanning recent inbox to learn contacts…")
-    stats = await asyncio.to_thread(backfill_contacts_from_inbox)
+    async with watcher_lock:
+        stats = await asyncio.to_thread(backfill_contacts_from_inbox)
     if stats.get("error"):
         await update.message.reply_text("Contact backfill failed. Check logs.")
         return

@@ -173,6 +173,8 @@ def mark_email_processed(
     is_actionable: bool | None,
     confidence: str | None,
     assignment_id: str | None = None,
+    *,
+    delivery_failed: bool = False,
 ) -> bool:
     try:
         db = get_db()
@@ -180,7 +182,7 @@ def mark_email_processed(
             {
                 "message_id": message_id,
                 "is_actionable": is_actionable,
-                "confidence": confidence,
+                "confidence": "delivery_failed" if delivery_failed else confidence,
                 "assignment_id": assignment_id,
                 "processed_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -532,12 +534,18 @@ def clear_assignment_reminder(assignment_id: str) -> None:
     db.table("assignments").update({"remind_at": None}).eq("id", assignment_id).execute()
 
 
-def enqueue_pending_email(message_id: str, error: str | None = None) -> None:
+def enqueue_pending_email(
+    message_id: str,
+    error: str | None = None,
+    *,
+    classified_result: dict[str, Any] | None = None,
+    already_alerted: bool = False,
+) -> None:
     try:
         db = get_db()
         existing = (
             db.table("pending_emails")
-            .select("message_id, attempts, dead_letter")
+            .select("message_id, attempts, dead_letter, already_alerted, classified_result")
             .eq("message_id", message_id)
             .limit(1)
             .execute()
@@ -553,6 +561,10 @@ def enqueue_pending_email(message_id: str, error: str | None = None) -> None:
                 "last_error": error,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
+            if classified_result is not None:
+                payload["classified_result"] = classified_result
+            if already_alerted or rows[0].get("already_alerted"):
+                payload["already_alerted"] = True
             if attempts >= MAX_PENDING_EMAIL_ATTEMPTS:
                 payload["dead_letter"] = True
                 logger.error(
@@ -568,6 +580,8 @@ def enqueue_pending_email(message_id: str, error: str | None = None) -> None:
                     "attempts": 1,
                     "last_error": error,
                     "dead_letter": False,
+                    "classified_result": classified_result,
+                    "already_alerted": already_alerted,
                 }
             ).execute()
     except Exception as exc:
@@ -602,6 +616,60 @@ def list_pending_email_ids(limit: int = 100) -> list[str]:
             continue
         out.append(str(mid))
     return out
+
+
+@_safe_read(None)
+def get_pending_email(message_id: str) -> dict[str, Any] | None:
+    db = get_db()
+    result = (
+        db.table("pending_emails")
+        .select(
+            "message_id, attempts, last_error, dead_letter, classified_result, already_alerted"
+        )
+        .eq("message_id", message_id)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+@_safe_read([])
+def list_dead_letter_email_ids(limit: int = 200) -> list[str]:
+    db = get_db()
+    result = (
+        db.table("pending_emails")
+        .select("message_id")
+        .eq("dead_letter", True)
+        .order("updated_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return [str(row["message_id"]) for row in (result.data or []) if row.get("message_id")]
+
+
+@_safe_read(0)
+def count_pending_emails() -> int:
+    db = get_db()
+    result = (
+        db.table("pending_emails")
+        .select("message_id")
+        .eq("dead_letter", False)
+        .execute()
+    )
+    return len(result.data or [])
+
+
+@_safe_read(0)
+def count_dead_letter_emails() -> int:
+    db = get_db()
+    result = (
+        db.table("pending_emails")
+        .select("message_id")
+        .eq("dead_letter", True)
+        .execute()
+    )
+    return len(result.data or [])
 
 
 @_safe_read(None)
