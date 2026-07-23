@@ -11,8 +11,12 @@ logger = logging.getLogger(__name__)
 
 BOT_COMMANDS = [
     BotCommand("start", "Welcome message and quick-action buttons"),
-    BotCommand("due", "Open deadlines and tasks (priority first)"),
-    BotCommand("done", "Mark item #n from /due as complete"),
+    BotCommand("due", "Upcoming deadlines and tasks (nearest first)"),
+    BotCommand("missed", "Open items whose deadline has passed"),
+    BotCommand("undated", "Open tasks with no due date"),
+    BotCommand("add", "Add a task or deadline yourself"),
+    BotCommand("edit", "Edit a self-added task from the last list"),
+    BotCommand("done", "Mark item #n from the last list"),
     BotCommand("classes", "Today's classes for your section"),
     BotCommand("section", "Change or check your class section"),
     BotCommand("ask", "Ask about deadlines, mail, senders, or content"),

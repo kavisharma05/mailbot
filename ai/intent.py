@@ -19,6 +19,9 @@ INTENT_CONTACT_LOOKUP = "contact_lookup"
 INTENT_MAILBOX_QA = "mailbox_qa"
 INTENT_SCHEDULE = "schedule"
 INTENT_DUE_LIST = "due_list"
+INTENT_MISSED_LIST = "missed_list"
+INTENT_UNDATED_LIST = "undated_list"
+INTENT_ADD_TASK = "add_task"
 INTENT_SMALLTALK = "smalltalk"
 
 _EMAIL_RE = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
@@ -64,6 +67,22 @@ _DUE_KEYWORDS = (
     "pending deadline",
     "open items",
     "what do i need to do",
+)
+_MISSED_KEYWORDS = (
+    "missed deadline",
+    "missed deadlines",
+    "what did i miss",
+    "what have i missed",
+    "deadlines i missed",
+    "what deadlines did i miss",
+    "overdue deadline",
+    "overdue deadlines",
+    "overdue task",
+    "overdue tasks",
+    "past deadline",
+    "past due",
+    "late deadline",
+    "late deadlines",
 )
 
 
@@ -215,6 +234,24 @@ def _is_due_intent(text: str) -> bool:
     return _is_due_list_question(text)
 
 
+def _is_missed_intent(text: str) -> bool:
+    from ai.assistant import _is_missed_list_question
+
+    return _is_missed_list_question(text)
+
+
+def _is_undated_intent(text: str) -> bool:
+    from ai.assistant import _asks_undated_tasks
+
+    return _asks_undated_tasks(text)
+
+
+def _is_add_task_intent(text: str) -> bool:
+    from ai.assistant import _is_add_task_question
+
+    return _is_add_task_question(text)
+
+
 def _llm_classify(text: str, convo: dict[str, Any] | None) -> dict[str, Any] | None:
     history = history_for_prompt(convo, limit=MAX_HISTORY)
     payload = {
@@ -271,6 +308,24 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
                 "confidence": "high",
             }
 
+    if _is_undated_intent(cleaned):
+        return {
+            "intent": INTENT_UNDATED_LIST,
+            "recipient": None,
+            "person": None,
+            "content": None,
+            "confidence": "high",
+        }
+
+    if _is_add_task_intent(cleaned):
+        return {
+            "intent": INTENT_ADD_TASK,
+            "recipient": None,
+            "person": None,
+            "content": None,
+            "confidence": "high",
+        }
+
     if _is_retrieval_intent(cleaned) and not is_compose:
         person = _extract_person_after_preposition(cleaned, "from") or _extract_person_after_preposition(
             cleaned, "by"
@@ -295,6 +350,15 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
     if _is_specific_deadline_question(cleaned):
         return {
             "intent": INTENT_MAILBOX_QA,
+            "recipient": None,
+            "person": None,
+            "content": None,
+            "confidence": "high",
+        }
+
+    if _is_missed_intent(cleaned):
+        return {
+            "intent": INTENT_MISSED_LIST,
             "recipient": None,
             "person": None,
             "content": None,
@@ -331,6 +395,9 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
             INTENT_MAILBOX_QA,
             INTENT_SCHEDULE,
             INTENT_DUE_LIST,
+            INTENT_MISSED_LIST,
+            INTENT_UNDATED_LIST,
+            INTENT_ADD_TASK,
             INTENT_SMALLTALK,
         }:
             intent = INTENT_MAILBOX_QA

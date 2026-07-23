@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from services.timeutil import IST, format_deadline_display, now_ist, parse_iso_deadline
+from services.timeutil import IST, format_deadline_display, item_effective_deadline_dt, now_ist, parse_iso_deadline
 
 VALID_CATEGORIES = ("deadline", "placement", "certification", "admin", "other")
 
@@ -161,6 +161,48 @@ def sort_assignments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(items, key=key)
 
 
+def sort_upcoming_assignments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Nearest deadline first; priority only breaks ties."""
+
+    def key(item: dict[str, Any]) -> tuple[str, int, str]:
+        dt = item_effective_deadline_dt(item)
+        due_key = dt.isoformat() if dt is not None else "9999"
+        cat = item.get("category") or "other"
+        pri = 0 if is_priority_item(
+            cat,
+            task=item.get("task"),
+            summary=item.get("summary"),
+            deadline_date=item.get("deadline_date"),
+        ) else 1
+        label = str(item.get("task") or item.get("summary") or "")
+        return (due_key, pri, label.lower())
+
+    return sorted(items, key=key)
+
+
+def sort_missed_assignments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Most recently missed deadline first."""
+
+    def key(item: dict[str, Any]) -> tuple[str, str]:
+        dt = item_effective_deadline_dt(item)
+        due_key = dt.isoformat() if dt is not None else ""
+        label = str(item.get("task") or item.get("summary") or "")
+        return (due_key, label.lower())
+
+    return sorted(items, key=key, reverse=True)
+
+
+def sort_undated_assignments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Newest created first."""
+
+    def key(item: dict[str, Any]) -> tuple[str, str]:
+        created = str(item.get("created_at") or "")
+        label = str(item.get("task") or item.get("summary") or "")
+        return (created, label.lower())
+
+    return sorted(items, key=key, reverse=True)
+
+
 def format_section_title(title: str, count: int | None = None) -> str:
     label = escape_html(title)
     if count is not None:
@@ -230,11 +272,13 @@ def format_assignment_list(
     limit: int = DEFAULT_LIST_LIMIT,
     overdue: bool = False,
     show_category: bool | None = None,
+    sort_fn=sort_assignments,
+    empty_detail: str = "",
 ) -> tuple[str, list[str]]:
     """Return formatted text and the exact item IDs shown (for /done mapping)."""
-    sorted_items = sort_assignments(items)
+    sorted_items = sort_fn(items)
     if not sorted_items:
-        return format_empty_state(title), []
+        return format_empty_state(title, empty_detail), []
 
     if show_category is None:
         show_category = category is None
@@ -320,15 +364,50 @@ def collect_priority_items(*lists: list[dict[str, Any]]) -> list[dict[str, Any]]
     return sort_assignments(out)
 
 
+def _list_title(base: str, category: str | None) -> str:
+    if category:
+        label = CATEGORY_LABELS.get(category, "Other")
+        return f"{base} — {label}"
+    return base
+
+
 def format_due_list(items: list[dict[str, Any]], category: str | None) -> tuple[str, list[str]]:
-    title = CATEGORY_LABELS.get(category or "", "Open items")
     return format_assignment_list(
         items,
-        title=title,
+        title=_list_title("Upcoming deadlines", category),
         category=category,
         numbered=True,
         limit=DEFAULT_LIST_LIMIT,
         show_category=category is None,
+        sort_fn=sort_upcoming_assignments,
+        empty_detail="No upcoming deadlines with a set due date.",
+    )
+
+
+def format_missed_list(items: list[dict[str, Any]], category: str | None) -> tuple[str, list[str]]:
+    return format_assignment_list(
+        items,
+        title=_list_title("Missed deadlines", category),
+        category=category,
+        numbered=True,
+        limit=DEFAULT_LIST_LIMIT,
+        overdue=True,
+        show_category=category is None,
+        sort_fn=sort_missed_assignments,
+        empty_detail="Nothing missed — all caught up on tracked deadlines.",
+    )
+
+
+def format_undated_list(items: list[dict[str, Any]], category: str | None) -> tuple[str, list[str]]:
+    return format_assignment_list(
+        items,
+        title=_list_title("Open tasks (no due date)", category),
+        category=category,
+        numbered=True,
+        limit=DEFAULT_LIST_LIMIT,
+        show_category=category is None,
+        sort_fn=sort_undated_assignments,
+        empty_detail="No open tasks without a resolvable due date.",
     )
 
 

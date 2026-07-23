@@ -28,6 +28,8 @@ def clear_convo(user_data: dict[str, Any]) -> None:
     """Drop conversation memory and any in-progress compose draft."""
     user_data.pop("convo", None)
     user_data.pop("compose", None)
+    user_data.pop("add_task", None)
+    user_data.pop("edit_task", None)
     user_data.pop("last_intent", None)
     user_data.pop("last_schedule_day", None)
 

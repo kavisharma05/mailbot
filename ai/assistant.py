@@ -325,6 +325,11 @@ def _asks_undated_tasks(question: str) -> bool:
             "without due",
             "tasks with no",
             "no specific due",
+            "undated",
+            "undated task",
+            "undated tasks",
+            "no due date",
+            "without a due date",
         )
     )
 
@@ -869,6 +874,53 @@ def _is_due_list_question(question: str) -> bool:
     ) or (
         ("deadline" in q or "due" in q or "pending" in q)
         and ("today" in q or "tomorrow" in q or "refresh" in q or "check" in q)
+    )
+
+
+def _is_missed_list_question(question: str) -> bool:
+    """True for explicit overdue/missed-deadline list refreshes."""
+    q = question.lower().strip()
+    if any(w in q for w in ("mail", "email", "inbox", "from ")):
+        return False
+    return any(k in q for k in (
+        "missed deadline",
+        "missed deadlines",
+        "what did i miss",
+        "what have i missed",
+        "deadlines i missed",
+        "what deadlines did i miss",
+        "overdue deadline",
+        "overdue deadlines",
+        "overdue task",
+        "overdue tasks",
+        "past deadline",
+        "past due",
+        "late deadline",
+        "late deadlines",
+    )) or (
+        "overdue" in q and ("deadline" in q or "task" in q or "assignment" in q)
+    )
+
+
+def _is_add_task_question(question: str) -> bool:
+    """True for natural-language requests to track a new task/deadline."""
+    q = question.lower().strip()
+    if any(w in q for w in ("mail", "email", "inbox", "from ")):
+        return False
+    return any(
+        phrase in q
+        for phrase in (
+            "add a task",
+            "add task",
+            "new task",
+            "create a task",
+            "create task",
+            "remind me to",
+            "track a task",
+            "add a deadline",
+            "add deadline",
+            "add a reminder",
+        )
     )
 
 

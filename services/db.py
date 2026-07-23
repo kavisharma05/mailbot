@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from supabase import Client, create_client
 
 from config import get_settings
-from services.timeutil import item_effective_deadline_dt, parse_iso_deadline
+from services.timeutil import item_effective_deadline_dt, now_ist, parse_iso_deadline, resolve_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ T = TypeVar("T")
 _db_client: Client | None = None
 
 _ASSIGNMENT_COLUMNS = (
-    "id, category, item_type, priority, course_or_topic, task, deadline_text, deadline_date, "
+    "id, source, category, item_type, priority, course_or_topic, task, deadline_text, deadline_date, "
     "summary, confidence, status, remind_at, gmail_message_id, gmail_thread_id, created_at"
 )
 
@@ -256,6 +256,139 @@ def get_open_assignments(category: str | None = None, limit: int = 40) -> list[d
         query = query.eq("category", category)
     result = query.execute()
     return result.data or []
+
+
+def _filter_assignments_by_deadline(
+    items: list[dict[str, Any]],
+    *,
+    upcoming: bool,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Keep open items with a resolvable effective deadline on the chosen side of now."""
+    ref = now or now_ist()
+    matched: list[dict[str, Any]] = []
+    for item in items:
+        dt = item_effective_deadline_dt(item)
+        if dt is None:
+            continue
+        if upcoming:
+            if dt >= ref:
+                matched.append(item)
+        elif dt < ref:
+            matched.append(item)
+    return matched
+
+
+@_safe_read([])
+def get_upcoming_assignments(
+    category: str | None = None,
+    limit: int = 40,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Open assignments whose effective deadline is now or later."""
+    items = get_open_assignments(category=category, limit=200)
+    return _filter_assignments_by_deadline(items, upcoming=True, now=now)[:limit]
+
+
+@_safe_read([])
+def get_missed_assignments(
+    category: str | None = None,
+    limit: int = 40,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Open assignments whose effective deadline has passed."""
+    items = get_open_assignments(category=category, limit=200)
+    return _filter_assignments_by_deadline(items, upcoming=False, now=now)[:limit]
+
+
+@_safe_read([])
+def get_undated_assignments(
+    category: str | None = None,
+    limit: int = 40,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Open assignments with no resolvable effective deadline."""
+    items = get_open_assignments(category=category, limit=200)
+    matched = [i for i in items if item_effective_deadline_dt(i) is None]
+    matched.sort(key=lambda i: str(i.get("created_at") or ""), reverse=True)
+    return matched[:limit]
+
+
+@_safe_write
+def create_manual_assignment(
+    task: str,
+    *,
+    deadline_text: str | None = None,
+    category: str = "other",
+    course_or_topic: str | None = None,
+) -> dict[str, Any] | None:
+    """Insert a self-created open assignment (source=manual)."""
+    from services.formatting import normalize_category
+
+    task_clean = (task or "").strip()
+    if not task_clean:
+        return None
+
+    deadline_iso = None
+    deadline_raw = (deadline_text or "").strip() if deadline_text else ""
+    if deadline_raw:
+        deadline_iso = resolve_deadline(None, deadline_raw, now=now_ist())
+
+    data: dict[str, Any] = {
+        "source": "manual",
+        "task": task_clean,
+        "summary": task_clean,
+        "category": normalize_category(category),
+        "item_type": "other",
+        "priority": "normal",
+        "confidence": "high",
+        "status": "open",
+        "course_or_topic": course_or_topic,
+        "deadline_text": deadline_raw or None,
+        "deadline_date": deadline_iso,
+    }
+    return insert_assignment(data)
+
+
+@_safe_write
+def update_assignment(assignment_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+    """Update fields on a manual open assignment only."""
+    from services.formatting import normalize_category
+
+    if not fields:
+        return None
+
+    payload = dict(fields)
+    if "deadline_text" in payload:
+        text = payload.get("deadline_text")
+        if text is None or (isinstance(text, str) and not str(text).strip()):
+            payload["deadline_text"] = None
+            payload["deadline_date"] = None
+        else:
+            payload["deadline_text"] = str(text).strip()
+            payload["deadline_date"] = resolve_deadline(
+                None, payload["deadline_text"], now=now_ist()
+            )
+    if "category" in payload:
+        payload["category"] = normalize_category(str(payload["category"]))
+    if "task" in payload and payload["task"]:
+        payload["task"] = str(payload["task"]).strip()
+        payload["summary"] = payload["task"]
+
+    db = get_db()
+    result = (
+        db.table("assignments")
+        .update(payload)
+        .eq("id", assignment_id)
+        .eq("source", "manual")
+        .eq("status", "open")
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
 
 
 @_safe_read([])

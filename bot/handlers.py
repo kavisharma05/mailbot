@@ -17,6 +17,7 @@ from telegram.ext import (
 from ai.assistant import (
     _extract_person_query,
     _is_due_list_question,
+    _is_missed_list_question,
     answer_question,
     infer_person_email,
     lookup_contact_email,
@@ -25,12 +26,15 @@ from ai.assistant import (
 )
 from ai.composer import compose_email
 from ai.intent import (
+    INTENT_ADD_TASK,
     INTENT_COMPOSE,
     INTENT_CONTACT_LOOKUP,
     INTENT_DUE_LIST,
     INTENT_MAILBOX_QA,
+    INTENT_MISSED_LIST,
     INTENT_SCHEDULE,
     INTENT_SMALLTALK,
+    INTENT_UNDATED_LIST,
     _is_specific_deadline_question,
     classify_message,
 )
@@ -55,18 +59,31 @@ from services.alert_actions import (
 )
 from services.db import (
     count_pending_scheduled_reminders,
+    create_manual_assignment,
     dismiss_assignment,
+    get_assignment_by_id,
     get_assignments_for_qa,
     get_digest_state,
-    get_open_assignments,
+    get_missed_assignments,
     get_preferred_section,
+    get_undated_assignments,
+    get_upcoming_assignments,
     get_watch_state,
     log_low_confidence,
     mark_assignment_done,
     schedule_assignment_reminder,
     set_preferred_section,
+    update_assignment,
 )
-from services.formatting import format_due_list
+from services.formatting import (
+    CATEGORY_LABELS,
+    VALID_CATEGORIES,
+    format_deadline,
+    format_due_list,
+    format_missed_list,
+    format_undated_list,
+    normalize_category,
+)
 from services.schedule import (
     _format_session_block,
     _session_section,
@@ -87,11 +104,23 @@ COMPOSE_NEED_CONTENT = "need_content"
 COMPOSE_NEED_RECIPIENT = "need_recipient"
 COMPOSE_CONFIRM = "confirm"
 
+ADD_TASK_NEED_TASK = "need_task"
+ADD_TASK_NEED_DEADLINE = "need_deadline"
+
+EDIT_TASK_EDITING_TASK = "editing_task"
+EDIT_TASK_EDITING_DEADLINE = "editing_deadline"
+EDIT_TASK_EDITING_CATEGORY = "editing_category"
+
+ADDTASK_CB = "addtask"
+EDITTASK_CB = "edittask"
+
 APPROVE_CB = "send_approve"
 CANCEL_CB = "send_cancel"
 CLEAR_CHAT_CB = "ui:clear_chat"
 
-QUICK_ACTION_LABELS = ("📚 Classes", "⏰ Due", "✉️ Send", "📋 Section")
+QUICK_ACTION_LABELS = ("📚 Classes", "⏰ Due", "➕ Add", "✉️ Send", "📋 Section")
+
+_TASK_CANCEL_WORDS = frozenset({"cancel", "stop", "discard", "abort", "/cancel"})
 
 # How many recent message IDs to try when clearing bot clutter in owner DM
 _CLEAR_CHAT_SCAN_LIMIT = 25
@@ -169,6 +198,281 @@ def _sort_items_priority_first(items: list[dict]) -> list[dict]:
 
 def _format_due_list(items: list[dict], category: str | None) -> tuple[str, list[str]]:
     return format_due_list(items, category)
+
+
+def _format_missed_list(items: list[dict], category: str | None) -> tuple[str, list[str]]:
+    return format_missed_list(items, category)
+
+
+def _format_undated_list(items: list[dict], category: str | None) -> tuple[str, list[str]]:
+    return format_undated_list(items, category)
+
+
+async def _fetch_assignment_list(
+    category: str | None,
+    *,
+    source: str = "due",
+) -> tuple[str, list[str]]:
+    if source == "missed":
+        items = await asyncio.to_thread(get_missed_assignments, category=category)
+        return _format_missed_list(items, category)
+    if source == "undated":
+        items = await asyncio.to_thread(get_undated_assignments, category=category)
+        return _format_undated_list(items, category)
+    items = await asyncio.to_thread(get_upcoming_assignments, category=category)
+    return _format_due_list(items, category)
+
+
+def _store_assignment_list(context: ContextTypes.DEFAULT_TYPE, due_ids: list[str], *, source: str) -> None:
+    context.user_data["due_items"] = due_ids
+    context.user_data["due_items_source"] = source
+
+
+def _get_add_task(user_data: dict) -> dict | None:
+    state = user_data.get("add_task")
+    return state if isinstance(state, dict) else None
+
+
+def _clear_add_task(user_data: dict) -> None:
+    user_data.pop("add_task", None)
+
+
+def _get_edit_task(user_data: dict) -> dict | None:
+    state = user_data.get("edit_task")
+    return state if isinstance(state, dict) else None
+
+
+def _clear_edit_task(user_data: dict) -> None:
+    user_data.pop("edit_task", None)
+
+
+def _category_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(CATEGORY_LABELS[c], callback_data=f"{prefix}:cat:{c}")
+        for c in VALID_CATEGORIES
+    ]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(rows)
+
+
+def _add_deadline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("No deadline", callback_data=f"{ADDTASK_CB}:nodeadline")]]
+    )
+
+
+def _edit_task_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Task", callback_data=f"{EDITTASK_CB}:field:task"),
+                InlineKeyboardButton("Deadline", callback_data=f"{EDITTASK_CB}:field:deadline"),
+            ],
+            [
+                InlineKeyboardButton("Category", callback_data=f"{EDITTASK_CB}:field:category"),
+                InlineKeyboardButton("Done editing", callback_data=f"{EDITTASK_CB}:done"),
+            ],
+        ]
+    )
+
+
+def _parse_add_one_line(text: str) -> dict[str, str | None]:
+    parts = [p.strip() for p in text.split("|", 2)]
+    while len(parts) < 3:
+        parts.append("")
+    task = parts[0]
+    deadline = parts[1] or None
+    category = parts[2] or "other"
+    return {"task": task, "deadline_text": deadline, "category": category}
+
+
+def _extract_task_from_add_phrase(question: str) -> str | None:
+    q = question.strip()
+    lower = q.lower()
+    for prefix in (
+        "remind me to ",
+        "add task ",
+        "add a task ",
+        "new task ",
+        "track a task ",
+        "add deadline ",
+        "add a deadline ",
+        "add a reminder to ",
+    ):
+        if lower.startswith(prefix):
+            return q[len(prefix) :].strip()
+    return None
+
+
+async def _save_manual_task_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    task: str,
+    deadline_text: str | None,
+    category: str,
+) -> bool:
+    if not update.message:
+        return False
+    row = await asyncio.to_thread(
+        create_manual_assignment,
+        task,
+        deadline_text=deadline_text,
+        category=category,
+    )
+    if not row:
+        await update.message.reply_text("Couldn't save that task. Try again with /add.")
+        return False
+    _clear_add_task(context.user_data)
+    due_display = format_deadline(row.get("deadline_date"), row.get("deadline_text"))
+    cat_label = CATEGORY_LABELS.get(normalize_category(row.get("category")), "Other")
+    await update.message.reply_text(
+        f"Added: <b>{html.escape(str(task))}</b>\n"
+        f"Category: {html.escape(cat_label)}\n"
+        f"Due: {html.escape(due_display)}",
+        parse_mode="HTML",
+    )
+    return True
+
+
+async def _show_edit_task_panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    assignment_id: str,
+    notice: str = "",
+) -> None:
+    item = await asyncio.to_thread(get_assignment_by_id, assignment_id)
+    if not item or item.get("source") != "manual":
+        target = update.callback_query.message if update.callback_query else update.message
+        if target:
+            await target.reply_text("Only tasks you added yourself can be edited.")
+        _clear_edit_task(context.user_data)
+        return
+
+    context.user_data["edit_task"] = {
+        "assignment_id": assignment_id,
+        "step": None,
+    }
+    due_display = format_deadline(item.get("deadline_date"), item.get("deadline_text"))
+    cat_label = CATEGORY_LABELS.get(normalize_category(item.get("category")), "Other")
+    task = item.get("task") or item.get("summary") or "Untitled"
+    lines = []
+    if notice:
+        lines.append(notice)
+    lines.extend(
+        [
+            f"<b>Editing:</b> {html.escape(str(task))}",
+            f"Category: {html.escape(cat_label)}",
+            f"Due: {html.escape(due_display)}",
+            "",
+            "Tap a field to change it, or Done editing when finished.",
+        ]
+    )
+    text = "\n".join(lines)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode="HTML", reply_markup=_edit_task_keyboard()
+        )
+    elif update.message:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=_edit_task_keyboard())
+
+
+async def _begin_add_task_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    task: str | None = None,
+) -> None:
+    if not update.message:
+        return
+    if task:
+        context.user_data["add_task"] = {
+            "step": ADD_TASK_NEED_DEADLINE,
+            "task": task,
+            "deadline_text": None,
+            "category": None,
+        }
+        await update.message.reply_text(
+            f"Got it: <b>{html.escape(task)}</b>\nWhen is it due? (e.g. tomorrow 5pm)\n"
+            "Or tap No deadline.",
+            parse_mode="HTML",
+            reply_markup=_add_deadline_keyboard(),
+        )
+        return
+    context.user_data["add_task"] = {
+        "step": ADD_TASK_NEED_TASK,
+        "task": None,
+        "deadline_text": None,
+        "category": None,
+    }
+    await update.message.reply_text(
+        "What task do you want to track?\n\n"
+        "Tip: one-line shortcut — /add Submit report | tomorrow 5pm | deadline"
+    )
+
+
+async def _continue_add_task_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    state = _get_add_task(context.user_data)
+    if not state or not update.message:
+        return
+    step = state.get("step")
+    if step == ADD_TASK_NEED_TASK:
+        task = text.strip()
+        if not task:
+            await update.message.reply_text("Please describe the task.")
+            return
+        state["task"] = task
+        state["step"] = ADD_TASK_NEED_DEADLINE
+        context.user_data["add_task"] = state
+        await update.message.reply_text(
+            f"Got it: <b>{html.escape(task)}</b>\nWhen is it due? (e.g. tomorrow 5pm)\n"
+            "Or tap No deadline.",
+            parse_mode="HTML",
+            reply_markup=_add_deadline_keyboard(),
+        )
+        return
+    if step == ADD_TASK_NEED_DEADLINE:
+        state["deadline_text"] = text.strip()
+        state["step"] = "need_category"
+        context.user_data["add_task"] = state
+        await update.message.reply_text("Pick a category:", reply_markup=_category_keyboard(ADDTASK_CB))
+
+
+async def _continue_edit_task_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    state = _get_edit_task(context.user_data)
+    if not state or not update.message:
+        return
+    assignment_id = state.get("assignment_id")
+    step = state.get("step")
+    if not assignment_id or not step:
+        await update.message.reply_text("Tap a field on the edit panel, or /cancel.")
+        return
+
+    fields: dict[str, str | None] = {}
+    if step == EDIT_TASK_EDITING_TASK:
+        task = text.strip()
+        if not task:
+            await update.message.reply_text("Task text can't be empty.")
+            return
+        fields["task"] = task
+    elif step == EDIT_TASK_EDITING_DEADLINE:
+        lower = text.strip().lower()
+        if lower in {"none", "no deadline", "skip", "-"}:
+            fields["deadline_text"] = None
+        else:
+            fields["deadline_text"] = text.strip()
+    else:
+        await update.message.reply_text("Pick a category using the buttons below.")
+        return
+
+    updated = await asyncio.to_thread(update_assignment, str(assignment_id), fields)
+    if not updated:
+        await update.message.reply_text("Couldn't update that task.")
+        return
+    state["step"] = None
+    context.user_data["edit_task"] = state
+    await _show_edit_task_panel(update, context, assignment_id=str(assignment_id), notice="Updated.")
 
 
 def _strip_bot_mention(text: str, bot_username: str | None) -> str:
@@ -533,14 +837,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Morning digest (7:00 IST) and evening digest (20:00 IST) land here in your DM.\n"
         "Free text works here too — ask about deadlines, mail, or senders.\n\n"
         "Commands:\n"
-        "/due — open deadlines & tasks (priority first)\n"
-        "/done <n> — mark item #n from /due as complete\n"
+        "/due — upcoming deadlines & tasks (nearest first)\n"
+        "/missed — open items whose deadline has passed\n"
+        "/undated — open tasks with no due date\n"
+        "/add — add a task yourself (wizard or one-line shortcut)\n"
+        "/edit <n> — edit a task you added (from the last list)\n"
+        "/done <n> — mark item #n from the last list (/due, /missed, or /undated)\n"
         "/classes — today's classes for your section (tap to set it first time)\n"
         "/section — change or check your section\n"
         "/ask <question> — ask about deadlines, mails, senders, or email content\n"
         "Add #verify to any question for a fresh Gmail answer with cited sources\n"
         "/send — compose and send an email\n"
-        "/cancel — cancel an in-progress email draft only\n"
+        "/cancel — cancel an in-progress draft or task wizard\n"
         "/reset (or /new) — clear conversation context; discards any draft\n"
         "/status — last check times and system health\n\n"
         "Actionable alerts have Done / Snooze / Remind again buttons.\n"
@@ -600,6 +908,8 @@ async def quick_action_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await classes_command(update, context)
     elif label == "⏰ Due":
         await due_command(update, context)
+    elif label == "➕ Add":
+        await add_command(update, context)
     elif label == "✉️ Send":
         await send_command(update, context)
     elif label == "📋 Section":
@@ -611,10 +921,193 @@ async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
-    items = await asyncio.to_thread(get_open_assignments, category=category)
-    text, due_ids = _format_due_list(items, category)
-    context.user_data["due_items"] = due_ids
+    text, due_ids = await _fetch_assignment_list(category, source="due")
+    _store_assignment_list(context, due_ids, source="due")
     await reply_long(update.message, text, parse_mode="HTML")
+
+
+async def missed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+
+    category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
+    text, due_ids = await _fetch_assignment_list(category, source="missed")
+    _store_assignment_list(context, due_ids, source="missed")
+    await reply_long(update.message, text, parse_mode="HTML")
+
+
+async def undated_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+
+    category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
+    text, due_ids = await _fetch_assignment_list(category, source="undated")
+    _store_assignment_list(context, due_ids, source="undated")
+    await reply_long(update.message, text, parse_mode="HTML")
+
+
+async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+
+    args_text = " ".join(context.args).strip() if context.args else ""
+    if args_text:
+        parsed = _parse_add_one_line(args_text)
+        task = parsed.get("task") or ""
+        if not task:
+            await update.message.reply_text(
+                "Usage: /add Task name | deadline (optional) | category (optional)\n"
+                "Example: /add Submit report | tomorrow 5pm | deadline"
+            )
+            return
+        await _save_manual_task_message(
+            update,
+            context,
+            task=task,
+            deadline_text=parsed.get("deadline_text"),
+            category=parsed.get("category") or "other",
+        )
+        return
+
+    await _begin_add_task_flow(update, context)
+
+
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /edit <number> — use the number from your last /due, /missed, or /undated list"
+        )
+        return
+
+    try:
+        index = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /edit <number>")
+        return
+
+    due_ids: list[str] = context.user_data.get("due_items") or []
+    if not due_ids:
+        category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
+        list_source = context.user_data.get("due_items_source") or "due"
+        _, due_ids = await _fetch_assignment_list(category, source=list_source)
+        _store_assignment_list(context, due_ids, source=list_source)
+
+    if index < 1 or index > len(due_ids):
+        await update.message.reply_text(
+            f"No item #{index} in the last list. Run /due, /missed, or /undated first."
+        )
+        return
+
+    assignment_id = due_ids[index - 1]
+    item = await asyncio.to_thread(get_assignment_by_id, assignment_id)
+    if not item:
+        await update.message.reply_text("Couldn't find that item.")
+        return
+    if item.get("source") != "manual":
+        await update.message.reply_text(
+            "Only tasks you added yourself can be edited. Email-tracked items stay read-only."
+        )
+        return
+
+    await _show_edit_task_panel(update, context, assignment_id=assignment_id)
+
+
+async def addtask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.callback_query:
+        return
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    state = _get_add_task(context.user_data)
+    if not state:
+        await query.edit_message_text("Add-task flow expired. Run /add again.")
+        return
+
+    if data == f"{ADDTASK_CB}:nodeadline":
+        state["deadline_text"] = None
+        state["step"] = "need_category"
+        context.user_data["add_task"] = state
+        await query.edit_message_text("Pick a category:", reply_markup=_category_keyboard(ADDTASK_CB))
+        return
+
+    if data.startswith(f"{ADDTASK_CB}:cat:"):
+        category = data.split(":", 2)[2]
+        task = state.get("task") or ""
+        deadline_text = state.get("deadline_text")
+        row = await asyncio.to_thread(
+            create_manual_assignment,
+            task,
+            deadline_text=deadline_text,
+            category=category,
+        )
+        if not row:
+            await query.edit_message_text("Couldn't save that task. Try /add again.")
+            _clear_add_task(context.user_data)
+            return
+        _clear_add_task(context.user_data)
+        due_display = format_deadline(row.get("deadline_date"), row.get("deadline_text"))
+        cat_label = CATEGORY_LABELS.get(normalize_category(category), "Other")
+        await query.edit_message_text(
+            f"Added: <b>{html.escape(str(task))}</b>\n"
+            f"Category: {html.escape(cat_label)}\n"
+            f"Due: {html.escape(due_display)}",
+            parse_mode="HTML",
+        )
+
+
+async def edittask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.callback_query:
+        return
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    state = _get_edit_task(context.user_data)
+    if not state:
+        await query.edit_message_text("Edit flow expired. Run /edit <n> again.")
+        return
+
+    assignment_id = str(state.get("assignment_id") or "")
+    if not assignment_id:
+        await query.edit_message_text("Edit flow expired. Run /edit <n> again.")
+        return
+
+    if data == f"{EDITTASK_CB}:done":
+        _clear_edit_task(context.user_data)
+        await query.edit_message_text("Done editing.")
+        return
+
+    if data == f"{EDITTASK_CB}:field:task":
+        state["step"] = EDIT_TASK_EDITING_TASK
+        context.user_data["edit_task"] = state
+        await query.edit_message_text("Send the new task text:")
+        return
+
+    if data == f"{EDITTASK_CB}:field:deadline":
+        state["step"] = EDIT_TASK_EDITING_DEADLINE
+        context.user_data["edit_task"] = state
+        await query.edit_message_text(
+            "Send the new deadline (e.g. tomorrow 5pm), or type 'none' for no deadline:"
+        )
+        return
+
+    if data == f"{EDITTASK_CB}:field:category":
+        state["step"] = EDIT_TASK_EDITING_CATEGORY
+        context.user_data["edit_task"] = state
+        await query.edit_message_text("Pick a new category:", reply_markup=_category_keyboard(EDITTASK_CB))
+        return
+
+    if data.startswith(f"{EDITTASK_CB}:cat:"):
+        category = data.split(":", 2)[2]
+        updated = await asyncio.to_thread(update_assignment, assignment_id, {"category": category})
+        if not updated:
+            await query.edit_message_text("Couldn't update category.")
+            return
+        state["step"] = None
+        context.user_data["edit_task"] = state
+        await _show_edit_task_panel(update, context, assignment_id=assignment_id, notice="Category updated.")
 
 
 async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -671,11 +1164,11 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
+    list_source = context.user_data.get("due_items_source") or "due"
 
     if not context.args:
-        items = await asyncio.to_thread(get_open_assignments, category=category)
-        text, due_ids = _format_due_list(items, category)
-        context.user_data["due_items"] = due_ids
+        text, due_ids = await _fetch_assignment_list(category, source=list_source)
+        _store_assignment_list(context, due_ids, source=list_source)
         await reply_long(
             update.message,
             "Usage: /done <number>\n\n" + text,
@@ -686,19 +1179,17 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         index = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Usage: /done <number> — use the number from /due")
+        await update.message.reply_text("Usage: /done <number> — use the number from /due, /missed, or /undated")
         return
 
     due_ids: list[str] = context.user_data.get("due_items") or []
     if not due_ids:
-        items = await asyncio.to_thread(get_open_assignments, category=category)
-        _, due_ids = _format_due_list(items, category)
-        context.user_data["due_items"] = due_ids
+        text, due_ids = await _fetch_assignment_list(category, source=list_source)
+        _store_assignment_list(context, due_ids, source=list_source)
 
     if index < 1 or index > len(due_ids):
-        items = await asyncio.to_thread(get_open_assignments, category=category)
-        text, due_ids = _format_due_list(items, category)
-        context.user_data["due_items"] = due_ids
+        text, due_ids = await _fetch_assignment_list(category, source=list_source)
+        _store_assignment_list(context, due_ids, source=list_source)
         await reply_long(
             update.message,
             f"No item #{index}. Pick from the list:\n\n" + text,
@@ -757,6 +1248,8 @@ def _looks_like_compose_breakout(text: str) -> bool:
         return True
     if _is_due_list_question(text):
         return True
+    if _is_missed_list_question(text):
+        return True
     if any(
         m in q
         for m in (
@@ -783,6 +1276,7 @@ def _looks_like_compose_breakout(text: str) -> bool:
         INTENT_MAILBOX_QA,
         INTENT_SCHEDULE,
         INTENT_DUE_LIST,
+        INTENT_MISSED_LIST,
     }
 
 
@@ -1131,6 +1625,26 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await _continue_compose_flow(update, context, text)
             return
 
+    if _get_add_task(context.user_data):
+        text = update.message.text
+        if text.strip().lower() in _TASK_CANCEL_WORDS:
+            _clear_add_task(context.user_data)
+            await update.message.reply_text("Cancelled.")
+            return
+        await _continue_add_task_flow(update, context, text)
+        return
+
+    if _get_edit_task(context.user_data):
+        text = update.message.text
+        state = _get_edit_task(context.user_data)
+        if text.strip().lower() in _TASK_CANCEL_WORDS:
+            _clear_edit_task(context.user_data)
+            await update.message.reply_text("Edit cancelled.")
+            return
+        if state and state.get("step"):
+            await _continue_edit_task_flow(update, context, text)
+            return
+
     text = update.message.text
     bot_username = context.bot.username
     chat = update.effective_chat
@@ -1210,6 +1724,22 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         await due_command(update, context)
         remember_turn(context.user_data, user_text=question, intent="due_list", query=question)
+        return
+
+    if intent == INTENT_MISSED_LIST:
+        await missed_command(update, context)
+        remember_turn(context.user_data, user_text=question, intent="missed_list", query=question)
+        return
+
+    if intent == INTENT_UNDATED_LIST:
+        await undated_command(update, context)
+        remember_turn(context.user_data, user_text=question, intent="undated_list", query=question)
+        return
+
+    if intent == INTENT_ADD_TASK:
+        extracted = _extract_task_from_add_phrase(question)
+        await _begin_add_task_flow(update, context, task=extracted)
+        remember_turn(context.user_data, user_text=question, intent="add_task", query=question)
         return
 
     await _answer_chat_question(
@@ -1359,22 +1889,32 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update) or not update.message:
         return
-    if not _get_compose(context.user_data):
-        await update.message.reply_text("No compose in progress.")
+    cleared: list[str] = []
+    if _get_compose(context.user_data):
+        _clear_compose(context.user_data)
+        cleared.append("email draft")
+    if _get_add_task(context.user_data):
+        _clear_add_task(context.user_data)
+        cleared.append("add-task wizard")
+    if _get_edit_task(context.user_data):
+        _clear_edit_task(context.user_data)
+        cleared.append("edit flow")
+    if not cleared:
+        await update.message.reply_text("Nothing in progress to cancel.")
         return
-    _clear_compose(context.user_data)
-    await update.message.reply_text("Cancelled. Draft discarded.")
+    await update.message.reply_text(f"Cancelled {' and '.join(cleared)}.")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update) or not update.message:
         return
     had_compose = bool(_get_compose(context.user_data))
+    had_task_flow = bool(_get_add_task(context.user_data) or _get_edit_task(context.user_data))
     clear_convo(context.user_data)
     msg = "Context cleared. You can start a fresh topic — deadlines, mail lookup, or /send."
-    if had_compose:
+    if had_compose or had_task_flow:
         msg = (
-            "Context cleared (any in-progress draft was discarded). "
+            "Context cleared (any in-progress draft or task flow was discarded). "
             "Start fresh — deadlines, mail lookup, or /send."
         )
     await update.message.reply_text(msg)
@@ -1386,12 +1926,18 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("due", due_command))
     application.add_handler(CommandHandler("list", due_command))
+    application.add_handler(CommandHandler("missed", missed_command))
+    application.add_handler(CommandHandler("undated", undated_command))
+    application.add_handler(CommandHandler("add", add_command))
+    application.add_handler(CommandHandler("edit", edit_command))
     application.add_handler(CommandHandler("done", done_command))
     application.add_handler(CommandHandler("classes", classes_command))
     application.add_handler(CommandHandler("section", section_command))
     application.add_handler(CallbackQueryHandler(section_button, pattern=r"^section:"))
     application.add_handler(CallbackQueryHandler(clear_chat_button, pattern=f"^{CLEAR_CHAT_CB}$"))
     application.add_handler(CallbackQueryHandler(action_button, pattern=r"^act:"))
+    application.add_handler(CallbackQueryHandler(addtask_callback, pattern=r"^addtask:"))
+    application.add_handler(CallbackQueryHandler(edittask_callback, pattern=r"^edittask:"))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("send", send_command))
     application.add_handler(CommandHandler("cancel", cancel_command))

@@ -5,7 +5,7 @@ Recent conversation JSON is provided (may be empty). Use it to resolve follow-up
 
 Return ONLY strict JSON:
 {{
-  "intent": "compose|contact_lookup|mailbox_qa|schedule|due_list|smalltalk",
+  "intent": "compose|contact_lookup|mailbox_qa|schedule|due_list|missed_list|undated_list|add_task|smalltalk",
   "recipient": "email or person name for compose, or null",
   "person": "person name for lookup/retrieval, or null",
   "content": "draft body/instructions for compose if present in the message, or null",
@@ -18,7 +18,10 @@ Rules:
 - mailbox_qa: list/count/summarize emails FROM someone, what someone said, show mails, follow-ups
   about prior person's emails ("what were the mails", "send all mails from X" means list, not compose).
 - schedule: classes/timetable questions.
-- due_list: deadlines / what's due today/tomorrow.
+- due_list: upcoming deadlines / what's due today/tomorrow.
+- missed_list: overdue or missed deadlines the student still hasn't closed.
+- undated_list: open tasks with no due date / no resolvable deadline.
+- add_task: student wants to add or track a new personal task or deadline.
 - smalltalk: hi/hello with no real ask.
 - "send all mails from saleena" = mailbox_qa (retrieval), NOT compose.
 - Prefer compose only when the student is trying to outbound mail TO a recipient.

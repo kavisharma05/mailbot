@@ -51,12 +51,13 @@ def test_due_list_numbering_matches_sorted_ids():
 
 
 def test_due_list_truncation_footer():
+    base = datetime.now(timezone.utc) + timedelta(hours=1)
     items = [
         {
             "id": str(i),
             "category": "deadline",
             "task": f"Task {i}",
-            "deadline_date": None,
+            "deadline_date": (base + timedelta(hours=i)).isoformat(),
             "course_or_topic": "Course",
         }
         for i in range(25)
@@ -67,10 +68,11 @@ def test_due_list_truncation_footer():
 
 
 def test_handlers_due_list_wrapper():
-    items = [{"id": "x", "category": "deadline", "task": "Submit", "deadline_date": None}]
+    future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    items = [{"id": "x", "category": "deadline", "task": "Submit", "deadline_date": future}]
     text, ids = _format_due_list(items, "deadline")
     assert ids == ["x"]
-    assert "Deadline" in text
+    assert "Upcoming deadlines" in text
 
 
 def test_morning_digest_deduplicates_priority_and_due():

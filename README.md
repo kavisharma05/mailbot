@@ -214,8 +214,12 @@ Set manually in BotFather: `/setuserpic` → upload your Mailbot icon. Name/desc
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome + persistent quick-action buttons |
-| `/due` or `/list` | Show numbered open items for this chat's category |
-| `/done <n>` | Mark item #n from the last `/due` list as complete |
+| `/due` or `/list` | Show numbered upcoming open items for this chat's category |
+| `/missed` | Show numbered open items whose deadline has passed |
+| `/undated` | Show numbered open tasks with no resolvable due date |
+| `/add` | Add a task yourself (wizard, or `/add Task \| deadline \| category`) |
+| `/edit <n>` | Edit a self-added task from the last list |
+| `/done <n>` | Mark item #n from the last list as complete |
 | `/classes` | Today's classes with time and room (from timetable emails) |
 | `/section` | Change or check your class section |
 | `/status` | Last mail check, heartbeat, digests, pending reminders |
