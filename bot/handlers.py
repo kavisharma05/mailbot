@@ -21,7 +21,6 @@ from ai.assistant import (
     answer_question,
     infer_person_email,
     lookup_contact_email,
-    resolve_person_email_live,
     split_question_and_paste,
 )
 from ai.composer import compose_email
@@ -41,12 +40,10 @@ from ai.intent import (
 from config import get_settings
 from gmail_api.client import send_email
 from services.contacts import (
-    format_contact_lookup_answer,
+    backfill_contacts_from_inbox,
     name_tokens,
     normalize_name_key,
-    resolve_contact,
-    resolve_contact_email,
-    sender_matches_name,
+    resolve_email_robust,
     canonical_person_name,
 )
 from services.conversation import clear_convo, get_convo, remember_turn
@@ -1344,33 +1341,12 @@ async def _resolve_recipient_hint(
     text = recipient.strip()
     if "@" in text:
         return text.lower(), None
-    email = await asyncio.to_thread(resolve_contact_email, text)
+
+    email, _matches, note = await asyncio.to_thread(resolve_email_robust, text, convo=convo)
     if email:
         return email, None
-    matches = await asyncio.to_thread(resolve_contact, text)
-    if len(matches) == 1:
-        return matches[0].get("email"), None
-    if len(matches) > 1:
-        return None, await asyncio.to_thread(format_contact_lookup_answer, text, matches)
-
-    if convo:
-        last_email = convo.get("last_person_email")
-        last_person = convo.get("last_person")
-        if last_email and last_person:
-            if sender_matches_name(f"{last_person} <{last_email}>", text):
-                return last_email, None
-            req = normalize_name_key(text)
-            last = normalize_name_key(last_person)
-            if req and last and (
-                req in last
-                or last in req
-                or any(tok in last.split() for tok in name_tokens(text))
-            ):
-                return last_email, None
-
-    live = await asyncio.to_thread(resolve_person_email_live, text)
-    if live:
-        return live, None
+    if note:
+        return None, note
 
     return None, (
         f"I don't have an email for {text} yet. "
@@ -1692,7 +1668,7 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if intent == INTENT_CONTACT_LOOKUP:
         person = classified.get("person")
-        answer = await asyncio.to_thread(lookup_contact_email, person)
+        answer = await asyncio.to_thread(lookup_contact_email, person, convo=convo)
         await reply_long(update.message, answer)
         remember_turn(
             context.user_data,
@@ -1921,6 +1897,21 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(msg)
 
 
+async def backfill_contacts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One-time admin: populate contacts from recent inbox senders."""
+    if not _is_owner(update) or not update.message:
+        return
+    await update.message.reply_text("Scanning recent inbox to learn contacts…")
+    stats = await asyncio.to_thread(backfill_contacts_from_inbox)
+    if stats.get("error"):
+        await update.message.reply_text("Contact backfill failed. Check logs.")
+        return
+    await update.message.reply_text(
+        f"Done. Scanned {stats.get('scanned', 0)} messages; "
+        f"learned/updated {stats.get('upserted', 0)} contacts."
+    )
+
+
 def register_handlers(application) -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
@@ -1944,6 +1935,7 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CommandHandler("new", reset_command))
+    application.add_handler(CommandHandler("backfill_contacts", backfill_contacts_command))
     application.add_handler(
         CallbackQueryHandler(confirm_callback, pattern=f"^({APPROVE_CB}|{CANCEL_CB})$")
     )

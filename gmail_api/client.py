@@ -175,6 +175,8 @@ def list_message_summaries(
             "message_id": details.get("message_id"),
             "subject": details.get("subject"),
             "sender": details.get("sender"),
+            "to": details.get("to"),
+            "cc": details.get("cc"),
             "received_at": details.get("received_at"),
         }
         if include_body:
@@ -282,6 +284,8 @@ def get_message_details(message_id: str, *, load_attachments: bool = True) -> di
     headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
     subject = headers.get("subject", "(no subject)")
     sender = headers.get("from", "")
+    to_header = headers.get("to", "")
+    cc_header = headers.get("cc", "")
     body = _extract_text_from_payload(msg.get("payload", {}))
 
     received_at = ""
@@ -328,6 +332,8 @@ def get_message_details(message_id: str, *, load_attachments: bool = True) -> di
         "thread_id": msg.get("threadId", ""),
         "subject": subject,
         "sender": sender,
+        "to": to_header,
+        "cc": cc_header,
         "received_at": received_at,
         "received_at_iso": received_at_iso,
         "body": body[:8000],

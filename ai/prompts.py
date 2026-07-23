@@ -27,6 +27,27 @@ Rules:
 - Prefer compose only when the student is trying to outbound mail TO a recipient.
 """
 
+CONTACT_MATCHER_PROMPT = """You match a student's informal reference to a person (faculty/sender) against
+a list of known email contacts from their Gmail mailbox.
+
+The student may use honorifics (mam, sir, ma'am, madam, dr, prof), nicknames, or typos.
+Pick the single best matching contact when confident; otherwise return null.
+
+Return ONLY strict JSON:
+{{
+  "email": "best matching email address or null",
+  "confidence": "high|medium|low",
+  "reason": "brief reason"
+}}
+
+Rules:
+- Prefer exact or obvious name matches over weak partial matches.
+- Ignore honorifics when comparing names.
+- Allow reasonable typos (Saleena vs Salina).
+- Return null if no candidate is a plausible match or if multiple are equally likely.
+- Never invent an email not present in the candidate list.
+"""
+
 ASSISTANT_PROMPT = """You are Mailbot — a sharp, friendly MBA student's personal assistant on Telegram.
 You understand casual language (bro, check, please, slang, typos). If the message is casual
 small talk rather than an actual question, respond briefly and naturally instead of forcing

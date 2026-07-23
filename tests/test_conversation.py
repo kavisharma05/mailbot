@@ -1,12 +1,23 @@
 """Tests for conversation memory, intent routing, and contact resolution."""
 
+from unittest.mock import patch
+
+from ai.assistant import lookup_contact_email, resolve_person_email_live
 from ai.intent import (
     INTENT_COMPOSE,
     INTENT_CONTACT_LOOKUP,
     INTENT_MAILBOX_QA,
     classify_message,
 )
-from services.contacts import normalize_name_key, parse_sender, sender_matches_name
+from services.contacts import (
+    fuzzy_token_hit,
+    is_generic_person,
+    normalize_name_key,
+    parse_sender,
+    resolve_contact,
+    resolve_email_robust,
+    sender_matches_name,
+)
 from services.conversation import clear_convo, get_convo, remember_turn
 
 
@@ -35,6 +46,12 @@ def test_compose_with_content():
     assert result.get("content")
 
 
+def test_compose_rejects_generic_faculty_recipient():
+    result = classify_message("Can we upload a file here to send to a faculty")
+    assert result["intent"] == INTENT_COMPOSE
+    assert not result.get("recipient")
+
+
 def test_parse_sender_display_email():
     name, email = parse_sender('Dr. Santhi Perumal <santhi.perumal@imtnag.ac.in>')
     assert name == "Dr. Santhi Perumal"
@@ -52,9 +69,115 @@ def test_sender_matches_requested_name():
     )
 
 
+def test_sender_matches_with_typo():
+    assert sender_matches_name(
+        "Saleena Khan <saleena.khan@imtnag.ac.in>",
+        "Salina",
+    )
+
+
 def test_normalize_name_key_strips_honorifics():
     assert normalize_name_key("santhi mam") == "santhi"
     assert normalize_name_key("Dr. Saleena Khan") == "saleena khan"
+    assert normalize_name_key("Saleena ma'am") == "saleena"
+
+
+def test_is_generic_person():
+    assert is_generic_person("a faculty")
+    assert is_generic_person("the professor")
+    assert is_generic_person("faculty")
+    assert not is_generic_person("Saleena Khan")
+    assert not is_generic_person("saleena.khan@imtnag.ac.in")
+
+
+def test_fuzzy_token_hit():
+    assert fuzzy_token_hit("saleena", "salina khan")
+    assert fuzzy_token_hit("santhi", "santhi perumal")
+    assert not fuzzy_token_hit("saleena", "john smith")
+
+
+@patch("services.contacts.find_contacts_by_name")
+def test_resolve_contact_honorific_and_typo(mock_find):
+    mock_find.return_value = [
+        {
+            "email": "saleena.khan@imtnag.ac.in",
+            "display_name": "Saleena Khan",
+            "name_key": "saleena khan",
+            "message_count": 5,
+        }
+    ]
+    matches = resolve_contact("Saleena mam")
+    assert len(matches) == 1
+    assert matches[0]["email"] == "saleena.khan@imtnag.ac.in"
+
+    matches = resolve_contact("Salina")
+    assert len(matches) == 1
+
+
+@patch("ai.assistant.resolve_person_email_live")
+@patch("services.contacts.find_contacts_by_name", return_value=[])
+def test_lookup_contact_email_live_fallback(mock_find, mock_live):
+    mock_live.return_value = "saleena.khan@imtnag.ac.in"
+    answer = lookup_contact_email("Saleena")
+    assert "saleena.khan@imtnag.ac.in" in answer
+    mock_live.assert_called_once_with("Saleena")
+
+
+@patch("ai.assistant.llm_pick_contact")
+@patch("ai.assistant.resolve_person_email_live")
+@patch("services.contacts.find_contacts_by_name", return_value=[])
+def test_resolve_email_robust_live_then_llm(mock_find, mock_live, mock_llm):
+    mock_live.return_value = None
+    mock_llm.return_value = "saleena.khan@imtnag.ac.in"
+    mock_find.side_effect = [
+        [],
+        [
+            {
+                "email": "saleena.khan@imtnag.ac.in",
+                "display_name": "Saleena Khan",
+                "name_key": "saleena khan",
+                "message_count": 3,
+            }
+        ],
+    ]
+    email, _matches, note = resolve_email_robust("Salina Khan")
+    assert email == "saleena.khan@imtnag.ac.in"
+    assert note is None
+
+
+@patch("ai.assistant.list_message_summaries")
+@patch("services.contacts.find_contacts_by_name", return_value=[])
+def test_resolve_person_email_live_from_inbox(mock_find, mock_list):
+    mock_list.return_value = [
+        {
+            "sender": "Saleena Khan <saleena.khan@imtnag.ac.in>",
+            "to": "",
+            "cc": "",
+        }
+    ]
+    email = resolve_person_email_live("Saleena")
+    assert email == "saleena.khan@imtnag.ac.in"
+
+
+@patch("ai.assistant.list_message_summaries")
+@patch("services.contacts.find_contacts_by_name", return_value=[])
+def test_resolve_person_email_live_from_sent_to_header(mock_find, mock_list):
+    mock_list.return_value = [
+        {
+            "sender": "Student <student@imtnag.ac.in>",
+            "to": "Saleena Khan <saleena.khan@imtnag.ac.in>",
+            "cc": "",
+        }
+    ]
+    email = resolve_person_email_live("Saleena Khan")
+    assert email == "saleena.khan@imtnag.ac.in"
+
+
+def test_resolve_email_robust_generic_person():
+    email, matches, note = resolve_email_robust("a faculty")
+    assert email is None
+    assert matches == []
+    assert note == "Which faculty? Tell me their name or email."
 
 
 def test_conversation_memory_remember_turn():

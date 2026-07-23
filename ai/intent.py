@@ -9,7 +9,7 @@ from typing import Any
 
 from ai.client import call_json
 from ai.prompts import INTENT_PROMPT
-from services.contacts import canonical_person_name
+from services.contacts import canonical_person_name, is_generic_person
 from services.conversation import history_for_prompt, MAX_HISTORY
 
 logger = logging.getLogger(__name__)
@@ -108,7 +108,10 @@ def _extract_person_after_preposition(text: str, prep: str) -> str | None:
         if p.lower() not in {"the", "a", "an", "my", "your", "her", "his", "their"}
     ]
     joined = " ".join(parts) if parts else None
-    return canonical_person_name(joined) if joined else None
+    person = canonical_person_name(joined) if joined else None
+    if person and is_generic_person(person):
+        return None
+    return person
 
 
 def _extract_compose_content(text: str) -> str | None:
@@ -160,6 +163,8 @@ def _is_compose_intent(text: str) -> tuple[bool, str | None, str | None, str | N
         content = _extract_compose_content(text)
         if email and not recipient:
             recipient = email
+        if recipient and is_generic_person(recipient):
+            recipient = None
         return True, recipient or email, content, email
 
     # "mail X saying ..."
@@ -171,6 +176,8 @@ def _is_compose_intent(text: str) -> tuple[bool, str | None, str | None, str | N
     if m:
         recipient = m.group(1).strip(" .,?!")
         content = m.group(2).strip()
+        if recipient and is_generic_person(recipient):
+            recipient = None
         return True, recipient, content, email
 
     # bare "/send-like" follow-up content after recipient was given

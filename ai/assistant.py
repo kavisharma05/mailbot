@@ -5,7 +5,7 @@ from datetime import datetime, time, timedelta
 from typing import Any
 
 from ai.client import call_json, call_text, get_last_groq_error
-from ai.prompts import ASSISTANT_PROMPT, GMAIL_QUERY_PROMPT, VERIFIED_ASSISTANT_PROMPT
+from ai.prompts import ASSISTANT_PROMPT, CONTACT_MATCHER_PROMPT, GMAIL_QUERY_PROMPT, VERIFIED_ASSISTANT_PROMPT
 from config import get_settings
 from gmail_api.client import (
     count_messages,
@@ -15,11 +15,15 @@ from gmail_api.client import (
 )
 from services.contacts import (
     format_contact_lookup_answer,
+    is_generic_person,
     name_tokens,
     normalize_name_key,
+    parse_address_list,
     parse_sender,
+    recipient_matches_name,
     resolve_contact,
     resolve_contact_email,
+    resolve_email_robust,
     sender_matches_name,
     upsert_contact_from_sender,
 )
@@ -101,12 +105,82 @@ def _filter_emails_for_person(emails: list[dict[str, Any]], person: str | None) 
     return [m for m in emails if sender_matches_name(m.get("sender"), person)]
 
 
-def lookup_contact_email(person: str | None) -> str:
-    """Deterministic contact lookup answer."""
+def lookup_contact_email(person: str | None, *, convo: dict[str, Any] | None = None) -> str:
+    """Contact lookup with DB + live Gmail + LLM fallback."""
     if not person:
         return "Who should I look up? Try: what is santhi mam's email?"
-    matches = resolve_contact(person)
-    return format_contact_lookup_answer(person, matches)
+    email, matches, note = resolve_email_robust(person, convo=convo)
+    if email:
+        if matches:
+            return format_contact_lookup_answer(person, matches[:1])
+        return f"{person} — {email}"
+    if note:
+        return note
+    return format_contact_lookup_answer(person, matches or [])
+
+
+def llm_pick_contact(phrase: str, candidates: list[dict[str, Any]]) -> str | None:
+    """Use LLM to pick the best contact when fuzzy/DB matching is ambiguous."""
+    if not phrase or not candidates:
+        return None
+    payload = {
+        "phrase": phrase,
+        "candidates": [
+            {
+                "email": c.get("email"),
+                "display_name": c.get("display_name"),
+                "name_key": c.get("name_key"),
+                "message_count": c.get("message_count"),
+            }
+            for c in candidates[:10]
+        ],
+    }
+    try:
+        result = call_json(CONTACT_MATCHER_PROMPT, json.dumps(payload, default=str))
+    except Exception as exc:
+        logger.warning("llm_pick_contact failed: %s", exc)
+        return None
+    if not result:
+        return None
+    confidence = (result.get("confidence") or "").lower()
+    email = (result.get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        return None
+    if confidence not in {"high", "medium"}:
+        return None
+    candidate_emails = {(c.get("email") or "").lower() for c in candidates}
+    if email not in candidate_emails:
+        return None
+    display = next(
+        (c.get("display_name") for c in candidates if (c.get("email") or "").lower() == email),
+        phrase,
+    )
+    upsert_contact_from_sender(f"{display} <{email}>")
+    return email
+
+
+def _accumulate_person_emails_from_mail(
+    mail: dict[str, Any],
+    person: str,
+    email_counts: dict[str, int],
+    sender_fields: dict[str, str],
+) -> None:
+    """Count matching sender/recipient addresses from one mail summary."""
+    if sender_matches_name(mail.get("sender"), person):
+        _, addr = parse_sender(mail.get("sender"))
+        if addr:
+            email_counts[addr] = email_counts.get(addr, 0) + 1
+            sender_fields[addr] = mail.get("sender") or addr
+
+    for header_key in ("to", "cc"):
+        header = mail.get(header_key) or ""
+        if not header:
+            continue
+        for display, addr in parse_address_list(header):
+            field = f"{display or ''} <{addr}>" if display else addr
+            if sender_matches_name(field, person):
+                email_counts[addr] = email_counts.get(addr, 0) + 1
+                sender_fields[addr] = field
 
 
 def _email_from_mailbox_results(
@@ -134,8 +208,8 @@ def _email_from_mailbox_results(
 
 
 def resolve_person_email_live(person: str | None) -> str | None:
-    """Find sender email via live Gmail when contacts DB has no match."""
-    if not person:
+    """Find sender/recipient email via live Gmail when contacts DB has no match."""
+    if not person or is_generic_person(person):
         return None
     text = person.strip()
     if "@" in text:
@@ -150,12 +224,16 @@ def resolve_person_email_live(person: str | None) -> str | None:
         upsert_contact_from_sender(f"{text} <{known}>")
         return known
 
+    lookback = "365d"
     queries: list[str] = []
     if from_clause:
-        queries.append(f"{from_clause} newer_than:90d")
+        queries.append(f"{from_clause} newer_than:{lookback}")
     parts = text.split()
     if parts:
-        queries.append(f"from:({parts[-1]}) newer_than:90d")
+        queries.append(f"from:({parts[-1]}) newer_than:{lookback}")
+        queries.append(f'to:({parts[-1]}) in:sent newer_than:{lookback}')
+    queries.append(f'to:("{text}") in:sent newer_than:{lookback}')
+    queries.append(f'"{text}" newer_than:{lookback}')
 
     email_counts: dict[str, int] = {}
     sender_fields: dict[str, str] = {}
@@ -165,23 +243,31 @@ def resolve_person_email_live(person: str | None) -> str | None:
             continue
         seen_queries.add(query)
         try:
-            batch = list_message_summaries(query, max_results=15, include_body=False)
+            batch = list_message_summaries(query, max_results=20, include_body=False)
         except Exception as exc:
             logger.warning("resolve_person_email_live search failed for %r: %s", query, exc)
             continue
         for mail in batch:
-            if not sender_matches_name(mail.get("sender"), text):
-                continue
-            _, addr = parse_sender(mail.get("sender"))
-            if not addr:
-                continue
-            email_counts[addr] = email_counts.get(addr, 0) + 1
-            sender_fields[addr] = mail.get("sender") or addr
+            _accumulate_person_emails_from_mail(mail, text, email_counts, sender_fields)
         if email_counts:
             break
 
     if not email_counts:
         return None
+
+    if len(email_counts) > 1:
+        candidates = [
+            {
+                "email": addr,
+                "display_name": parse_sender(sender_fields.get(addr, addr))[0],
+                "name_key": normalize_name_key(parse_sender(sender_fields.get(addr, addr))[0]),
+                "message_count": email_counts[addr],
+            }
+            for addr in email_counts
+        ]
+        llm_email = llm_pick_contact(text, candidates)
+        if llm_email:
+            return llm_email
 
     best = max(email_counts, key=lambda e: email_counts[e])
     upsert_contact_from_sender(sender_fields.get(best, best))
