@@ -77,7 +77,10 @@ async def send_actionable_alert(
         caption_prefix=caption_prefix,
     )
     if not attach_ok:
-        return None
+        logger.warning(
+            "send_actionable_alert to %s: text delivered but attachment forwarding failed",
+            chat_id,
+        )
     return sent_id
 
 

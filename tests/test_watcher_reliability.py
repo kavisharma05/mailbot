@@ -435,3 +435,122 @@ def test_process_message_skips_own_sent_mail():
         mock_category.assert_not_called()
 
     asyncio.run(_run())
+
+
+def test_partial_delivery_retry_skips_owner_resend():
+    """When owner DM succeeds but category alert fails, retry must not re-send owner DM."""
+    cached = {
+        "is_actionable": True,
+        "confidence": "high",
+        "category": "deadline",
+        "task": "Submit report",
+        "summary": "Due soon",
+        "deadline_date": "2026-07-30T23:59:59+05:30",
+    }
+    details = {
+        "message_id": "msg-1",
+        "thread_id": "t-1",
+        "subject": "Test",
+        "sender": "Office <office@imtnag.ac.in>",
+        "body": "Body",
+        "received_at_iso": "2026-07-23T10:00:00+00:00",
+        "attachments": [],
+        "attachment_text": "",
+    }
+
+    async def _run_first_attempt():
+        with (
+            patch("services.watcher.get_pending_email", return_value=None),
+            patch("services.watcher.get_message_details", return_value=details),
+            patch("services.watcher.upsert_contact_from_sender"),
+            patch("services.watcher.annotate_attachment_intents", return_value=[]),
+            patch("services.watcher.classify_email", return_value=cached),
+            patch("services.watcher.dequeue_pending_email"),
+            patch("services.watcher.get_settings") as mock_settings,
+            patch("services.watcher.is_trusted_schedule_sender", return_value=False),
+            patch("services.watcher.insert_assignment", return_value={"id": "assign-1"}),
+            patch("services.watcher.schedule_deadline_reminders"),
+            patch("services.watcher.send_owner_update", new=AsyncMock(return_value=True)) as mock_owner,
+            patch("services.watcher.send_category_alert", new=AsyncMock(return_value=False)) as mock_category,
+            patch("services.watcher.enqueue_pending_email") as mock_enqueue,
+            patch("services.watcher.mark_email_processed") as mock_mark,
+        ):
+            mock_settings.return_value.owner_dm_all_mail = False
+            mock_settings.return_value.telegram_owner_chat_id = "123"
+            mock_settings.return_value.telegram_chat_deadlines = "456"
+
+            outcome = await _process_message("msg-1", bot=object())
+
+        assert outcome["transient"] is True
+        mock_owner.assert_called_once()
+        mock_category.assert_called_once()
+        mock_mark.assert_not_called()
+        assert mock_enqueue.call_args.kwargs["delivered_channels"]["owner"] is True
+        assert "category" not in mock_enqueue.call_args.kwargs["delivered_channels"]
+
+    async def _run_retry():
+        with (
+            patch(
+                "services.watcher.get_pending_email",
+                return_value={
+                    "last_error": "alert_delivery_failed",
+                    "classified_result": cached,
+                    "already_alerted": False,
+                    "dead_letter": False,
+                    "delivered_channels": {"owner": True},
+                },
+            ),
+            patch("services.watcher.get_message_details", return_value=details),
+            patch("services.watcher.upsert_contact_from_sender"),
+            patch("services.watcher.annotate_attachment_intents", return_value=[]),
+            patch("services.watcher.classify_email") as mock_classify,
+            patch("services.watcher.dequeue_pending_email"),
+            patch("services.watcher.get_settings") as mock_settings,
+            patch("services.watcher.is_trusted_schedule_sender", return_value=False),
+            patch("services.watcher.insert_assignment", return_value={"id": "assign-1"}),
+            patch("services.watcher.schedule_deadline_reminders"),
+            patch("services.watcher.send_owner_update", new=AsyncMock(return_value=True)) as mock_owner,
+            patch("services.watcher.send_category_alert", new=AsyncMock(return_value=True)) as mock_category,
+            patch("services.watcher.mark_email_processed", return_value=True),
+        ):
+            mock_settings.return_value.owner_dm_all_mail = False
+            mock_settings.return_value.telegram_owner_chat_id = "123"
+            mock_settings.return_value.telegram_chat_deadlines = "456"
+
+            outcome = await _process_message("msg-1", bot=object())
+
+        assert outcome["processed"] == 1
+        mock_classify.assert_not_called()
+        mock_owner.assert_not_called()
+        mock_category.assert_called_once()
+
+    async def _run():
+        await _run_first_attempt()
+        await _run_retry()
+
+    asyncio.run(_run())
+
+
+def test_send_actionable_alert_returns_id_when_attachments_fail():
+    async def _run():
+        from services.alert_delivery import send_actionable_alert
+
+        bot = MagicMock()
+        sent_msg = MagicMock(message_id=42)
+        bot.send_message = AsyncMock(return_value=sent_msg)
+
+        with patch(
+            "services.alert_delivery.deliver_attachments",
+            new=AsyncMock(return_value=False),
+        ):
+            msg_id = await send_actionable_alert(
+                bot,
+                "123",
+                "<b>Alert</b>",
+                assignment_id="assign-1",
+                attachments=[{"filename": "doc.pdf", "data": b"x", "forward": True, "intent": "reading"}],
+            )
+
+        assert msg_id == 42
+
+    asyncio.run(_run())

@@ -540,12 +540,15 @@ def enqueue_pending_email(
     *,
     classified_result: dict[str, Any] | None = None,
     already_alerted: bool = False,
+    delivered_channels: dict[str, Any] | None = None,
 ) -> None:
     try:
         db = get_db()
         existing = (
             db.table("pending_emails")
-            .select("message_id, attempts, dead_letter, already_alerted, classified_result")
+            .select(
+                "message_id, attempts, dead_letter, already_alerted, classified_result, delivered_channels"
+            )
             .eq("message_id", message_id)
             .limit(1)
             .execute()
@@ -565,6 +568,10 @@ def enqueue_pending_email(
                 payload["classified_result"] = classified_result
             if already_alerted or rows[0].get("already_alerted"):
                 payload["already_alerted"] = True
+            if delivered_channels is not None:
+                merged = dict(rows[0].get("delivered_channels") or {})
+                merged.update(delivered_channels)
+                payload["delivered_channels"] = merged
             if attempts >= MAX_PENDING_EMAIL_ATTEMPTS:
                 payload["dead_letter"] = True
                 logger.error(
@@ -582,6 +589,7 @@ def enqueue_pending_email(
                     "dead_letter": False,
                     "classified_result": classified_result,
                     "already_alerted": already_alerted,
+                    "delivered_channels": delivered_channels or {},
                 }
             ).execute()
     except Exception as exc:
@@ -624,7 +632,7 @@ def get_pending_email(message_id: str) -> dict[str, Any] | None:
     result = (
         db.table("pending_emails")
         .select(
-            "message_id, attempts, last_error, dead_letter, classified_result, already_alerted"
+            "message_id, attempts, last_error, dead_letter, classified_result, already_alerted, delivered_channels"
         )
         .eq("message_id", message_id)
         .limit(1)

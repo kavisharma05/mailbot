@@ -345,6 +345,9 @@ async def _process_message(
     attachment_text = details.get("attachment_text") or ""
 
     already_alerted = bool((pending_row or {}).get("already_alerted"))
+    delivered: dict[str, bool] = dict((pending_row or {}).get("delivered_channels") or {})
+    if already_alerted:
+        delivered = {"owner": True, "category": True, "schedule": True}
     cached_result = None
     if pending_row and pending_row.get("last_error") in _REUSE_CLASSIFICATION_ERRORS:
         cached_result = pending_row.get("classified_result")
@@ -381,7 +384,6 @@ async def _process_message(
     sender = result.get("sender") or details.get("sender")
     summary = result.get("summary")
     delivery_ok = True
-    skip_alerts = already_alerted
 
     owner_text = format_incoming_mail_message(
         subject=details.get("subject"),
@@ -407,7 +409,8 @@ async def _process_message(
             message_id,
             error,
             classified_result=result,
-            already_alerted=skip_alerts or error == "mark_failed",
+            already_alerted=already_alerted or error == "mark_failed",
+            delivered_channels=delivered,
         )
         return {"processed": 0, "alerts": 0, "transient": True}
 
@@ -443,30 +446,34 @@ async def _process_message(
                 sessions,
                 gmail_message_id=message_id,
             )
-            if not skip_alerts:
-                if _should_owner_dm(
-                    settings,
-                    is_actionable=is_actionable,
-                    category=category,
-                    task=result.get("task"),
-                    summary=summary,
-                ):
-                    owner_sent = await send_owner_update(
-                        bot,
-                        settings.telegram_owner_chat_id,
-                        owner_text,
-                        attachments=attachments if is_actionable else None,
-                        pin=pin_owner,
-                    )
-                    if not owner_sent:
-                        delivery_ok = False
+            if not delivered.get("owner") and _should_owner_dm(
+                settings,
+                is_actionable=is_actionable,
+                category=category,
+                task=result.get("task"),
+                summary=summary,
+            ):
+                owner_sent = await send_owner_update(
+                    bot,
+                    settings.telegram_owner_chat_id,
+                    owner_text,
+                    attachments=attachments if is_actionable else None,
+                    pin=pin_owner,
+                )
+                if owner_sent:
+                    delivered["owner"] = True
+                else:
+                    delivery_ok = False
+            if not delivered.get("schedule"):
                 schedule_sent = await share_schedule(
                     bot,
                     sessions=stored or sessions,
                     summary=summary,
                     attachments=attachments,
                 )
-                if not schedule_sent:
+                if schedule_sent:
+                    delivered["schedule"] = True
+                else:
                     delivery_ok = False
             alerts = 1
             if is_actionable and confidence in ("high", "medium"):
@@ -480,7 +487,7 @@ async def _process_message(
                 )
                 if assignment:
                     assignment_id = assignment["id"]
-                elif not skip_alerts:
+                elif not already_alerted:
                     return await _fail_delivery(error="assignment_insert_failed")
             if not delivery_ok:
                 return await _fail_delivery()
@@ -489,20 +496,26 @@ async def _process_message(
                 return finalize
             return {"processed": 1, "alerts": alerts}
 
-    if not skip_alerts and _should_owner_dm(
-        settings,
-        is_actionable=is_actionable,
-        category=category,
-        task=result.get("task"),
-        summary=summary,
-    ) and not is_actionable:
+    if (
+        not delivered.get("owner")
+        and _should_owner_dm(
+            settings,
+            is_actionable=is_actionable,
+            category=category,
+            task=result.get("task"),
+            summary=summary,
+        )
+        and not is_actionable
+    ):
         owner_sent = await send_owner_update(
             bot,
             settings.telegram_owner_chat_id,
             owner_text,
             pin=pin_owner,
         )
-        if not owner_sent:
+        if owner_sent:
+            delivered["owner"] = True
+        else:
             delivery_ok = False
 
     if is_actionable:
@@ -513,15 +526,19 @@ async def _process_message(
         if assignment:
             assignment_id = assignment["id"]
             await asyncio.to_thread(schedule_deadline_reminders, assignment)
-        elif not skip_alerts:
+        elif not already_alerted:
             return await _fail_delivery(error="assignment_insert_failed")
 
-        if not skip_alerts and assignment_id and _should_owner_dm(
-            settings,
-            is_actionable=True,
-            category=category,
-            task=result.get("task"),
-            summary=summary,
+        if (
+            assignment_id
+            and not delivered.get("owner")
+            and _should_owner_dm(
+                settings,
+                is_actionable=True,
+                category=category,
+                task=result.get("task"),
+                summary=summary,
+            )
         ):
             owner_sent = await send_owner_update(
                 bot,
@@ -531,11 +548,17 @@ async def _process_message(
                 attachments=attachments,
                 pin=pin_owner,
             )
-            if not owner_sent:
+            if owner_sent:
+                delivered["owner"] = True
+            else:
                 delivery_ok = False
 
-        if not skip_alerts and assignment_id and _should_alert(
-            confidence, deadline_date, skip_past_deadlines=skip_past_deadlines
+        if (
+            assignment_id
+            and not delivered.get("category")
+            and _should_alert(
+                confidence, deadline_date, skip_past_deadlines=skip_past_deadlines
+            )
         ):
             category_sent = await send_category_alert(
                 bot,
@@ -550,10 +573,11 @@ async def _process_message(
                 subject=details.get("subject"),
                 attachments=attachments,
             )
-            if not category_sent:
-                delivery_ok = False
-            else:
+            if category_sent:
+                delivered["category"] = True
                 alerts = 1
+            else:
+                delivery_ok = False
     elif confidence == "low":
         await asyncio.to_thread(
             log_low_confidence,
