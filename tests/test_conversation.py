@@ -68,7 +68,7 @@ def test_conversation_memory_remember_turn():
         query="mails from saleena mam",
     )
     convo = get_convo(user_data)
-    assert convo["last_person"] == "saleena mam"
+    assert convo["last_person"] == "saleena"
     assert convo["last_query"] == "mails from saleena mam"
     assert len(convo["history"]) == 2
 

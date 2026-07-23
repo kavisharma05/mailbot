@@ -23,6 +23,9 @@ from services.watcher import (
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+# Avoid logging full Telegram API URLs (token in path) from PTB/httpx at INFO.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 ptb_app = build_telegram_application()

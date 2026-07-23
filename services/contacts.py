@@ -45,6 +45,32 @@ def name_tokens(name: str | None) -> list[str]:
     return [t for t in key.split() if len(t) >= 2]
 
 
+def canonical_person_name(name: str | None) -> str | None:
+    """Normalize a casual person reference to a stable key (no honorifics/titles)."""
+    if not name:
+        return None
+    text = name.strip()
+    if not text:
+        return None
+    if "@" in text:
+        return text.lower()
+    key = normalize_name_key(text)
+    return key or None
+
+
+def _gather_contact_rows(tokens: list[str]) -> list[dict[str, Any]]:
+    """Union contact rows matching any name token, deduped by email."""
+    seen_emails: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for token in tokens:
+        for row in find_contacts_by_name(token):
+            email = (row.get("email") or "").lower()
+            if email and email not in seen_emails:
+                seen_emails.add(email)
+                rows.append(row)
+    return rows
+
+
 def sender_matches_name(sender_field: str | None, requested_name: str | None) -> bool:
     """True when sender display/email tokens overlap the requested person name."""
     if not requested_name:
@@ -100,7 +126,7 @@ def resolve_contact(name: str | None, *, min_score: float = 0.5) -> list[dict[st
     tokens = name_tokens(name)
     if not tokens:
         return []
-    rows = find_contacts_by_name(tokens[0])
+    rows = _gather_contact_rows(tokens)
     scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
         score = _score_contact(row, tokens)

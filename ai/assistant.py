@@ -15,11 +15,15 @@ from gmail_api.client import (
 )
 from services.contacts import (
     format_contact_lookup_answer,
+    name_tokens,
+    normalize_name_key,
     parse_sender,
     resolve_contact,
     resolve_contact_email,
     sender_matches_name,
+    upsert_contact_from_sender,
 )
+from services.conversation import history_for_prompt, MAX_HISTORY
 from services.timeutil import (
     IST,
     format_deadline_display,
@@ -100,6 +104,169 @@ def lookup_contact_email(person: str | None) -> str:
         return "Who should I look up? Try: what is santhi mam's email?"
     matches = resolve_contact(person)
     return format_contact_lookup_answer(person, matches)
+
+
+def _email_from_mailbox_results(
+    person: str | None,
+    emails: list[dict[str, Any]] | None,
+) -> str | None:
+    """Pick the most common sender email from Gmail results matching person."""
+    if not person or not emails:
+        return None
+    counts: dict[str, int] = {}
+    senders: dict[str, str] = {}
+    for mail in emails:
+        if not sender_matches_name(mail.get("sender"), person):
+            continue
+        _, addr = parse_sender(mail.get("sender"))
+        if not addr:
+            continue
+        counts[addr] = counts.get(addr, 0) + 1
+        senders[addr] = mail.get("sender") or addr
+    if not counts:
+        return None
+    best = max(counts, key=lambda e: counts[e])
+    upsert_contact_from_sender(senders.get(best, best))
+    return best
+
+
+def resolve_person_email_live(person: str | None) -> str | None:
+    """Find sender email via live Gmail when contacts DB has no match."""
+    if not person:
+        return None
+    text = person.strip()
+    if "@" in text:
+        return text.lower()
+
+    email = resolve_contact_email(text)
+    if email:
+        return email
+
+    from_clause, known = _person_to_gmail_from(text)
+    if known:
+        upsert_contact_from_sender(f"{text} <{known}>")
+        return known
+
+    queries: list[str] = []
+    if from_clause:
+        queries.append(f"{from_clause} newer_than:90d")
+    parts = text.split()
+    if parts:
+        queries.append(f"from:({parts[-1]}) newer_than:90d")
+
+    email_counts: dict[str, int] = {}
+    sender_fields: dict[str, str] = {}
+    seen_queries: set[str] = set()
+    for query in queries:
+        if query in seen_queries:
+            continue
+        seen_queries.add(query)
+        try:
+            batch = list_message_summaries(query, max_results=15, include_body=False)
+        except Exception as exc:
+            logger.warning("resolve_person_email_live search failed for %r: %s", query, exc)
+            continue
+        for mail in batch:
+            if not sender_matches_name(mail.get("sender"), text):
+                continue
+            _, addr = parse_sender(mail.get("sender"))
+            if not addr:
+                continue
+            email_counts[addr] = email_counts.get(addr, 0) + 1
+            sender_fields[addr] = mail.get("sender") or addr
+        if email_counts:
+            break
+
+    if not email_counts:
+        return None
+
+    best = max(email_counts, key=lambda e: email_counts[e])
+    upsert_contact_from_sender(sender_fields.get(best, best))
+    return best
+
+
+def infer_person_email(
+    person: str | None,
+    *,
+    stats: dict[str, Any] | None = None,
+    emails: list[dict[str, Any]] | None = None,
+    convo: dict[str, Any] | None = None,
+) -> str | None:
+    """Best-effort email for a person: contacts, mailbox context, memory, live Gmail."""
+    if not person:
+        return (convo or {}).get("last_person_email")
+
+    text = person.strip()
+    if "@" in text:
+        return text.lower()
+
+    email = resolve_contact_email(text)
+    if email:
+        return email
+
+    if stats and stats.get("resolved_email"):
+        return stats["resolved_email"]
+
+    mailbox_email = _email_from_mailbox_results(text, emails)
+    if mailbox_email:
+        return mailbox_email
+
+    if convo:
+        last_email = convo.get("last_person_email")
+        last_person = convo.get("last_person")
+        if last_email and last_person:
+            hay = normalize_name_key(last_person)
+            req = normalize_name_key(text)
+            if req and (req in hay or hay in req or any(t in hay.split() for t in name_tokens(text))):
+                return last_email
+
+    return resolve_person_email_live(text)
+
+
+def _is_date_time_question(question: str) -> bool:
+    """True for basic date/day/time questions — not deadline or mail queries."""
+    q = question.lower().strip()
+    if any(
+        w in q
+        for w in (
+            "deadline",
+            "due",
+            "submit",
+            "assignment",
+            "task",
+            "mail",
+            "email",
+            "inbox",
+            "class",
+            "schedule",
+        )
+    ):
+        return False
+    patterns = (
+        r"what(?:'s| is)\s+(?:the\s+)?(?:date|day|time)\b",
+        r"what(?:'s| is)\s+today\b",
+        r"what\s+day\s+is\s+(?:it|today)",
+        r"what\s+date\s+is\s+(?:it|today)",
+        r"today(?:'s)?\s+(?:date|day)\b",
+        r"current\s+(?:date|time|day)\b",
+        r"what\s+time\s+is\s+it\b",
+        r"^date\s+today\b",
+        r"^time\s+now\b",
+    )
+    return any(re.search(p, q) for p in patterns)
+
+
+def _deterministic_date_time_answer(question: str) -> str:
+    ref = now_ist()
+    q = question.lower()
+    if re.search(r"\btime\b", q) and not re.search(r"\b(?:date|day)\b", q):
+        return f"It's {ref.strftime('%I:%M %p IST')} ({ref.strftime('%H:%M')} IST)."
+    if re.search(r"\bday\b", q) and not re.search(r"\b(?:date|time)\b", q):
+        return f"Today is {ref.strftime('%A, %d %B %Y')} (IST)."
+    return (
+        f"Today is {ref.strftime('%A, %d %B %Y')} (IST). "
+        f"Current time: {ref.strftime('%I:%M %p IST')}."
+    )
 
 
 def _looks_like_pasted_email(text: str) -> bool:
@@ -561,6 +728,8 @@ def _gather_mailbox_context(
         "resolved_email": resolve_contact_email(person) if person and "@" not in person else person,
     }
     emails = _filter_emails_for_person(emails, person)
+    if person and not stats.get("resolved_email"):
+        stats["resolved_email"] = _email_from_mailbox_results(person, emails)
     if person and not emails and seen:
         stats["person_no_match"] = True
         stats["listed"] = 0
@@ -943,6 +1112,7 @@ def _build_user_prompt(
             "last_person_email": convo.get("last_person_email"),
             "last_query": convo.get("last_query"),
             "last_intent": convo.get("last_intent"),
+            "recent_history": history_for_prompt(convo, limit=MAX_HISTORY),
         }
         parts.append(f"Conversation memory (JSON):\n{json.dumps(convo_ctx, default=str)}")
         parts.append("")
@@ -1151,6 +1321,9 @@ def answer_question(
     today = today_ist().isoformat()
     now_str = ref.strftime("%Y-%m-%d %H:%M %Z")
 
+    if _is_date_time_question(question):
+        return _deterministic_date_time_answer(question)
+
     if verified:
         system = VERIFIED_ASSISTANT_PROMPT.format(
             today=today, now=now_str, student_name=get_settings().student_name
@@ -1220,13 +1393,15 @@ def answer_question(
     if _asks_undated_tasks(question):
         return _deterministic_undated_answer(items)
 
+    q_lower = question.lower()
     if _is_due_list_question(question) or any(
-        w in question.lower() for w in ("deadline", "due", "pending", "today", "tomorrow")
+        w in q_lower for w in ("deadline", "due", "pending", "today", "tomorrow")
     ):
-        deterministic = _deterministic_deadline_answer(question, items)
-        if deterministic:
-            note = "\n\n(Offline format — tracked items from your DB.)"
-            return deterministic + note
+        if not _is_date_time_question(question):
+            deterministic = _deterministic_deadline_answer(question, items)
+            if deterministic:
+                note = "\n\n(Offline format — tracked items from your DB.)"
+                return deterministic + note
 
     if stats is not None or (
         scan_gmail and any(w in question.lower() for w in ("mail", "email", "from ", "inbox", "whom"))

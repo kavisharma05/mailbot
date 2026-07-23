@@ -15,9 +15,12 @@ from telegram.ext import (
 )
 
 from ai.assistant import (
+    _extract_person_query,
     _is_due_list_question,
     answer_question,
+    infer_person_email,
     lookup_contact_email,
+    resolve_person_email_live,
     split_question_and_paste,
 )
 from ai.composer import compose_email
@@ -33,7 +36,15 @@ from ai.intent import (
 )
 from config import get_settings
 from gmail_api.client import send_email
-from services.contacts import format_contact_lookup_answer, resolve_contact, resolve_contact_email
+from services.contacts import (
+    format_contact_lookup_answer,
+    name_tokens,
+    normalize_name_key,
+    resolve_contact,
+    resolve_contact_email,
+    sender_matches_name,
+    canonical_person_name,
+)
 from services.conversation import clear_convo, get_convo, remember_turn
 from services.alert_actions import (
     ACT_DISMISS,
@@ -672,6 +683,12 @@ _COMPOSE_CANCEL_WORDS = frozenset({"cancel", "stop", "discard", "abort", "/cance
 def _looks_like_compose_breakout(text: str) -> bool:
     """True when free text during compose is clearly not part of drafting."""
     q = text.lower().strip()
+    if _looks_like_recipient_only_message(text):
+        return False
+    if re.search(r"\b(?:received\s+)?(?:mail|email)s?\s+from\b", q):
+        return False
+    if re.search(r"\b(?:send|sending|sent)\s+(?:her|him|them)\s+(?:a\s+)?(?:mail|email)\b", q):
+        return False
     if any(m in q for m in SCHEDULE_KEYWORDS):
         return True
     if _is_due_list_question(text):
@@ -684,7 +701,6 @@ def _looks_like_compose_breakout(text: str) -> bool:
             "what's his email",
             "what is his email",
             "what did ",
-            " from ",
             "when is",
             "when's",
             "what's the deadline",
@@ -693,6 +709,10 @@ def _looks_like_compose_breakout(text: str) -> bool:
         )
     ):
         return True
+    if re.search(r"\b(?:all\s+)?(?:mails?|emails?)\s+from\b", q):
+        return True
+    if re.search(r"\b(?:show|list|how many|count)\b.+\b(?:mail|email)", q):
+        return True
     classified = classify_message(text, None)
     return classified.get("intent") in {
         INTENT_CONTACT_LOOKUP,
@@ -700,6 +720,52 @@ def _looks_like_compose_breakout(text: str) -> bool:
         INTENT_SCHEDULE,
         INTENT_DUE_LIST,
     }
+
+
+def _is_compose_recipient_reply(
+    text: str,
+    convo: dict | None,
+    compose: dict | None,
+) -> bool:
+    """During compose, treat person/email clarifications as recipient input."""
+    if not compose:
+        return False
+    step = compose.get("step")
+    if step not in (COMPOSE_NEED_CONTENT, COMPOSE_NEED_RECIPIENT):
+        return False
+    if "@" in text:
+        return True
+    q = text.lower()
+    if re.search(r"\b(?:received\s+)?(?:mail|email)s?\s+from\b", q):
+        return True
+    if re.search(r"\b(?:from|to)\s+[a-z]", q) and not re.search(
+        r"\b(?:send|write|draft|compose|reply)\b.+\bto\b", q, re.I
+    ):
+        return True
+    if convo and convo.get("last_person"):
+        person = convo["last_person"]
+        if any(tok in q for tok in name_tokens(person)):
+            return True
+        req = normalize_name_key(text)
+        last = normalize_name_key(person)
+        if req and last and (req in last or last in req):
+            return True
+    return False
+
+
+def _looks_like_recipient_only_message(text: str) -> bool:
+    """True when the message clarifies who to email, not what to say."""
+    q = text.lower().strip()
+    if "@" in text:
+        return False
+    content_markers = ("saying", "that ", "please ", "request", "ask ", "tell ", "inform ")
+    if any(m in q for m in content_markers) and len(q.split()) > 6:
+        return False
+    return bool(
+        re.search(r"\b(?:received\s+)?(?:mail|email)s?\s+from\b", q)
+        or re.search(r"\b(?:we|i)\s+(?:have|got|received)\b", q)
+        or re.search(r"\b(?:her|his|their)\s+(?:mail|email)\b", q)
+    )
 
 
 def _compose_keyboard() -> InlineKeyboardMarkup:
@@ -713,7 +779,10 @@ def _compose_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def _resolve_recipient_hint(recipient: str | None) -> tuple[str | None, str | None]:
+async def _resolve_recipient_hint(
+    recipient: str | None,
+    convo: dict | None = None,
+) -> tuple[str | None, str | None]:
     """Return (email, disambiguation_message)."""
     if not recipient:
         return None, None
@@ -728,6 +797,26 @@ async def _resolve_recipient_hint(recipient: str | None) -> tuple[str | None, st
         return matches[0].get("email"), None
     if len(matches) > 1:
         return None, await asyncio.to_thread(format_contact_lookup_answer, text, matches)
+
+    if convo:
+        last_email = convo.get("last_person_email")
+        last_person = convo.get("last_person")
+        if last_email and last_person:
+            if sender_matches_name(f"{last_person} <{last_email}>", text):
+                return last_email, None
+            req = normalize_name_key(text)
+            last = normalize_name_key(last_person)
+            if req and last and (
+                req in last
+                or last in req
+                or any(tok in last.split() for tok in name_tokens(text))
+            ):
+                return last_email, None
+
+    live = await asyncio.to_thread(resolve_person_email_live, text)
+    if live:
+        return live, None
+
     return None, (
         f"I don't have an email for {text} yet. "
         "Paste their email address, or wait until you've received mail from them."
@@ -775,25 +864,29 @@ async def _begin_compose_flow(
     recipient: str | None = None,
     content: str | None = None,
 ) -> None:
+    convo = get_convo(context.user_data)
     compose: dict = {"step": COMPOSE_NEED_CONTENT, "instructions": None, "recipient": None, "draft": None}
     if content:
         compose["instructions"] = content.strip()
     if recipient:
-        email, note = await _resolve_recipient_hint(recipient)
+        email, note = await _resolve_recipient_hint(recipient, convo)
         if note:
             compose["recipient_name"] = recipient
             if compose["instructions"]:
                 compose["pending_recipient_name"] = recipient
             await update.message.reply_text(note)
             if not compose["instructions"]:
-                compose["step"] = COMPOSE_NEED_CONTENT
+                compose["step"] = COMPOSE_NEED_RECIPIENT
                 context.user_data["compose"] = compose
-                await update.message.reply_text("What do you want to say in the email?")
+                await update.message.reply_text(
+                    "Paste their email address, or say their name again once I've seen mail from them."
+                )
                 remember_turn(
                     context.user_data,
                     user_text=update.message.text,
                     bot_text=note,
                     intent="compose",
+                    person=recipient,
                 )
                 return
         elif email:
@@ -836,7 +929,51 @@ async def _continue_compose_flow(update: Update, context: ContextTypes.DEFAULT_T
     if not compose:
         return
 
+    convo = get_convo(context.user_data)
     step = compose.get("step")
+
+    if step == COMPOSE_NEED_RECIPIENT or (
+        not compose.get("recipient") and _is_compose_recipient_reply(text, convo, compose)
+    ):
+        email, note = await _resolve_recipient_hint(text.strip(), convo)
+        if note and not email:
+            await update.message.reply_text(note)
+            compose["step"] = COMPOSE_NEED_RECIPIENT
+            context.user_data["compose"] = compose
+            remember_turn(context.user_data, user_text=text, intent="compose")
+            return
+        if email:
+            compose["recipient"] = email
+            compose.pop("recipient_name", None)
+            if step == COMPOSE_NEED_RECIPIENT and not compose.get("instructions"):
+                compose["step"] = COMPOSE_NEED_CONTENT
+                context.user_data["compose"] = compose
+                await update.message.reply_text(
+                    f"Got it — I'll send to {email}. What do you want to say in the email?"
+                )
+                remember_turn(
+                    context.user_data,
+                    user_text=text,
+                    intent="compose",
+                    person=compose.get("recipient_name") or text.strip(),
+                    person_email=email,
+                )
+                return
+            if _looks_like_recipient_only_message(text) and not compose.get("instructions"):
+                compose["step"] = COMPOSE_NEED_CONTENT
+                context.user_data["compose"] = compose
+                await update.message.reply_text(
+                    f"Got it — I'll send to {email}. What do you want to say in the email?"
+                )
+                remember_turn(
+                    context.user_data,
+                    user_text=text,
+                    intent="compose",
+                    person=compose.get("recipient_name") or text.strip(),
+                    person_email=email,
+                )
+                return
+
     if step == COMPOSE_NEED_CONTENT:
         compose["instructions"] = text.strip()
         if compose.get("recipient"):
@@ -851,14 +988,28 @@ async def _continue_compose_flow(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if step == COMPOSE_NEED_RECIPIENT:
-        email, note = await _resolve_recipient_hint(text.strip())
+        email, note = await _resolve_recipient_hint(text.strip(), convo)
         if note and not email:
             await update.message.reply_text(note)
             remember_turn(context.user_data, user_text=text, intent="compose")
             return
         compose["recipient"] = email or text.strip()
+        if compose.get("instructions"):
+            context.user_data["compose"] = compose
+            await _draft_and_show_compose(update, context)
+            remember_turn(
+                context.user_data,
+                user_text=text,
+                intent="compose",
+                person=text.strip(),
+                person_email=compose.get("recipient"),
+            )
+            return
+        compose["step"] = COMPOSE_NEED_CONTENT
         context.user_data["compose"] = compose
-        await _draft_and_show_compose(update, context)
+        await update.message.reply_text(
+            f"Got it — I'll send to {compose['recipient']}. What do you want to say in the email?"
+        )
         remember_turn(
             context.user_data,
             user_text=text,
@@ -904,6 +1055,11 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if lower in _COMPOSE_CANCEL_WORDS:
             _clear_compose(context.user_data)
             await update.message.reply_text("Cancelled. Draft discarded.")
+            return
+        convo = get_convo(context.user_data)
+        compose = _get_compose(context.user_data)
+        if _is_compose_recipient_reply(text, convo, compose):
+            await _continue_compose_flow(update, context, text)
             return
         if _looks_like_compose_breakout(text):
             _clear_compose(context.user_data)
@@ -1058,18 +1214,19 @@ async def _answer_chat_question(
 
     # Plain text avoids Telegram HTML parse errors from LLM output; chunk if long.
     await reply_long(update.message, answer)
-    person = person_hint or convo.get("last_person")
-    person_email = convo.get("last_person_email")
-    if person_hint:
-        resolved = await asyncio.to_thread(resolve_contact_email, person_hint)
-        if resolved:
-            person_email = resolved
+    resolved_person = person_hint or _extract_person_query(question_for_qa) or convo.get("last_person")
+    resolved_person = canonical_person_name(resolved_person) or resolved_person
+    person_email = await asyncio.to_thread(
+        infer_person_email,
+        resolved_person,
+        convo=convo,
+    )
     remember_turn(
         context.user_data,
         user_text=question,
         bot_text=answer[:800],
         intent=intent,
-        person=person_hint or person,
+        person=resolved_person,
         person_email=person_email,
         query=question,
     )

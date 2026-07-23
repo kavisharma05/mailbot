@@ -681,3 +681,79 @@ def mark_digest_sent(kind: str, sent_on: date | None = None) -> None:
             logger.warning("digest_state table missing — using in-memory fallback: %s", exc)
         else:
             logger.exception("mark_digest_sent failed for %s: %s", kind, exc)
+
+
+# --- Telegram user_data persistence (conversation + compose drafts) ---
+
+_user_state_table_missing = False
+_user_state_fallback: dict[str, dict[str, Any]] = {}
+
+
+@_safe_read({})
+def load_all_user_data_states() -> dict[str, dict[str, Any]]:
+    """Load all persisted Telegram user_data blobs keyed by user_id string."""
+    global _user_state_table_missing
+    if _user_state_table_missing:
+        return dict(_user_state_fallback)
+    try:
+        db = get_db()
+        result = db.table("user_data_state").select("user_id, data").execute()
+        rows = result.data or []
+        loaded = {str(row["user_id"]): row.get("data") or {} for row in rows}
+        _user_state_fallback.update(loaded)
+        return dict(loaded)
+    except Exception as exc:
+        err = str(exc).lower()
+        if "user_data_state" in err or "does not exist" in err or "42p01" in err:
+            _user_state_table_missing = True
+            logger.warning("user_data_state table missing — using in-memory fallback: %s", exc)
+            return dict(_user_state_fallback)
+        logger.exception("load_all_user_data_states failed: %s", exc)
+        return dict(_user_state_fallback)
+
+
+@_safe_write
+def save_user_data_state(user_id: str, data: dict[str, Any]) -> None:
+    """Upsert one user's Telegram user_data blob."""
+    global _user_state_table_missing
+    uid = str(user_id)
+    _user_state_fallback[uid] = data
+    if _user_state_table_missing:
+        return
+    try:
+        db = get_db()
+        db.table("user_data_state").upsert(
+            {
+                "user_id": uid,
+                "data": data,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="user_id",
+        ).execute()
+    except Exception as exc:
+        err = str(exc).lower()
+        if "user_data_state" in err or "does not exist" in err or "42p01" in err:
+            _user_state_table_missing = True
+            logger.warning("user_data_state table missing — using in-memory fallback: %s", exc)
+        else:
+            logger.exception("save_user_data_state failed for %s: %s", uid, exc)
+
+
+@_safe_write
+def delete_user_data_state(user_id: str) -> None:
+    """Remove one user's persisted Telegram user_data blob."""
+    global _user_state_table_missing
+    uid = str(user_id)
+    _user_state_fallback.pop(uid, None)
+    if _user_state_table_missing:
+        return
+    try:
+        db = get_db()
+        db.table("user_data_state").delete().eq("user_id", uid).execute()
+    except Exception as exc:
+        err = str(exc).lower()
+        if "user_data_state" in err or "does not exist" in err or "42p01" in err:
+            _user_state_table_missing = True
+            logger.warning("user_data_state table missing — using in-memory fallback: %s", exc)
+        else:
+            logger.exception("delete_user_data_state failed for %s: %s", uid, exc)

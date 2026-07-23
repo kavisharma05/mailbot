@@ -5,6 +5,7 @@ from telegram.ext import Application
 
 from bot.handlers import register_handlers
 from config import get_settings
+from services.persistence import SupabasePersistence
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ def build_telegram_application() -> Application:
     app = (
         Application.builder()
         .token(settings.telegram_bot_token)
+        .persistence(SupabasePersistence())
         .post_init(register_bot_commands)
         .build()
     )

@@ -9,7 +9,8 @@ from typing import Any
 
 from ai.client import call_json
 from ai.prompts import INTENT_PROMPT
-from services.conversation import history_for_prompt
+from services.contacts import canonical_person_name
+from services.conversation import history_for_prompt, MAX_HISTORY
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,8 @@ def _extract_person_after_preposition(text: str, prep: str) -> str | None:
         for p in name.split()
         if p.lower() not in {"the", "a", "an", "my", "your", "her", "his", "their"}
     ]
-    return " ".join(parts) if parts else None
+    joined = " ".join(parts) if parts else None
+    return canonical_person_name(joined) if joined else None
 
 
 def _extract_compose_content(text: str) -> str | None:
@@ -214,7 +216,7 @@ def _is_due_intent(text: str) -> bool:
 
 
 def _llm_classify(text: str, convo: dict[str, Any] | None) -> dict[str, Any] | None:
-    history = history_for_prompt(convo, limit=4)
+    history = history_for_prompt(convo, limit=MAX_HISTORY)
     payload = {
         "recent_history": history,
         "message": text,

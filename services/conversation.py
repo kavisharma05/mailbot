@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-MAX_HISTORY = 6
+from services.contacts import canonical_person_name
+
+MAX_HISTORY = 12
 
 
 def get_convo(user_data: dict[str, Any]) -> dict[str, Any]:
@@ -56,7 +58,7 @@ def remember_turn(
         convo["last_intent"] = intent
         user_data["last_intent"] = intent
     if person:
-        convo["last_person"] = person
+        convo["last_person"] = canonical_person_name(person) or person.strip()
     if person_email:
         convo["last_person_email"] = person_email
     if query:
