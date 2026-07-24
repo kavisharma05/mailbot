@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from services.contacts import backfill_contacts_from_inbox
 from services.watcher import (
     CATCHUP_DAYS,
+    CATCHUP_MAX_RESULTS,
     MAX_ALERTS_PER_RUN,
     _process_message,
     _recent_unprocessed_message_ids,
@@ -99,7 +100,7 @@ def test_recent_catchup_uses_inbox_spam_pagination():
         ids = _recent_unprocessed_message_ids()
 
     assert ids == ["m1", "m2"]
-    mock_list.assert_called_once_with(days=CATCHUP_DAYS, max_results=300)
+    mock_list.assert_called_once_with(days=CATCHUP_DAYS, max_results=CATCHUP_MAX_RESULTS)
 
 
 def test_backfill_contacts_uses_light_sender_fetch():
@@ -428,7 +429,7 @@ def test_process_message_skips_own_sent_mail():
 
             outcome = await _process_message("msg-sent", bot=object())
 
-        assert outcome == {"processed": 0, "alerts": 0}
+        assert outcome == {"processed": 0, "alerts": 0, "notifications": 0}
         mock_dequeue.assert_called_once_with("msg-sent")
         mock_mark.assert_called_once_with("msg-sent", False, "high", None)
         mock_classify.assert_not_called()
@@ -438,8 +439,8 @@ def test_process_message_skips_own_sent_mail():
     asyncio.run(_run())
 
 
-def test_partial_delivery_retry_skips_owner_resend():
-    """When owner DM succeeds but category alert fails, retry must not re-send owner DM."""
+def test_partial_delivery_marks_processed_without_requeue_storm():
+    """Owner success + category failure must mark processed and NOT requeue for full re-alert."""
     cached = {
         "is_actionable": True,
         "confidence": "high",
@@ -459,7 +460,7 @@ def test_partial_delivery_retry_skips_owner_resend():
         "attachment_text": "",
     }
 
-    async def _run_first_attempt():
+    async def _run():
         with (
             patch("services.watcher.get_pending_email", return_value=None),
             patch("services.watcher.get_message_details", return_value=details),
@@ -474,45 +475,7 @@ def test_partial_delivery_retry_skips_owner_resend():
             patch("services.watcher.send_owner_update", new=AsyncMock(return_value=True)) as mock_owner,
             patch("services.watcher.send_category_alert", new=AsyncMock(return_value=False)) as mock_category,
             patch("services.watcher.enqueue_pending_email") as mock_enqueue,
-            patch("services.watcher.mark_email_processed") as mock_mark,
-        ):
-            mock_settings.return_value.owner_dm_all_mail = False
-            mock_settings.return_value.telegram_owner_chat_id = "123"
-            mock_settings.return_value.telegram_chat_deadlines = "456"
-
-            outcome = await _process_message("msg-1", bot=object())
-
-        assert outcome["transient"] is True
-        mock_owner.assert_called_once()
-        mock_category.assert_called_once()
-        mock_mark.assert_not_called()
-        assert mock_enqueue.call_args.kwargs["delivered_channels"]["owner"] is True
-        assert "category" not in mock_enqueue.call_args.kwargs["delivered_channels"]
-
-    async def _run_retry():
-        with (
-            patch(
-                "services.watcher.get_pending_email",
-                return_value={
-                    "last_error": "alert_delivery_failed",
-                    "classified_result": cached,
-                    "already_alerted": False,
-                    "dead_letter": False,
-                    "delivered_channels": {"owner": True},
-                },
-            ),
-            patch("services.watcher.get_message_details", return_value=details),
-            patch("services.watcher.upsert_contact_from_sender"),
-            patch("services.watcher.annotate_attachment_intents", return_value=[]),
-            patch("services.watcher.classify_email") as mock_classify,
-            patch("services.watcher.dequeue_pending_email"),
-            patch("services.watcher.get_settings") as mock_settings,
-            patch("services.watcher.is_trusted_schedule_sender", return_value=False),
-            patch("services.watcher.insert_assignment", return_value={"id": "assign-1"}),
-            patch("services.watcher.schedule_deadline_reminders"),
-            patch("services.watcher.send_owner_update", new=AsyncMock(return_value=True)) as mock_owner,
-            patch("services.watcher.send_category_alert", new=AsyncMock(return_value=True)) as mock_category,
-            patch("services.watcher.mark_email_processed", return_value=True),
+            patch("services.watcher.mark_email_processed", return_value=True) as mock_mark,
         ):
             mock_settings.return_value.owner_dm_all_mail = False
             mock_settings.return_value.telegram_owner_chat_id = "123"
@@ -521,13 +484,12 @@ def test_partial_delivery_retry_skips_owner_resend():
             outcome = await _process_message("msg-1", bot=object())
 
         assert outcome["processed"] == 1
-        mock_classify.assert_not_called()
-        mock_owner.assert_not_called()
+        assert outcome.get("partial") is True
+        assert outcome["notifications"] == 1
+        mock_owner.assert_called_once()
         mock_category.assert_called_once()
-
-    async def _run():
-        await _run_first_attempt()
-        await _run_retry()
+        mock_mark.assert_called()
+        mock_enqueue.assert_not_called()
 
     asyncio.run(_run())
 
@@ -708,7 +670,7 @@ def test_watcher_alert_cap_stops_storm_and_defers_history():
         update_calls.append(kwargs)
 
     async def fake_process(_message_id, _bot, **kwargs):
-        return {"processed": 1, "alerts": 1}
+        return {"processed": 1, "alerts": 1, "notifications": 1}
 
     async def _run():
         many_ids = [f"msg-{i}" for i in range(MAX_ALERTS_PER_RUN + 25)]
@@ -726,10 +688,54 @@ def test_watcher_alert_cap_stops_storm_and_defers_history():
             result = await run_gmail_watcher(bot=object())
 
         assert result["alert_cap_hit"] is True
-        assert result["alerts"] == MAX_ALERTS_PER_RUN
+        assert result["notifications"] == MAX_ALERTS_PER_RUN
         assert mock_proc.call_count == MAX_ALERTS_PER_RUN
         # history must NOT advance while a storm is suspected
         assert result["history_id"] == "1000"
         assert update_calls[0].get("last_history_id") is None
+
+    asyncio.run(_run())
+
+
+def test_healthy_collect_skips_inbox_catchup_scan():
+    """Healthy history path must NOT re-scan days of inbox every tick."""
+
+    async def _run():
+        state = {"last_history_id": "1000"}
+        with (
+            patch(
+                "services.watcher.list_history_message_ids",
+                return_value=(["hist-1"], "2000", False),
+            ),
+            patch("services.watcher._recent_unprocessed_message_ids") as mock_catchup,
+            patch("services.watcher.list_pending_email_ids", return_value=["pend-1"]),
+        ):
+            from services.watcher import _collect_message_ids
+
+            ids, latest, failed = await _collect_message_ids(state)
+
+        assert failed is False
+        assert latest == "2000"
+        assert ids == ["hist-1", "pend-1"]
+        mock_catchup.assert_not_called()
+
+    asyncio.run(_run())
+
+
+def test_send_actionable_alert_never_pins():
+    async def _run():
+        from services import telegram_dedupe
+        from services.alert_delivery import send_actionable_alert
+
+        telegram_dedupe._content_seen.clear()
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=MagicMock(message_id=7))
+        bot.pin_chat_message = AsyncMock()
+
+        await send_actionable_alert(
+            bot, "123", "<b>Important</b>", assignment_id="a1", pin=True
+        )
+
+        bot.pin_chat_message.assert_not_called()
 
     asyncio.run(_run())

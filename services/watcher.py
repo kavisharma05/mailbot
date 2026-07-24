@@ -50,15 +50,31 @@ from services.timeutil import IST, now_ist, parse_iso_deadline
 logger = logging.getLogger(__name__)
 
 WATCHER_INTERVAL_SECONDS = 60
-CATCHUP_DAYS = 14
-CATCHUP_MAX_RESULTS = 300
-# Safety valve: cap fresh alerts emitted in a single watcher run. A healthy
-# tick sends at most a handful; anything approaching this means we are
-# reprocessing already-seen mail (loop) and must stop before spamming.
-MAX_ALERTS_PER_RUN = 12
+# Catch-up is ONLY for init / history-API failure — never the healthy 60s path.
+CATCHUP_DAYS = 2
+CATCHUP_MAX_RESULTS = 50
+# Only alert on mail newer than this during catch-up; older mail is marked silently.
+CATCHUP_ALERT_MAX_AGE_HOURS = 6
+# Safety valve: every Telegram notification (owner/category/schedule) counts.
+MAX_NOTIFICATIONS_PER_RUN = 8
+# Back-compat alias used by tests
+MAX_ALERTS_PER_RUN = MAX_NOTIFICATIONS_PER_RUN
 watcher_lock = asyncio.Lock()
 
 _REUSE_CLASSIFICATION_ERRORS = frozenset({"alert_delivery_failed", "mark_failed"})
+
+
+def _mail_age_hours(details: dict[str, Any]) -> float | None:
+    raw = details.get("received_at_iso") or details.get("received_at")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
 
 
 def _category_group_chat_id(category: str, settings: Settings) -> str | None:
@@ -311,6 +327,7 @@ async def _process_message(
     bot,
     *,
     skip_past_deadlines: bool = False,
+    catchup_mode: bool = False,
 ) -> dict[str, Any]:
     """Classify one email, persist results, optionally alert + forward attachments."""
     pending_row = await asyncio.to_thread(get_pending_email, message_id)
@@ -324,7 +341,7 @@ async def _process_message(
             delivery_failed=True,
         )
         await asyncio.to_thread(dequeue_pending_email, message_id)
-        return {"processed": 1, "alerts": 0}
+        return {"processed": 1, "alerts": 0, "notifications": 0}
 
     details = await asyncio.to_thread(get_message_details, message_id, load_attachments=True)
 
@@ -338,7 +355,7 @@ async def _process_message(
             "high",
             None,
         )
-        return {"processed": 0, "alerts": 0}
+        return {"processed": 0, "alerts": 0, "notifications": 0}
 
     await asyncio.to_thread(upsert_contact_from_sender, details.get("sender"))
     attachments = annotate_attachment_intents(
@@ -375,7 +392,7 @@ async def _process_message(
             {"message_id": message_id, "subject": details["subject"], "retry": True},
         )
         await asyncio.to_thread(enqueue_pending_email, message_id, "classification_failed")
-        return {"processed": 0, "alerts": 0, "transient": True}
+        return {"processed": 0, "alerts": 0, "notifications": 0, "transient": True}
 
     await asyncio.to_thread(dequeue_pending_email, message_id)
 
@@ -385,9 +402,19 @@ async def _process_message(
     deadline_date = result.get("deadline_date")
     assignment_id = None
     alerts = 0
+    notifications = 0
     sender = result.get("sender") or details.get("sender")
     summary = result.get("summary")
     delivery_ok = True
+    marked_early = False
+
+    # Catch-up / history-fallback: mark old mail silently — never re-spam the inbox.
+    age_hours = _mail_age_hours(details)
+    suppress_alerts = bool(
+        catchup_mode
+        and age_hours is not None
+        and age_hours > CATCHUP_ALERT_MAX_AGE_HOURS
+    )
 
     owner_text = format_incoming_mail_message(
         subject=details.get("subject"),
@@ -400,14 +427,39 @@ async def _process_message(
         summary=summary,
         confidence=confidence,
     )
-    pin_owner = is_priority_item(
-        category,
-        task=result.get("task"),
-        summary=summary,
-        deadline_date=deadline_date,
-    )
+
+    async def _mark_now() -> bool:
+        nonlocal marked_early
+        ok = await asyncio.to_thread(
+            mark_email_processed,
+            message_id,
+            is_actionable,
+            confidence,
+            assignment_id,
+        )
+        if ok:
+            marked_early = True
+        return ok
+
+    async def _note_sent(channel: str) -> None:
+        nonlocal notifications, delivery_ok
+        delivered[channel] = True
+        notifications += 1
+        # Durable anti-storm: once ANY Telegram send succeeds, persist processed
+        # immediately so a later mark failure / process restart cannot re-alert.
+        if not marked_early:
+            await _mark_now()
 
     async def _fail_delivery(*, error: str = "alert_delivery_failed") -> dict[str, Any]:
+        # Never re-queue a full re-alert if we already notified on any channel.
+        if any(delivered.values()) or marked_early:
+            await _mark_now()
+            return {
+                "processed": 1,
+                "alerts": alerts,
+                "notifications": notifications,
+                "partial": True,
+            }
         await asyncio.to_thread(
             enqueue_pending_email,
             message_id,
@@ -416,9 +468,11 @@ async def _process_message(
             already_alerted=already_alerted or error == "mark_failed",
             delivered_channels=delivered,
         )
-        return {"processed": 0, "alerts": 0, "transient": True}
+        return {"processed": 0, "alerts": 0, "notifications": 0, "transient": True}
 
     async def _finalize_processed() -> dict[str, Any] | None:
+        if marked_early:
+            return None
         marked = await asyncio.to_thread(
             mark_email_processed,
             message_id,
@@ -450,25 +504,29 @@ async def _process_message(
                 sessions,
                 gmail_message_id=message_id,
             )
-            if not delivered.get("owner") and _should_owner_dm(
-                settings,
-                is_actionable=is_actionable,
-                category=category,
-                task=result.get("task"),
-                summary=summary,
+            if (
+                not suppress_alerts
+                and not delivered.get("owner")
+                and _should_owner_dm(
+                    settings,
+                    is_actionable=is_actionable,
+                    category=category,
+                    task=result.get("task"),
+                    summary=summary,
+                )
             ):
                 owner_sent = await send_owner_update(
                     bot,
                     settings.telegram_owner_chat_id,
                     owner_text,
                     attachments=attachments if is_actionable else None,
-                    pin=pin_owner,
+                    pin=False,
                 )
                 if owner_sent:
-                    delivered["owner"] = True
+                    await _note_sent("owner")
                 else:
                     delivery_ok = False
-            if not delivered.get("schedule"):
+            if not suppress_alerts and not delivered.get("schedule"):
                 schedule_sent = await share_schedule(
                     bot,
                     sessions=stored or sessions,
@@ -476,10 +534,10 @@ async def _process_message(
                     attachments=attachments,
                 )
                 if schedule_sent:
-                    delivered["schedule"] = True
+                    await _note_sent("schedule")
+                    alerts = 1
                 else:
                     delivery_ok = False
-            alerts = 1
             if is_actionable and confidence in ("high", "medium"):
                 assignment = await asyncio.to_thread(
                     insert_assignment,
@@ -491,17 +549,18 @@ async def _process_message(
                 )
                 if assignment:
                     assignment_id = assignment["id"]
-                elif not already_alerted:
+                elif not already_alerted and not any(delivered.values()):
                     return await _fail_delivery(error="assignment_insert_failed")
             if not delivery_ok:
                 return await _fail_delivery()
             finalize = await _finalize_processed()
             if finalize:
                 return finalize
-            return {"processed": 1, "alerts": alerts}
+            return {"processed": 1, "alerts": alerts, "notifications": notifications}
 
     if (
-        not delivered.get("owner")
+        not suppress_alerts
+        and not delivered.get("owner")
         and _should_owner_dm(
             settings,
             is_actionable=is_actionable,
@@ -515,10 +574,10 @@ async def _process_message(
             bot,
             settings.telegram_owner_chat_id,
             owner_text,
-            pin=pin_owner,
+            pin=False,
         )
         if owner_sent:
-            delivered["owner"] = True
+            await _note_sent("owner")
         else:
             delivery_ok = False
 
@@ -530,11 +589,12 @@ async def _process_message(
         if assignment:
             assignment_id = assignment["id"]
             await asyncio.to_thread(schedule_deadline_reminders, assignment)
-        elif not already_alerted:
+        elif not already_alerted and not any(delivered.values()):
             return await _fail_delivery(error="assignment_insert_failed")
 
         if (
-            assignment_id
+            not suppress_alerts
+            and assignment_id
             and not delivered.get("owner")
             and _should_owner_dm(
                 settings,
@@ -550,15 +610,16 @@ async def _process_message(
                 owner_text,
                 assignment_id=str(assignment_id),
                 attachments=attachments,
-                pin=pin_owner,
+                pin=False,
             )
             if owner_sent:
-                delivered["owner"] = True
+                await _note_sent("owner")
             else:
                 delivery_ok = False
 
         if (
-            assignment_id
+            not suppress_alerts
+            and assignment_id
             and not delivered.get("category")
             and _should_alert(
                 confidence, deadline_date, skip_past_deadlines=skip_past_deadlines
@@ -578,7 +639,7 @@ async def _process_message(
                 attachments=attachments,
             )
             if category_sent:
-                delivered["category"] = True
+                await _note_sent("category")
                 alerts = 1
             else:
                 delivery_ok = False
@@ -599,7 +660,7 @@ async def _process_message(
     finalize = await _finalize_processed()
     if finalize:
         return finalize
-    return {"processed": 1, "alerts": alerts}
+    return {"processed": 1, "alerts": alerts, "notifications": notifications}
 
 
 def _recent_unprocessed_message_ids(max_results: int = CATCHUP_MAX_RESULTS) -> list[str]:
@@ -613,6 +674,12 @@ def _recent_unprocessed_message_ids(max_results: int = CATCHUP_MAX_RESULTS) -> l
 async def _collect_message_ids(
     state: dict[str, Any] | None,
 ) -> tuple[list[str], str | None, bool]:
+    """Collect candidates for this tick.
+
+    Healthy path: Gmail history delta + pending retries ONLY.
+    Catch-up (limited inbox scan) runs only on init or when history API fails.
+    Re-scanning 14d of inbox every 60s was the root cause of pin/alert storms.
+    """
     if not state or not state.get("last_history_id"):
         history_id = await asyncio.to_thread(get_profile_history_id)
         catchup_ids = await asyncio.to_thread(_recent_unprocessed_message_ids)
@@ -626,10 +693,13 @@ async def _collect_message_ids(
     )
 
     seen: set[str] = set(message_ids)
-    for mid in await asyncio.to_thread(_recent_unprocessed_message_ids):
-        if mid not in seen:
-            message_ids.append(mid)
-            seen.add(mid)
+    # Limited catch-up ONLY when history API failed (fallback list is already
+    # returned by list_history_message_ids; avoid a second full inbox scan).
+    if history_failed:
+        for mid in await asyncio.to_thread(_recent_unprocessed_message_ids):
+            if mid not in seen:
+                message_ids.append(mid)
+                seen.add(mid)
     for mid in await asyncio.to_thread(list_pending_email_ids):
         if mid not in seen:
             message_ids.append(mid)
@@ -665,15 +735,15 @@ async def _run_gmail_watcher_inner(bot) -> dict:
         logger.info("Running init catch-up before setting historyId=%s", history_id)
         processed = 0
         alerts = 0
+        notifications = 0
         failed = 0
         hit_cap = False
         for message_id in message_ids:
-            if alerts >= MAX_ALERTS_PER_RUN:
+            if notifications >= MAX_NOTIFICATIONS_PER_RUN:
                 hit_cap = True
                 logger.error(
-                    "Alert cap (%d) hit during init catch-up — stopping this tick to "
-                    "prevent duplicate-alert storm; remaining mail will retry next tick",
-                    MAX_ALERTS_PER_RUN,
+                    "Notification cap (%d) hit during init catch-up — stopping this tick",
+                    MAX_NOTIFICATIONS_PER_RUN,
                 )
                 break
             processed_state = await _processed_lookup(message_id)
@@ -687,7 +757,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
             if processed_state:
                 continue
             try:
-                outcome = await _process_message(message_id, bot)
+                outcome = await _process_message(message_id, bot, catchup_mode=True)
             except Exception as exc:
                 logger.exception("Catch-up processing failed for %s: %s", message_id, exc)
                 failed += 1
@@ -697,6 +767,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
                 continue
             processed += outcome["processed"]
             alerts += outcome["alerts"]
+            notifications += int(outcome.get("notifications") or 0)
 
         if failed == 0 and not hit_cap:
             await asyncio.to_thread(
@@ -717,6 +788,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
             "history_id": history_id if (failed == 0 and not hit_cap) else None,
             "processed": processed,
             "alerts": alerts,
+            "notifications": notifications,
             "failed_retries": failed,
             "alert_cap_hit": hit_cap,
             "catchup_candidates": len(message_ids),
@@ -725,16 +797,16 @@ async def _run_gmail_watcher_inner(bot) -> dict:
     start_id = state["last_history_id"]
     processed = 0
     alerts = 0
+    notifications = 0
     failed = 0
     hit_cap = False
 
     for message_id in message_ids:
-        if alerts >= MAX_ALERTS_PER_RUN:
+        if notifications >= MAX_NOTIFICATIONS_PER_RUN:
             hit_cap = True
             logger.error(
-                "Alert cap (%d) hit during watcher run — stopping this tick to prevent "
-                "duplicate-alert storm; remaining mail will retry next tick",
-                MAX_ALERTS_PER_RUN,
+                "Notification cap (%d) hit during watcher run — stopping this tick",
+                MAX_NOTIFICATIONS_PER_RUN,
             )
             break
         processed_state = await _processed_lookup(message_id)
@@ -749,7 +821,9 @@ async def _run_gmail_watcher_inner(bot) -> dict:
             continue
 
         try:
-            outcome = await _process_message(message_id, bot)
+            outcome = await _process_message(
+                message_id, bot, catchup_mode=history_failed
+            )
         except Exception as exc:
             logger.exception("Processing failed for %s: %s", message_id, exc)
             failed += 1
@@ -763,6 +837,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
             continue
         processed += outcome["processed"]
         alerts += outcome["alerts"]
+        notifications += int(outcome.get("notifications") or 0)
 
     if failed == 0 and not history_failed and not hit_cap:
         new_history_id = latest_or_init or await asyncio.to_thread(get_profile_history_id)
@@ -792,6 +867,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
         "status": "ok",
         "processed": processed,
         "alerts": alerts,
+        "notifications": notifications,
         "failed_retries": failed,
         "history_failed": history_failed,
         "alert_cap_hit": hit_cap,

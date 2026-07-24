@@ -27,11 +27,19 @@ async def send_actionable_alert(
     caption_prefix: str | None = None,
     pin: bool = False,
 ) -> int | None:
-    """Send HTML alert; return message_id of first chunk only if all chunks and attachments sent."""
+    """Send HTML alert; return message_id of first chunk only if all chunks sent.
+
+    Pinning is intentionally disabled: auto-pin storms filled chats with hundreds
+    of pins. Priority is still signaled in the message text (IMPORTANT prefix).
+    """
     if not chat_id:
         return None
     if await already_sent_content(chat_id, text):
         return _DEDUPE_SENTINEL
+
+    # Never auto-pin from the watcher/reminder paths — Telegram pin caps and
+    # reprocessing loops turned this into hundreds of pinned messages.
+    pin = False
 
     reply_markup = build_action_keyboard(assignment_id) if assignment_id else None
     from services.telegram_util import chunk_text
