@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     # Optional second Groq free account for rotation
     groq_api_key_2: str = ""
 
+    # Nemotron 3 Ultra (free) via OpenRouter — primary + brain when configured
+    # https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b:free
+    nemotron_api_key: str = ""
+    nemotron_primary_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    nemotron_brain_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+
     # Fallback when Groq hits rate limits (https://cloud.cerebras.ai)
     cerebras_api_key: str = ""
     cerebras_model: str = "gemma-4-31b"

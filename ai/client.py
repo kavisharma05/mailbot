@@ -50,12 +50,20 @@ def get_llm_status() -> dict[str, Any]:
         for name, until in _cooldowns.items()
         if until > now
     }
+    settings = get_settings()
+    nemotron: dict[str, str] | None = None
+    if settings.nemotron_api_key:
+        nemotron = {
+            "primary_model": settings.nemotron_primary_model,
+            "brain_model": settings.nemotron_brain_model,
+        }
     return {
         "last_ok_provider": _last_ok_provider,
         "last_error_provider": _last_provider if _last_error else None,
         "last_error_status": _last_status if _last_error else None,
         "cooldowns_seconds": cooled,
         "providers_configured": _configured_provider_names(),
+        "nemotron": nemotron,
     }
 
 
@@ -365,6 +373,39 @@ def _call_openrouter(
     )
 
 
+def _call_nemotron(
+    system: str,
+    user: str,
+    *,
+    json_mode: bool,
+    max_tokens: int,
+    temperature: float,
+) -> str | None:
+    settings = get_settings()
+    if not settings.nemotron_api_key or _is_cooled("nemotron"):
+        return None
+    model = (
+        settings.nemotron_primary_model
+        if json_mode
+        else settings.nemotron_brain_model
+    )
+    return _openai_compatible_post(
+        url=_OPENROUTER_URL,
+        api_key=settings.nemotron_api_key,
+        model=model,
+        system=system,
+        user=user,
+        json_mode=json_mode,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        provider="nemotron",
+        extra_headers={
+            "HTTP-Referer": settings.render_url or "https://mailbot.local",
+            "X-Title": "Mailbot",
+        },
+    )
+
+
 ProviderFn = Callable[..., str | None]
 
 
@@ -372,6 +413,8 @@ def _provider_chain() -> list[tuple[str, ProviderFn]]:
     settings = get_settings()
     chain: list[tuple[str, ProviderFn]] = []
 
+    if settings.nemotron_api_key:
+        chain.append(("nemotron", _call_nemotron))
     if settings.groq_api_key:
         chain.append(
             (

@@ -25,6 +25,17 @@ def test_tomorrow_classes_text_is_defined():
     assert asyncio.iscoroutinefunction(_tomorrow_classes_text)
 
 
+FROZEN_NOW = datetime(2026, 7, 23, 8, 0, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+
+
+class _FrozenDateTime(datetime):
+    """datetime stand-in with a pinned now() so digest tests are date-independent."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return FROZEN_NOW.astimezone(tz) if tz else FROZEN_NOW
+
+
 def test_digest_marks_only_after_successful_send():
     db_module._digest_state_table_missing = True
     db_module._digest_state_fallback["last_morning"] = None
@@ -34,6 +45,7 @@ def test_digest_marks_only_after_successful_send():
 
     async def _run():
         with (
+            patch("services.digest.datetime", _FrozenDateTime),
             patch("services.digest.digest_already_sent_today", return_value=False),
             patch("services.digest.acquire_digest_lease", return_value=True),
             patch("services.digest.classes_command_text", return_value=""),
@@ -51,6 +63,7 @@ def test_digest_marks_only_after_successful_send():
         db_module._digest_state_fallback["last_morning"] = None
         db_module._digest_leases_fallback.clear()
         with (
+            patch("services.digest.datetime", _FrozenDateTime),
             patch("services.digest.digest_already_sent_today", return_value=False),
             patch("services.digest.acquire_digest_lease", return_value=True),
             patch("services.digest.classes_command_text", return_value=""),
@@ -75,6 +88,7 @@ def test_digest_send_failure_allows_retry():
 
     async def _run():
         with (
+            patch("services.digest.datetime", _FrozenDateTime),
             patch("services.digest.digest_already_sent_today", return_value=False),
             patch("services.digest.acquire_digest_lease", return_value=True),
             patch("services.digest.classes_command_text", return_value=""),
@@ -89,6 +103,7 @@ def test_digest_send_failure_allows_retry():
 
         db_module._digest_leases_fallback.clear()
         with (
+            patch("services.digest.datetime", _FrozenDateTime),
             patch("services.digest.digest_already_sent_today", return_value=False),
             patch("services.digest.acquire_digest_lease", return_value=True),
             patch("services.digest.classes_command_text", return_value=""),

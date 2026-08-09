@@ -26,11 +26,14 @@ async def send_actionable_alert(
     attachments: list[dict[str, Any]] | None = None,
     caption_prefix: str | None = None,
     pin: bool = False,
+    show_reply: bool = False,
 ) -> int | None:
     """Send HTML alert; return message_id of first chunk only if all chunks sent.
 
     Pinning is intentionally disabled: auto-pin storms filled chats with hundreds
     of pins. Priority is still signaled in the message text (IMPORTANT prefix).
+    ``show_reply`` adds a "Reply to sender" button — only use it for the owner DM
+    where the seeded compose flow is available.
     """
     if not chat_id:
         return None
@@ -41,7 +44,9 @@ async def send_actionable_alert(
     # reprocessing loops turned this into hundreds of pinned messages.
     pin = False
 
-    reply_markup = build_action_keyboard(assignment_id) if assignment_id else None
+    reply_markup = (
+        build_action_keyboard(assignment_id, show_reply=show_reply) if assignment_id else None
+    )
     from services.telegram_util import chunk_text
 
     pieces = chunk_text(text)
@@ -163,6 +168,7 @@ async def send_owner_update(
     assignment_id: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
     pin: bool = False,
+    show_reply: bool = False,
 ) -> bool:
     if not chat_id:
         return False
@@ -174,6 +180,7 @@ async def send_owner_update(
             assignment_id=assignment_id,
             attachments=attachments,
             pin=pin,
+            show_reply=show_reply,
         )
         return msg_id is not None
     if await already_sent_content(chat_id, text):

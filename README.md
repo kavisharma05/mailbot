@@ -16,7 +16,7 @@ Email categories: `deadline`, `placement`, `certification`, `admin`, `other`.
 
 - **Marks attachments** — score sheets / results are posted as readable text in Telegram
 - **Reading attachments** — cases, chapters, and books are forwarded as files with the alert
-- **Action buttons** — Done / Not important / Remind again / Snooze on actionable alerts
+- **Action buttons** — Done / Not important / Remind again / Snooze (1h, 3h, or tomorrow 9am IST) on actionable alerts; owner alerts with a known sender also get **Reply to sender**, which seeds a threaded Gmail reply draft
 - **Priority surfacing** — important mail is pinned, highlighted in digests, and sorted first in `/due`
 - **Quiet owner DMs** — set `OWNER_DM_ALL_MAIL=true` to DM owner for **every** email (recommended if you cannot miss any mail); default is actionable/priority only
 
@@ -159,8 +159,17 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `TELEGRAM_CHAT_OTHER` | Chat ID for other/FYI alerts (optional) |
 | `GROQ_API_KEY` | Groq API key (free from console.groq.com) |
 | `GROQ_MODEL` | Model name (default: llama-3.3-70b-versatile) |
+| `NEMOTRON_API_KEY` | OpenRouter API key for Nemotron 3 Ultra (free); tried first when set |
+| `NEMOTRON_PRIMARY_MODEL` | Structured/JSON tasks (default: `nvidia/nemotron-3-ultra-550b-a55b:free`) |
+| `NEMOTRON_BRAIN_MODEL` | Q&A and reasoning tasks (default: `nvidia/nemotron-3-ultra-550b-a55b:free`) |
 | `CEREBRAS_API_KEY` | Cerebras fallback when Groq is rate-limited |
 | `CEREBRAS_MODEL` | Cerebras model (default: `gemma-4-31b`) |
+| `GEMINI_API_KEY` | Google Gemini fallback (optional) |
+| `GEMINI_MODEL` | Gemini model (default: `gemini-2.0-flash`) |
+| `GITHUB_MODELS_TOKEN` | GitHub Models token (optional) |
+| `GITHUB_MODELS_MODEL` | GitHub Models slug (default: `openai/gpt-4o-mini`) |
+| `OPENROUTER_API_KEY` | OpenRouter fallback (optional) |
+| `OPENROUTER_MODEL` | OpenRouter model (default: `google/gemma-4-31b-it:free`) |
 | `GMAIL_CLIENT_ID` | Google OAuth client ID |
 | `GMAIL_CLIENT_SECRET` | Google OAuth client secret |
 | `GMAIL_REFRESH_TOKEN` | From get_gmail_token.py |
@@ -182,6 +191,7 @@ Run `supabase/migration_contacts.sql` once to enable learned name→email contac
 Run `supabase/migration_digest_state.sql` once to enable digest idempotency (prevents double morning/evening sends).
 Run `supabase/migration_precision_reliability.sql` once for scheduled reminders, item priority/type, OAuth tokens, and heartbeat columns.
 Run `supabase/migration_delivery_claims.sql` once for digest send leases, reminder dedupe, and pending-email dead letters.
+Run `supabase/migration_sender_subject.sql` once to store mail sender/subject on tracked items (enables Reply-to-sender and From/Subject lines in reminders).
 
 ### Heartbeat monitoring (recommended)
 

@@ -247,7 +247,7 @@ def test_deterministic_deadline_answer_filters_tomorrow_only():
         {**_item("today-task", datetime.combine(today, datetime.min.time(), tzinfo=IST)), "status": "open"},
         {**_item("tomorrow-task", datetime.combine(tomorrow, datetime.min.time(), tzinfo=IST)), "status": "open"},
     ]
-    answer = _deterministic_deadline_answer("deadlines for tomorrow", items)
+    answer = _deterministic_deadline_answer("deadlines for tomorrow", items, now=REF)
     assert answer is not None
     assert "tomorrow-task" in answer or "Task tomorrow-task" in answer
     assert "today-task" not in answer

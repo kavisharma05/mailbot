@@ -43,6 +43,7 @@ from services.contacts import (
     backfill_contacts_from_inbox,
     name_tokens,
     normalize_name_key,
+    parse_sender,
     resolve_email_robust,
     canonical_person_name,
 )
@@ -52,7 +53,9 @@ from services.alert_actions import (
     ACT_DISMISS,
     ACT_DONE,
     ACT_REMIND,
+    ACT_REPLY,
     ACT_SNOOZE,
+    SNOOZE_TOMORROW,
     parse_action_callback,
 )
 from services.db import (
@@ -97,7 +100,7 @@ from services.schedule import (
     sessions_for_day,
 )
 from services.telegram_util import reply_long, safe_user_error_message
-from services.timeutil import DayWindow, IST, parse_day_window, today_ist
+from services.timeutil import DayWindow, IST, now_ist, parse_day_window, today_ist
 
 logger = logging.getLogger(__name__)
 
@@ -711,14 +714,19 @@ async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if action == ACT_SNOOZE:
-        try:
-            hours = max(1, int(extra or "1"))
-        except ValueError:
-            hours = 1
-        remind_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+        if (extra or "") == SNOOZE_TOMORROW:
+            target = (now_ist() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+            remind_at = target.astimezone(timezone.utc)
+            confirm = "💤 Snoozed until tomorrow 9:00 AM IST"
+        else:
+            try:
+                hours = max(1, int(extra or "1"))
+            except ValueError:
+                hours = 1
+            remind_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+            confirm = f"💤 Snoozed for {hours}h"
         updated = await asyncio.to_thread(schedule_assignment_reminder, assignment_id, remind_at)
         if updated:
-            confirm = f"💤 Snoozed for {hours}h"
             try:
                 prior = query.message.text or query.message.caption or ""
                 await query.edit_message_text(
@@ -731,6 +739,34 @@ async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer(confirm)
         else:
             await query.answer("Could not snooze.")
+        return
+
+    if action == ACT_REPLY:
+        item = await asyncio.to_thread(get_assignment_by_id, assignment_id)
+        if not item:
+            await query.answer("Item not found — it may already be closed.", show_alert=True)
+            return
+        sender_name, sender_email = parse_sender(item.get("sender"))
+        if not sender_email:
+            await query.answer("No sender address stored for this item.", show_alert=True)
+            return
+        subject = str(item.get("subject") or "").strip()
+        context.user_data["compose"] = {
+            "step": COMPOSE_NEED_CONTENT,
+            "instructions": None,
+            "recipient": sender_email,
+            "recipient_name": sender_name,
+            "reply_subject": subject,
+            "reply_thread_id": item.get("gmail_thread_id"),
+            "draft": None,
+        }
+        await query.answer()
+        lines = [f"Replying to <b>{html.escape(sender_name or sender_email)}</b>"]
+        if subject:
+            lines.append(f"Re: <i>{html.escape(subject)}</i>")
+        lines.append("")
+        lines.append("What do you want to say? (type /cancel to stop)")
+        await query.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
 
 
@@ -1410,7 +1446,15 @@ async def _draft_and_show_compose(update: Update, context: ContextTypes.DEFAULT_
         return
 
     await update.message.reply_text("Drafting your email...")
-    draft = await asyncio.to_thread(compose_email, instructions)
+    reply_subject = str(compose.get("reply_subject") or "").strip()
+    prompt_instructions = instructions
+    if reply_subject:
+        reply_target = compose.get("recipient_name") or recipient
+        prompt_instructions = (
+            f"This is a reply to an email from {reply_target} "
+            f"with subject \"{reply_subject}\".\n\nReply instructions:\n{instructions}"
+        )
+    draft = await asyncio.to_thread(compose_email, prompt_instructions)
     if not draft or "subject" not in draft or "body" not in draft:
         await asyncio.to_thread(
             log_low_confidence,
@@ -1420,6 +1464,10 @@ async def _draft_and_show_compose(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Couldn't draft the email. Try rephrasing your instructions.")
         _clear_compose(context.user_data)
         return
+
+    if reply_subject:
+        base_subject = re.sub(r"^(?:\s*re\s*:\s*)+", "", reply_subject, flags=re.IGNORECASE).strip()
+        draft["subject"] = f"Re: {base_subject or reply_subject}"
 
     compose["draft"] = draft
     compose["step"] = COMPOSE_CONFIRM
@@ -1905,6 +1953,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             to=recipient,
             subject=draft["subject"],
             body=draft["body"],
+            thread_id=(compose or {}).get("reply_thread_id"),
         )
         await query.edit_message_text(f"Sent to {recipient}.")
         remember_turn(

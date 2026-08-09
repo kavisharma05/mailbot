@@ -1153,17 +1153,25 @@ def _deterministic_undated_answer(items: list[dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
-def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -> str | None:
-    """Structured DB answers for clear due-list / undated-task questions."""
+def _deterministic_deadline_answer(
+    question: str,
+    items: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    """Structured DB answers for clear due-list / undated-task questions.
+
+    ``now`` lets callers/tests pin "today" instead of relying on wall-clock time.
+    """
     if _asks_undated_tasks(question):
         return _deterministic_undated_answer(items)
 
-    if not _is_due_list_question(question) and parse_day_window(question) is None:
+    if not _is_due_list_question(question) and parse_day_window(question, ref=now) is None:
         q = question.lower()
         if not any(w in q for w in ("need to do today", "need to do tomorrow", "what's due", "refresh")):
             return None
 
-    window = parse_day_window(question)
+    window = parse_day_window(question, ref=now)
     day_set: set | None = None
     if window is not None:
         if window.single:
@@ -1178,7 +1186,8 @@ def _deterministic_deadline_answer(question: str, items: list[dict[str, Any]]) -
             label = window.label
     elif _is_due_list_question(question):
         # Default refresh → today + tomorrow, not an unfiltered dump
-        day_set = {today_ist(), today_ist() + timedelta(days=1)}
+        today = now.astimezone(IST).date() if now else today_ist()
+        day_set = {today, today + timedelta(days=1)}
         label = "today and tomorrow (IST)"
     else:
         return None

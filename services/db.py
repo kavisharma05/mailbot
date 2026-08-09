@@ -239,8 +239,9 @@ def insert_assignment(data: dict[str, Any]) -> dict[str, Any] | None:
         return rows[0]
     except Exception as exc:
         err = str(exc).lower()
-        if "item_type" in err or "priority" in err:
-            slim = {k: v for k, v in data.items() if k not in ("item_type", "priority")}
+        optional_cols = ("item_type", "priority", "sender", "subject")
+        if any(col in err for col in optional_cols):
+            slim = {k: v for k, v in data.items() if k not in optional_cols}
             try:
                 result = db.table("assignments").insert(slim).execute()
                 rows = result.data or []

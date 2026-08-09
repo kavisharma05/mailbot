@@ -136,6 +136,8 @@ async def run_scheduled_reminders(bot) -> dict[str, Any]:
         category = normalize_category(item.get("category"))
         msg_id = None
         if owner:
+            from services.contacts import parse_sender
+
             msg_id = await send_actionable_alert(
                 bot,
                 owner,
@@ -147,6 +149,7 @@ async def run_scheduled_reminders(bot) -> dict[str, Any]:
                     summary=item.get("summary"),
                     deadline_date=item.get("deadline_date"),
                 ),
+                show_reply=bool(parse_sender(item.get("sender"))[1]),
             )
         if msg_id:
             await asyncio.to_thread(mark_scheduled_reminder_sent, str(reminder_id))

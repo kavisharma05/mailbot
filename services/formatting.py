@@ -248,9 +248,10 @@ def format_assignment_row(
     cat_part = f"[{escape_html(cat_label)}] " if show_category else ""
 
     if numbered is not None:
-        head = f"{numbered}. {pri_mark}{icon} {cat_part}<b>{escape_html(str(task))}</b>"
+        overdue_tag = " ⚠️ Overdue" if overdue else ""
+        head = f"{numbered}. {pri_mark}{icon} {cat_part}<b>{escape_html(str(task))}</b>{overdue_tag}"
     elif overdue:
-        head = f"⚠️ {pri_mark}<b>{escape_html(str(task))}</b>"
+        head = f"⚠️ {pri_mark}<b>{escape_html(str(task))}</b> — Overdue"
     else:
         head = f"• {pri_mark}{icon} {cat_part}<b>{escape_html(str(task))}</b>"
 

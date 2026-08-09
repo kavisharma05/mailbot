@@ -307,6 +307,8 @@ def _assignment_payload(
         "summary": result.get("summary"),
         "confidence": confidence,
         "status": "open",
+        "sender": result.get("sender") or details.get("sender"),
+        "subject": details.get("subject"),
     }
 
 
@@ -611,6 +613,7 @@ async def _process_message(
                 assignment_id=str(assignment_id),
                 attachments=attachments,
                 pin=False,
+                show_reply=bool(parse_sender(sender)[1]),
             )
             if owner_sent:
                 await _note_sent("owner")
@@ -947,6 +950,7 @@ async def run_due_reminders(bot) -> dict:
                     summary=item.get("summary"),
                     deadline_date=item.get("deadline_date"),
                 ),
+                show_reply=bool(parse_sender(item.get("sender"))[1]),
             )
         if sent_id:
             await asyncio.to_thread(clear_assignment_reminder, str(assignment_id))
