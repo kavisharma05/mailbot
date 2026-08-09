@@ -298,3 +298,87 @@ def test_reminder_clears_after_successful_send():
 
 def test_compose_breakout_detects_due_question():
     assert _looks_like_compose_breakout("what's due today?")
+
+
+def test_compose_breakout_does_not_clear_short_recipient_name():
+    """A short recipient answer (e.g. 'saleena') must not be treated as a
+    compose breakout even if the classifier defaults it to mailbox_qa."""
+    assert not _looks_like_compose_breakout("saleena")
+    assert not _looks_like_compose_breakout("saleena mam")
+    assert not _looks_like_compose_breakout("Dr. Santhi")
+    # But a real question still breaks out
+    assert _looks_like_compose_breakout("what's due today?")
+
+
+def test_send_flow_content_then_ask_recipient_not_misrouted():
+    """End-to-end: /send with no args asks for content; user replies with
+    text containing 'from'/'class'; the content is captured and the bot
+    asks 'Who should I send it to?' instead of misrouting or clearing."""
+    from bot.handlers import (
+        COMPOSE_NEED_CONTENT,
+        COMPOSE_NEED_RECIPIENT,
+        _begin_compose_flow,
+        _continue_compose_flow,
+        _get_compose,
+    )
+
+    user_data: dict = {}
+    update = MagicMock()
+    update.message.text = "/send"
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.user_data = user_data
+
+    async def _run():
+        # Step 1: /send with no args -> asks for content
+        await _begin_compose_flow(update, context, recipient=None, content=None)
+        compose = _get_compose(user_data)
+        assert compose is not None
+        assert compose["step"] == COMPOSE_NEED_CONTENT
+        assert compose["instructions"] is None
+
+        # Step 2: user provides content that previously triggered misroute
+        content_text = "Please share notes from today's class"
+        await _continue_compose_flow(update, context, content_text)
+        compose = _get_compose(user_data)
+        assert compose is not None
+        # Content was captured, not treated as recipient
+        assert compose["instructions"] == content_text
+        # No recipient yet -> now asking for recipient
+        assert compose["step"] == COMPOSE_NEED_RECIPIENT
+
+    asyncio.run(_run())
+
+
+def test_chat_message_content_step_routes_to_continue_not_breakout():
+    """chat_message must route content-step text directly to
+    _continue_compose_flow without running breakout detection."""
+    from bot.handlers import COMPOSE_NEED_CONTENT, chat_message
+
+    user_data: dict = {
+        "compose": {
+            "step": COMPOSE_NEED_CONTENT,
+            "recipient": None,
+            "instructions": None,
+            "draft": None,
+        }
+    }
+    update = MagicMock()
+    update.effective_user = MagicMock(id=1)
+    update.effective_chat = MagicMock(id=1, type="private")
+    update.message.text = "Please share notes from today's class"
+    update.message.reply_text = AsyncMock()
+    update.message.entities = []
+    context = MagicMock()
+    context.user_data = user_data
+    context.bot = MagicMock(id=2, username="bot")
+
+    async def _run():
+        with patch("bot.handlers._is_owner", return_value=True):
+            await chat_message(update, context)
+        # Compose must still exist and have content captured
+        compose = _get_compose(user_data)
+        assert compose is not None
+        assert compose["instructions"] == "Please share notes from today's class"
+
+    asyncio.run(_run())

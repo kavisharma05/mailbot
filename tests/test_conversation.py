@@ -201,3 +201,27 @@ def test_clear_convo():
     clear_convo(user_data)
     assert "convo" not in user_data
     assert "compose" not in user_data
+
+
+def test_compose_content_step_does_not_intercept_as_recipient():
+    """When asked 'What do you want to say?', content containing 'from' or
+    'class' must be treated as content, not as a recipient clarification.
+    Regression test for the send-flow bug where the bot never asked
+    'Who should I send it to?'."""
+    from bot.handlers import (
+        COMPOSE_NEED_CONTENT,
+        COMPOSE_NEED_RECIPIENT,
+        _is_compose_recipient_reply,
+    )
+
+    convo = {"last_person": None, "last_person_email": None}
+    compose = {"step": COMPOSE_NEED_CONTENT, "recipient": None, "instructions": None}
+
+    # Content that previously triggered the recipient-reply misroute must
+    # NOT be treated as a recipient reply when we're asking for content.
+    assert not _is_compose_recipient_reply("Please share notes from today's class", convo, compose)
+    assert not _is_compose_recipient_reply("Remind them the deadline for the report", convo, compose)
+
+    # When step is need_recipient, recipient detection still works
+    compose_recipient = {"step": COMPOSE_NEED_RECIPIENT, "recipient": None}
+    assert _is_compose_recipient_reply("saleena@imtnag.ac.in", convo, compose_recipient)

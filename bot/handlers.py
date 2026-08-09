@@ -1298,6 +1298,15 @@ def _looks_like_compose_breakout(text: str) -> bool:
         return True
     if re.search(r"\b(?:show|list|how many|count)\b.+\b(?:mail|email)", q):
         return True
+    # The classifier fallback below is too aggressive for short answers that
+    # are really recipient names/content (e.g. "saleena" -> mailbox_qa by
+    # default). Only run it when the text reads like an actual question or
+    # command, not a short reply to "who should I send it to?".
+    looks_like_question = "?" in q or q.startswith(
+        ("what", "when", "who", "where", "why", "how", "is ", "are ", "do ", "did ", "can ", "could ", "show ", "list ")
+    )
+    if not looks_like_question and len(q.split()) <= 4:
+        return False
     classified = classify_message(text, None)
     return classified.get("intent") in {
         INTENT_CONTACT_LOOKUP,
@@ -1317,7 +1326,10 @@ def _is_compose_recipient_reply(
     if not compose:
         return False
     step = compose.get("step")
-    if step not in (COMPOSE_NEED_CONTENT, COMPOSE_NEED_RECIPIENT):
+    # Only intercept as recipient reply when we're actively asking for a
+    # recipient. When we're asking for content, the text is content — even
+    # if it happens to contain "from" or a person name.
+    if step != COMPOSE_NEED_RECIPIENT:
         return False
     if "@" in text:
         return True
@@ -1623,14 +1635,25 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         convo = get_convo(context.user_data)
         compose = _get_compose(context.user_data)
-        if _is_compose_recipient_reply(text, convo, compose):
+        step = compose.get("step")
+
+        if step == COMPOSE_NEED_CONTENT:
+            # User was asked "What do you want to say?" — treat ANY text as
+            # email content. Do NOT run recipient-reply or breakout checks
+            # here; those misrouted legitimate content (e.g. text containing
+            # "from" or "class") and silently killed the compose draft.
             await _continue_compose_flow(update, context, text)
             return
-        if _looks_like_compose_breakout(text):
-            _clear_compose(context.user_data)
-        else:
-            await _continue_compose_flow(update, context, text)
-            return
+
+        if step == COMPOSE_NEED_RECIPIENT:
+            if _is_compose_recipient_reply(text, convo, compose):
+                await _continue_compose_flow(update, context, text)
+                return
+            if _looks_like_compose_breakout(text):
+                _clear_compose(context.user_data)
+            else:
+                await _continue_compose_flow(update, context, text)
+                return
 
     if _get_add_task(context.user_data):
         text = update.message.text

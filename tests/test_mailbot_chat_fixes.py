@@ -88,8 +88,12 @@ def test_compose_breakout_allows_received_mail_from_person():
 
 def test_compose_recipient_reply_detects_clarification():
     convo = {"last_person": "saleena mam", "last_person_email": "skhan@imtnag.ac.in"}
-    compose = {"step": "need_content", "recipient": None}
-    assert _is_compose_recipient_reply("We have received mail from saleena", convo, compose)
+    # Recipient reply detection should only fire when we're asking for a recipient,
+    # not when we're asking for content (otherwise content with "from" is misrouted).
+    compose_content = {"step": "need_content", "recipient": None}
+    assert not _is_compose_recipient_reply("We have received mail from saleena", convo, compose_content)
+    compose_recipient = {"step": "need_recipient", "recipient": None}
+    assert _is_compose_recipient_reply("We have received mail from saleena", convo, compose_recipient)
     assert _looks_like_recipient_only_message("We have received mail from saleena")
 
 
