@@ -134,6 +134,7 @@ def _openai_compatible_post(
     temperature: float,
     provider: str,
     extra_headers: dict[str, str] | None = None,
+    extra_payload: dict[str, Any] | None = None,
 ) -> str | None:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -154,6 +155,8 @@ def _openai_compatible_post(
     if json_mode:
         # Some providers ignore this; prompts still request JSON.
         payload["response_format"] = {"type": "json_object"}
+    if extra_payload:
+        payload.update(extra_payload)
 
     for attempt in range(1, 3):
         try:
@@ -177,22 +180,34 @@ def _openai_compatible_post(
                     _cooldown(provider, daily=_is_daily_limit_text(body), seconds=180)
                 elif resp.status_code in (401, 403):
                     _cooldown(provider, seconds=3600)
+                elif resp.status_code == 402:
+                    # Payment/quota exhausted — back off for an hour, don't hammer.
+                    _cooldown(provider, seconds=3600)
+                elif resp.status_code == 404:
+                    # Model retired/renamed — back off for hours, not seconds.
+                    _cooldown(provider, seconds=6 * 3600)
                 return None
 
             data = resp.json()
             message = (data.get("choices") or [{}])[0].get("message", {}) or {}
-            text = (message.get("content") or message.get("reasoning") or "").strip()
-            if isinstance(text, list):
+            raw_content = message.get("content")
+            if isinstance(raw_content, list):
                 # Some Gemini OpenAI-compat shapes return content parts
-                text = "".join(
+                raw_content = "".join(
                     part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in text
-                ).strip()
+                    for part in raw_content
+                )
+            text = (raw_content or "").strip()
             if text:
                 logger.info("LLM answered via %s model=%s", provider, model)
                 _mark_ok(provider)
                 return text
-            _set_last_error("empty response", resp.status_code, provider)
+            # Never serve hidden chain-of-thought (reasoning field) as the answer:
+            # reasoning models can exhaust max_tokens before producing content.
+            _set_last_error("empty content (reasoning-only response)", resp.status_code, provider)
+            logger.warning(
+                "%s returned empty content (reasoning-only?) model=%s", provider, model
+            )
             return None
         except Exception as exc:
             if attempt < 2:
@@ -200,6 +215,8 @@ def _openai_compatible_post(
                 continue
             _set_last_error(str(exc), None, provider)
             logger.error("%s exception: %s", provider, exc)
+            # Repeated connection/SSL failures shouldn't be retried every call.
+            _cooldown(provider, seconds=300)
             return None
     return None
 
@@ -234,6 +251,10 @@ def _call_groq(
             }
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
+            if "gpt-oss" in model:
+                # gpt-oss is a reasoning model — keep reasoning lean so hidden
+                # chain-of-thought can't starve the answer budget (or quota).
+                kwargs["reasoning_effort"] = "low"
 
             resp = client.chat.completions.create(**kwargs)
             text = (resp.choices[0].message.content or "").strip()
@@ -250,6 +271,15 @@ def _call_groq(
             if exc.status_code in (401, 403):
                 _cooldown(provider, seconds=3600)
                 logger.error("%s auth failed (%s): %s", provider, exc.status_code, exc)
+                return None
+            if exc.status_code == 402:
+                _cooldown(provider, seconds=3600)
+                logger.error("%s payment/quota exhausted: %s", provider, exc)
+                return None
+            if exc.status_code == 404:
+                # Model retired/renamed — back off for hours, not seconds.
+                _cooldown(provider, seconds=6 * 3600)
+                logger.error("%s model not found (retired?): %s", provider, exc)
                 return None
             if exc.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS:
                 delay = min(2 ** (attempt - 1), 2)
@@ -268,6 +298,7 @@ def _call_groq(
         except Exception as exc:
             _set_last_error(str(exc), None, provider)
             logger.error("%s exception: %s", provider, exc)
+            _cooldown(provider, seconds=300)
             return None
     return None
 
@@ -370,6 +401,7 @@ def _call_openrouter(
             "HTTP-Referer": settings.render_url or "https://mailbot.local",
             "X-Title": "Mailbot",
         },
+        extra_payload={"reasoning": {"exclude": True}},
     )
 
 
@@ -389,6 +421,9 @@ def _call_nemotron(
         if json_mode
         else settings.nemotron_brain_model
     )
+    # Reasoning models burn a large share of max_tokens on hidden chain-of-thought
+    # before emitting the answer — give them headroom so content isn't truncated.
+    safe_max_tokens = max(max_tokens * 3, 1500)
     return _openai_compatible_post(
         url=_OPENROUTER_URL,
         api_key=settings.nemotron_api_key,
@@ -396,65 +431,99 @@ def _call_nemotron(
         system=system,
         user=user,
         json_mode=json_mode,
-        max_tokens=max_tokens,
+        max_tokens=safe_max_tokens,
         temperature=temperature,
         provider="nemotron",
         extra_headers={
             "HTTP-Referer": settings.render_url or "https://mailbot.local",
             "X-Title": "Mailbot",
         },
+        extra_payload={"reasoning": {"exclude": True}},
     )
 
 
 ProviderFn = Callable[..., str | None]
 
 
-def _provider_chain() -> list[tuple[str, ProviderFn]]:
+def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
+    """Provider order, tuned per mode.
+
+    Text mode ("brain"): Nemotron first — strongest reasoning for Q&A answers.
+    JSON mode (drafts, timetable parsing, classification): strict-formatting,
+    non-reasoning models first — reasoning models can burn the whole token
+    budget on hidden chain-of-thought and return no parseable JSON.
+    """
     settings = get_settings()
     chain: list[tuple[str, ProviderFn]] = []
 
-    if settings.nemotron_api_key:
-        chain.append(("nemotron", _call_nemotron))
-    if settings.groq_api_key:
-        chain.append(
-            (
-                "groq",
-                lambda system, user, json_mode, max_tokens, temperature: _call_groq(
-                    system,
-                    user,
-                    json_mode=json_mode,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    api_key=settings.groq_api_key,
-                    model=settings.groq_model,
-                    provider="groq",
-                ),
+    def add_nemotron() -> None:
+        if settings.nemotron_api_key:
+            chain.append(("nemotron", _call_nemotron))
+
+    def add_groq() -> None:
+        if settings.groq_api_key:
+            chain.append(
+                (
+                    "groq",
+                    lambda system, user, json_mode, max_tokens, temperature: _call_groq(
+                        system,
+                        user,
+                        json_mode=json_mode,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        api_key=settings.groq_api_key,
+                        model=settings.groq_model,
+                        provider="groq",
+                    ),
+                )
             )
-        )
-    if settings.groq_api_key_2:
-        chain.append(
-            (
-                "groq_2",
-                lambda system, user, json_mode, max_tokens, temperature: _call_groq(
-                    system,
-                    user,
-                    json_mode=json_mode,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    api_key=settings.groq_api_key_2,
-                    model=settings.groq_model,
-                    provider="groq_2",
-                ),
+        if settings.groq_api_key_2:
+            chain.append(
+                (
+                    "groq_2",
+                    lambda system, user, json_mode, max_tokens, temperature: _call_groq(
+                        system,
+                        user,
+                        json_mode=json_mode,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        api_key=settings.groq_api_key_2,
+                        model=settings.groq_model,
+                        provider="groq_2",
+                    ),
+                )
             )
-        )
-    if settings.cerebras_api_key:
-        chain.append(("cerebras", _call_cerebras))
-    if settings.gemini_api_key:
-        chain.append(("gemini", _call_gemini))
-    if settings.github_models_token:
-        chain.append(("github_models", _call_github_models))
-    if settings.openrouter_api_key:
-        chain.append(("openrouter", _call_openrouter))
+
+    def add_gemini() -> None:
+        if settings.gemini_api_key:
+            chain.append(("gemini", _call_gemini))
+
+    def add_cerebras() -> None:
+        if settings.cerebras_api_key:
+            chain.append(("cerebras", _call_cerebras))
+
+    def add_openrouter() -> None:
+        if settings.openrouter_api_key:
+            chain.append(("openrouter", _call_openrouter))
+
+    def add_github_models() -> None:
+        if settings.github_models_token:
+            chain.append(("github_models", _call_github_models))
+
+    if json_mode:
+        add_groq()
+        add_gemini()
+        add_cerebras()
+        add_nemotron()
+        add_openrouter()
+        add_github_models()
+    else:
+        add_nemotron()
+        add_groq()
+        add_gemini()
+        add_cerebras()
+        add_openrouter()
+        add_github_models()
     return chain
 
 
@@ -470,13 +539,20 @@ def _complete(
     max_tokens: int,
     model: str | None = None,
     temperature: float = 0.3,
+    validator: Callable[[str], bool] | None = None,
 ) -> str | None:
-    """Try free providers in order; skip cooled-down ones."""
+    """Try free providers in order; skip cooled-down ones.
+
+    When ``validator`` is given, a provider whose response fails validation is
+    skipped (brief cooldown) and the next provider is tried — a model that
+    returns unusable output (e.g. non-JSON for a JSON call) no longer poisons
+    the whole request.
+    """
     _set_last_error(None, None, None)
     # `model` arg kept for API compat; per-provider env models are used.
     _ = model
 
-    for name, fn in _provider_chain():
+    for name, fn in _provider_chain(json_mode=json_mode):
         if _is_cooled(name):
             logger.info("Skipping %s (cooldown)", name)
             continue
@@ -488,8 +564,16 @@ def _complete(
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        if text:
-            return text
+        if not text:
+            continue
+        if validator is not None and not validator(text):
+            logger.warning(
+                "Provider %s returned unusable payload — trying next provider", name
+            )
+            _set_last_error("unusable payload", None, name)
+            _cooldown(name, seconds=45)
+            continue
+        return text
     logger.error("All LLM providers failed or cooled down")
     return None
 
@@ -520,10 +604,26 @@ def _parse_json_text(text: str) -> dict[str, Any] | None:
     return None
 
 
-def call_json(system: str, user: str, model: str | None = None) -> dict[str, Any] | None:
-    """Call LLM and parse strict JSON from the response."""
+def call_json(
+    system: str,
+    user: str,
+    model: str | None = None,
+    *,
+    max_tokens: int = 1000,
+) -> dict[str, Any] | None:
+    """Call LLM and parse strict JSON from the response.
+
+    Providers that return unparseable output are skipped in favour of the next
+    provider in the chain (see _complete's validator).
+    """
     text = _complete(
-        system, user, json_mode=True, max_tokens=900, model=model, temperature=0.2
+        system,
+        user,
+        json_mode=True,
+        max_tokens=max_tokens,
+        model=model,
+        temperature=0.2,
+        validator=lambda t: _parse_json_text(t) is not None,
     )
     if not text:
         return None

@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     remind_again_hours: int = 4
 
     groq_api_key: str
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
     # Optional second Groq free account for rotation
     groq_api_key_2: str = ""
 
@@ -37,11 +37,11 @@ class Settings(BaseSettings):
 
     # Fallback when Groq hits rate limits (https://cloud.cerebras.ai)
     cerebras_api_key: str = ""
-    cerebras_model: str = "gemma-4-31b"
+    cerebras_model: str = "gpt-oss-120b"
 
     # Free provider pool extras
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-3.6-flash"
     github_models_token: str = ""
     github_models_model: str = "openai/gpt-4o-mini"
     openrouter_api_key: str = ""

@@ -606,7 +606,10 @@ def _llm_parse_schedule_chunk(
         "and faculty initials.\n\n"
         f"Timetable text (layout-preserved from PDF):\n{chunk[:8000]}"
     )
-    sessions = _normalize_parsed_sessions(call_json(system, user), force_date=force_date)
+    # Full-week timetables can produce long JSON — give the model room.
+    sessions = _normalize_parsed_sessions(
+        call_json(system, user, max_tokens=2200), force_date=force_date
+    )
     return _correct_session_times_from_layout(
         sessions, chunk=chunk, columns=columns or _extract_time_columns(chunk)
     )
