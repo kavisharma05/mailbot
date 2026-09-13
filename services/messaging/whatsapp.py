@@ -67,7 +67,7 @@ class WhatsAppClient:
         return any(marker in msg for marker in _OUTSIDE_WINDOW_MARKERS)
 
     async def mark_read(self, message_id: str) -> None:
-        if not message_id or not self.enabled:
+        if not message_id or not self.can_send:
             return
         payload = {
             "messaging_product": "whatsapp",

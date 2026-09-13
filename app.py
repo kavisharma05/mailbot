@@ -228,6 +228,34 @@ async def healthz():
     return {"status": status, "llm": get_llm_status(), "db": db}
 
 
+@fastapi_app.get("/privacy", response_class=HTMLResponse)
+async def privacy_policy():
+    """Public privacy policy (required by Meta to switch the app to Live mode)."""
+    settings = get_settings()
+    name = _escape_html(settings.student_name or "Mailbot operator")
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Mailbot Privacy Policy</title></head>
+<body>
+<h1>Privacy Policy</h1>
+<p><strong>Mailbot</strong> is a personal assistant operated by {name}. It connects
+Gmail and messaging apps (Telegram, WhatsApp) to send task reminders and email alerts.</p>
+<h2>Data we process</h2>
+<ul>
+<li>Email metadata and content from the linked Gmail account (classification and alerts only).</li>
+<li>Messages you send to the bot on Telegram or WhatsApp (commands and chat).</li>
+<li>Task and reminder data stored in our database (Supabase).</li>
+</ul>
+<h2>How we use it</h2>
+<p>Data is used only to run the assistant for the account owner. We do not sell or share
+personal data with third parties except service providers (hosting, email, messaging APIs)
+needed to operate the bot.</p>
+<h2>Retention &amp; deletion</h2>
+<p>Data is kept while the service is in use. To request deletion, contact the operator
+via the same Telegram or email account linked to the bot.</p>
+<p><em>Last updated: September 2026</em></p>
+</body></html>"""
+
+
 async def _process_whatsapp_payload(payload: dict) -> None:
     client = get_whatsapp_client()
     messages = extract_inbound_messages(payload)
@@ -281,6 +309,7 @@ async def whatsapp_webhook_verify(request: Request):
 async def whatsapp_webhook(request: Request) -> Response:
     settings = get_settings()
     body = await request.body()
+    logger.info("WhatsApp webhook POST (%s bytes)", len(body))
     secret = (settings.whatsapp_app_secret or "").strip()
     if secret:
         signature = request.headers.get("X-Hub-Signature-256") or ""
