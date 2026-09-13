@@ -19,6 +19,20 @@ logger = logging.getLogger(__name__)
 # Re-engagement / outside 24h customer service window (common subcodes vary).
 _OUTSIDE_WINDOW_MARKERS = ("131047", "131026", "470", "outside the allowed window")
 
+# Shared HTTP client: keep-alive pooling avoids a fresh TLS handshake to
+# graph.facebook.com on every send (saves ~100-300ms per API call).
+_shared_http: httpx.AsyncClient | None = None
+
+
+def _http() -> httpx.AsyncClient:
+    global _shared_http
+    if _shared_http is None or _shared_http.is_closed:
+        _shared_http = httpx.AsyncClient(
+            timeout=httpx.Timeout(45.0),
+            limits=httpx.Limits(max_keepalive_connections=10, keepalive_expiry=300),
+        )
+    return _shared_http
+
 
 class WhatsAppClient:
     def __init__(self, settings: Settings) -> None:
@@ -66,24 +80,35 @@ class WhatsAppClient:
         msg = str(err.get("message", "")) + str(err.get("error_subcode", "")) + str(err.get("code", ""))
         return any(marker in msg for marker in _OUTSIDE_WINDOW_MARKERS)
 
-    async def mark_read(self, message_id: str) -> None:
+    async def mark_read(self, message_id: str, *, typing: bool = False) -> None:
+        """Mark a message read; optionally show the 'typing…' indicator.
+
+        The typing indicator stays visible until we reply (or ~25s pass),
+        which makes LLM-backed answers feel much more responsive.
+        """
         if not message_id or not self.can_send:
             return
-        payload = {
+        payload: dict[str, Any] = {
             "messaging_product": "whatsapp",
             "status": "read",
             "message_id": message_id,
         }
+        if typing:
+            payload["typing_indicator"] = {"type": "text"}
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                await client.post(self._messages_url(), headers=self._headers(), json=payload)
+            await _http().post(
+                self._messages_url(), headers=self._headers(), json=payload, timeout=20
+            )
         except Exception as exc:
             logger.debug("WhatsApp mark_read failed: %s", exc)
 
+    async def send_typing(self, message_id: str) -> None:
+        """Show 'typing…' for an inbound message (also marks it read)."""
+        await self.mark_read(message_id, typing=True)
+
     async def _post_message(self, to: str, payload: dict[str, Any]) -> httpx.Response:
         body = {"messaging_product": "whatsapp", "to": self._normalize_to(to), **payload}
-        async with httpx.AsyncClient(timeout=45) as client:
-            return await client.post(self._messages_url(), headers=self._headers(), json=body)
+        return await _http().post(self._messages_url(), headers=self._headers(), json=body)
 
     async def send_template(
         self,
@@ -155,6 +180,16 @@ class WhatsAppClient:
                 break
         return ok
 
+    async def send_interactive(self, to: str, interactive: dict[str, Any]) -> bool:
+        """Send a raw interactive payload (reply buttons or list message)."""
+        if not self.can_send or not interactive:
+            return False
+        resp = await self._post_message(to, {"type": "interactive", "interactive": interactive})
+        if resp.status_code >= 400:
+            logger.warning("WhatsApp interactive send failed %s: %s", resp.status_code, resp.text[:500])
+            return False
+        return True
+
     async def send_document(
         self,
         to: str,
@@ -167,39 +202,41 @@ class WhatsAppClient:
             return False
         to_norm = self._normalize_to(to)
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                upload = await client.post(
-                    self._media_url(),
-                    headers={"Authorization": f"Bearer {self._token}"},
-                    data={"messaging_product": "whatsapp", "type": "application/octet-stream"},
-                    files={"file": (filename or "attachment", data)},
-                )
-                if upload.status_code >= 400:
-                    logger.warning("WhatsApp media upload failed: %s", upload.text[:400])
-                    return False
-                media_id = (upload.json() or {}).get("id")
-                if not media_id:
-                    return False
-                doc: dict[str, Any] = {"id": media_id, "filename": filename[:240]}
-                payload: dict[str, Any] = {
-                    "type": "document",
-                    "document": doc,
-                }
-                if caption:
-                    payload["document"]["caption"] = caption[:1024]
-                resp = await client.post(
-                    self._messages_url(),
-                    headers=self._headers(),
-                    json={
-                        "messaging_product": "whatsapp",
-                        "to": to_norm,
-                        **payload,
-                    },
-                )
-                if resp.status_code >= 400:
-                    logger.warning("WhatsApp document send failed: %s", resp.text[:400])
-                    return False
-                return True
+            client = _http()
+            upload = await client.post(
+                self._media_url(),
+                headers={"Authorization": f"Bearer {self._token}"},
+                data={"messaging_product": "whatsapp", "type": "application/octet-stream"},
+                files={"file": (filename or "attachment", data)},
+                timeout=60,
+            )
+            if upload.status_code >= 400:
+                logger.warning("WhatsApp media upload failed: %s", upload.text[:400])
+                return False
+            media_id = (upload.json() or {}).get("id")
+            if not media_id:
+                return False
+            doc: dict[str, Any] = {"id": media_id, "filename": filename[:240]}
+            payload: dict[str, Any] = {
+                "type": "document",
+                "document": doc,
+            }
+            if caption:
+                payload["document"]["caption"] = caption[:1024]
+            resp = await client.post(
+                self._messages_url(),
+                headers=self._headers(),
+                json={
+                    "messaging_product": "whatsapp",
+                    "to": to_norm,
+                    **payload,
+                },
+                timeout=60,
+            )
+            if resp.status_code >= 400:
+                logger.warning("WhatsApp document send failed: %s", resp.text[:400])
+                return False
+            return True
         except Exception as exc:
             logger.warning("WhatsApp send_document error: %s", exc)
             return False

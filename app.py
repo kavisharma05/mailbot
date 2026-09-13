@@ -268,7 +268,9 @@ async def _process_whatsapp_payload(payload: dict) -> None:
             logger.info("Skipping duplicate WhatsApp message id=%s", msg_id)
             continue
         if msg_id:
-            await client.mark_read(msg_id)
+            # Mark read + show "typing…" immediately so the user gets instant
+            # feedback while the handler (sometimes an LLM call) works.
+            await client.mark_read(msg_id, typing=True)
         try:
             await process_whatsapp_message(phone, msg)
         except Exception as exc:

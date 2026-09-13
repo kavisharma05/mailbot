@@ -12,6 +12,7 @@ from bot.whatsapp_adapter import (
     owner_phone_for_bot,
     whatsapp_bot,
 )
+from bot.whatsapp_menu import CMD_PREFIX, MENU_KEYWORDS, send_main_menu
 from services.messaging.phone import normalize_wa_digits, wa_phones_match
 from services.messaging.state import load_user_data, save_user_data
 
@@ -38,8 +39,27 @@ _COMMANDS: dict[str, object] = {
     "backfill_contacts": handlers.backfill_contacts_command,
 }
 
+# Commands that show the WhatsApp-native interactive menu instead of the
+# Telegram-oriented text (start/help share the same handler on Telegram).
+_MENU_COMMAND_STYLES = {"start": "welcome", "help": "help", "menu": "menu"}
+
 
 async def _dispatch_callback(data: str, phone: str, user_data: dict) -> None:
+    # Main-menu rows carry "cmd:<name>" — dispatch as if the user typed /<name>.
+    if data.startswith(CMD_PREFIX):
+        cmd = data[len(CMD_PREFIX):].strip().lower()
+        handler = _COMMANDS.get(cmd)
+        if handler:
+            if cmd in _MENU_COMMAND_STYLES:
+                await send_main_menu(phone, style=_MENU_COMMAND_STYLES[cmd])
+                return
+            update = build_text_update(phone, f"/{cmd}", "")
+            context = WhatsAppContext(bot=whatsapp_bot, user_data=user_data)
+            await handler(update, context)  # type: ignore[operator]
+        else:
+            logger.info("Unknown WhatsApp menu command: %s", cmd[:40])
+        return
+
     update = build_callback_update(phone, data)
     context = WhatsAppContext(bot=whatsapp_bot, user_data=user_data)
 
@@ -68,11 +88,19 @@ async def _dispatch_text(text: str, phone: str, message_id: str, user_data: dict
         parts = stripped.split()
         cmd = parts[0][1:].split("@")[0].lower()
         context.args = parts[1:]
+        if cmd in _MENU_COMMAND_STYLES:
+            await send_main_menu(phone, style=_MENU_COMMAND_STYLES[cmd])
+            return
         handler = _COMMANDS.get(cmd)
         if handler:
             update = build_text_update(phone, stripped, message_id)
             await handler(update, context)  # type: ignore[operator]
             return
+
+    # Bare "menu" keyword (MNP-bot style) opens the interactive menu.
+    if stripped.lower() in MENU_KEYWORDS:
+        await send_main_menu(phone, style="menu")
+        return
 
     # Quick-action labels (same as Telegram reply keyboard)
     if stripped in handlers.QUICK_ACTION_LABELS:

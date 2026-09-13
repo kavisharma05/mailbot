@@ -26,14 +26,23 @@ class SupabasePersistence(DictPersistence):
             callback_data=False,
         )
         all_states = load_all_user_data_states()
-        user_data_json = json.dumps(all_states) if all_states else ""
+        # The same table also holds WhatsApp sessions under "wa:<phone>" keys
+        # (see services/messaging/state.py). PTB requires integer user ids, so
+        # keep only numeric keys here — WhatsApp rows are loaded lazily per
+        # inbound message and must not crash app startup.
+        tg_states = {
+            k: v
+            for k, v in (all_states or {}).items()
+            if str(k).isdigit() and isinstance(v, dict)
+        }
+        user_data_json = json.dumps(tg_states) if tg_states else ""
         super().__init__(
             store_data=store,
             user_data_json=user_data_json,
             update_interval=update_interval,
         )
-        if all_states:
-            logger.info("Loaded user_data for %d user(s) from Supabase", len(all_states))
+        if tg_states:
+            logger.info("Loaded user_data for %d Telegram user(s) from Supabase", len(tg_states))
 
     async def update_user_data(self, user_id: int, data: dict) -> None:
         await super().update_user_data(user_id, data)

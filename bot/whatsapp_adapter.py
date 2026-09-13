@@ -32,9 +32,16 @@ class WhatsAppUser:
 class WhatsAppChat:
     id: int
     type: str = ChatType.PRIVATE
+    # Inbound message id enables the Cloud API "typing…" indicator.
+    inbound_message_id: str = ""
 
     async def send_action(self, action: str) -> None:
-        del action  # typing indicator not supported; mark_read handled upstream
+        if action != "typing" or not self.inbound_message_id:
+            return
+        try:
+            await get_whatsapp_client().send_typing(self.inbound_message_id)
+        except Exception as exc:
+            logger.debug("WhatsApp typing indicator failed: %s", exc)
 
 
 class WhatsAppMessage:
@@ -45,7 +52,7 @@ class WhatsAppMessage:
         self._bot = bot
         uid = _phone_to_user_id(phone)
         self.from_user = WhatsAppUser(id=uid)
-        self.chat = WhatsAppChat(id=uid)
+        self.chat = WhatsAppChat(id=uid, inbound_message_id=message_id)
         self.reply_to_message = None
 
     async def reply_text(self, text: str, parse_mode: str | None = None, reply_markup: Any = None, **kwargs: Any):
