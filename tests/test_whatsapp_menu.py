@@ -73,12 +73,10 @@ def test_router_menu_keyword_sends_menu(router_env, monkeypatch):
     assert sent == ["menu"]
 
 
-def test_router_menu_skips_session_load(router_env, monkeypatch):
-    loads: list[str] = []
+def test_router_menu_skips_session_save_when_unchanged(router_env, monkeypatch):
     saves: list[str] = []
 
-    async def fake_load(phone):
-        loads.append(phone)
+    async def fake_load(_phone):
         return {}
 
     async def fake_save(phone, _data):
@@ -87,16 +85,19 @@ def test_router_menu_skips_session_load(router_env, monkeypatch):
     async def fake_menu(phone, *, style="menu"):
         return True
 
+    async def fake_flush(_phone, user_data=None):
+        return False
+
     monkeypatch.setattr(router_env, "load_user_data", fake_load)
     monkeypatch.setattr(router_env, "save_user_data", fake_save)
     monkeypatch.setattr(router_env, "send_main_menu", fake_menu)
+    monkeypatch.setattr(router_env, "flush_pending_digest", fake_flush)
     _run(
         router_env.process_whatsapp_message(
             "1111111111",
             {"id": "m-menu", "type": "text", "text": {"body": "/start"}},
         )
     )
-    assert loads == []
     assert saves == []
 
 

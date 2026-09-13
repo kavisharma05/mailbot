@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     whatsapp_owner_phone: str = ""
     whatsapp_api_version: str = "v22.0"
     whatsapp_alert_template: str = ""
+    whatsapp_digest_template: str = ""
     whatsapp_waba_id: str = ""
     telegram_chat_deadlines: str = ""
     telegram_chat_placements: str = ""

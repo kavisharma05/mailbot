@@ -63,7 +63,7 @@ When `WHATSAPP_ENABLED=true`, owner DMs are mirrored to WhatsApp and you can run
 3. Set `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_OWNER_PHONE` (E.164 digits, no `+`)
 4. Set `WHATSAPP_VERIFY_TOKEN` (any random string) and `WHATSAPP_APP_SECRET` (App Dashboard → Settings → Basic)
 5. In Meta → WhatsApp → Configuration, set callback URL `https://<RENDER_URL>/whatsapp/webhook` and the same verify token; subscribe to **messages**
-6. Approve a **utility template** (e.g. `mailbot_alert_v1`) and set `WHATSAPP_ALERT_TEMPLATE` for proactive digests/reminders outside the 24h session window (paid per conversation on WhatsApp)
+6. Optional but recommended: approve a **utility template** (e.g. `mailbot_alert_v1`) with one body variable and set `WHATSAPP_ALERT_TEMPLATE` (or `WHATSAPP_DIGEST_TEMPLATE`). Morning/evening digests are mirrored to WhatsApp. If Meta's 24h window is closed, Mailbot **stashes** the full digest and sends that short template nudge; your next reply (`menu`, `digest`, or anything) opens the window and delivers the full briefing. Without a template, the stash still delivers on your next message.
 
 ```bash
 python scripts/setup_whatsapp_webhook.py --subscribe
@@ -177,7 +177,8 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `WHATSAPP_VERIFY_TOKEN` | Must match Meta webhook verify token |
 | `WHATSAPP_OWNER_PHONE` | Owner WhatsApp number (digits only, e.g. `917489491188`) |
 | `WHATSAPP_API_VERSION` | Graph version (default `v22.0`) |
-| `WHATSAPP_ALERT_TEMPLATE` | Approved template name for outside-24h proactive messages |
+| `WHATSAPP_ALERT_TEMPLATE` | Approved utility template for outside-24h nudges (one `{{1}}` body param) |
+| `WHATSAPP_DIGEST_TEMPLATE` | Optional digest-specific template; falls back to `WHATSAPP_ALERT_TEMPLATE` |
 | `WHATSAPP_WABA_ID` | WhatsApp Business Account ID (for `setup_whatsapp_webhook.py --subscribe`) |
 | `TELEGRAM_CHAT_DEADLINES` | Chat ID for deadline alerts (optional) |
 | `TELEGRAM_CHAT_PLACEMENTS` | Chat ID for placement alerts (optional) |

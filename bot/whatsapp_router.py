@@ -14,8 +14,10 @@ from bot.whatsapp_adapter import (
     whatsapp_bot,
 )
 from bot.whatsapp_menu import CMD_PREFIX, MENU_KEYWORDS, send_main_menu
+from services.messaging.pending_digest import DIGEST_KEYWORDS, flush_pending_digest
 from services.messaging.phone import normalize_wa_digits, wa_phones_match
 from services.messaging.state import load_user_data, save_user_data
+from services.messaging.whatsapp import get_whatsapp_client
 
 logger = logging.getLogger(__name__)
 
@@ -130,17 +132,38 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
     msg_id = str(message.get("id") or "")
     msg_type = message.get("type")
 
-    # Menu-only turns never touch session state — skip the Supabase round-trip.
+    # Any inbound message opens Meta's 24h window — deliver a stashed digest first.
+    user_data = await load_user_data(normalized)
+    snapshot = copy.deepcopy(user_data)
+    flushed = await flush_pending_digest(normalized, user_data)
+
+    # Menu / digest-keyword turns can return after the flush.
     if msg_type == "text":
         body = (message.get("text") or {}).get("body") or ""
         stripped = body.strip()
+        lower = stripped.lower()
         if stripped.startswith("/"):
             cmd = stripped.split()[0][1:].split("@")[0].lower()
             if cmd in _MENU_COMMAND_STYLES:
                 await send_main_menu(normalized, style=_MENU_COMMAND_STYLES[cmd])
+                if user_data != snapshot:
+                    await save_user_data(normalized, user_data)
                 return
-        if stripped.lower() in MENU_KEYWORDS:
+        if lower in MENU_KEYWORDS:
             await send_main_menu(normalized, style="menu")
+            if user_data != snapshot:
+                await save_user_data(normalized, user_data)
+            return
+        if lower in DIGEST_KEYWORDS:
+            if not flushed:
+                await get_whatsapp_client().send_text(
+                    normalized,
+                    "No stored digest right now. Morning (7 AM) and evening (8 PM) land here automatically.",
+                    from_html=False,
+                    template_fallback=False,
+                )
+            if user_data != snapshot:
+                await save_user_data(normalized, user_data)
             return
     elif msg_type == "interactive":
         interactive = message.get("interactive") or {}
@@ -154,10 +177,20 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
             cmd = cb[len(CMD_PREFIX):].strip().lower()
             if cmd in _MENU_COMMAND_STYLES:
                 await send_main_menu(normalized, style=_MENU_COMMAND_STYLES[cmd])
+                if user_data != snapshot:
+                    await save_user_data(normalized, user_data)
                 return
-
-    user_data = await load_user_data(normalized)
-    snapshot = copy.deepcopy(user_data)
+            if cmd == "digest":
+                if not flushed:
+                    await get_whatsapp_client().send_text(
+                        normalized,
+                        "No stored digest right now. Morning (7 AM) and evening (8 PM) land here automatically.",
+                        from_html=False,
+                        template_fallback=False,
+                    )
+                if user_data != snapshot:
+                    await save_user_data(normalized, user_data)
+                return
 
     try:
         if msg_type == "text":

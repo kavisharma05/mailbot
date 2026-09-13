@@ -23,6 +23,7 @@ from services.schedule import (
     refresh_schedule_from_gmail,
     sessions_for_day,
 )
+from services.messaging.pending_digest import deliver_whatsapp_digest
 from services.telegram_util import send_html_detailed
 
 logger = logging.getLogger(__name__)
@@ -43,12 +44,16 @@ def _deadline_local_date(item: dict[str, Any], tz) -> datetime | None:
     return dt.astimezone(tz)
 
 
-async def _send_owner_digest(bot, text: str) -> bool:
+async def _send_owner_digest(bot, text: str, *, kind: str = "morning") -> bool:
     settings = get_settings()
     owner = settings.telegram_owner_chat_id
     if not owner:
         return False
     result = await send_html_detailed(bot, owner, text)
+    try:
+        await deliver_whatsapp_digest(text, kind=kind)
+    except Exception as exc:
+        logger.warning("WhatsApp digest deliver failed: %s", exc)
     return result.ok
 
 
@@ -113,7 +118,7 @@ async def run_morning_digest(bot, *, dry_run: bool = False, force: bool = False)
 
     sent: list[str] = []
     if not dry_run:
-        if await _send_owner_digest(bot, text):
+        if await _send_owner_digest(bot, text, kind="morning"):
             sent.append("owner")
             await asyncio.to_thread(mark_digest_sent, "morning", today_date)
         elif lease_acquired:
@@ -189,7 +194,7 @@ async def run_evening_digest(bot, *, dry_run: bool = False, force: bool = False)
 
     sent: list[str] = []
     if not dry_run:
-        if await _send_owner_digest(bot, text):
+        if await _send_owner_digest(bot, text, kind="evening"):
             sent.append("owner")
             await asyncio.to_thread(mark_digest_sent, "evening", today_date)
         elif lease_acquired:

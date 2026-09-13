@@ -144,6 +144,7 @@ class WhatsAppClient:
         *,
         from_html: bool = True,
         reply_markup: Any = None,
+        template_fallback: bool = True,
     ) -> bool:
         if not self.can_send or not text or not str(text).strip():
             if not self.can_send:
@@ -171,7 +172,7 @@ class WhatsAppClient:
             if resp.status_code >= 400:
                 logger.warning("WhatsApp text send failed %s: %s", resp.status_code, resp.text[:500])
                 ok = False
-                if self._is_outside_window_error(resp):
+                if template_fallback and self._is_outside_window_error(resp):
                     tmpl = (self._settings.whatsapp_alert_template or "").strip()
                     if tmpl:
                         summary = prepare_outbound_text(text, from_html=from_html)

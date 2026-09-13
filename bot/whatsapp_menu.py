@@ -23,7 +23,8 @@ MENU_KEYWORDS = {"menu", "main menu", "options"}
 
 _WELCOME_BODY = (
     "👋 *Mailbot ready!*\n\n"
-    "Morning (7 AM) and evening (8 PM) digests land here.\n"
+    "Morning (7 AM) and evening (8 PM) digests land here — "
+    "if one is waiting, any reply opens it.\n"
     "Tap *📋 Open menu* below — or just type a question about "
     "your mail, deadlines, or tasks."
 )
@@ -55,6 +56,7 @@ _MENU_ROWS: list[tuple[str, str, str]] = [
     ("undated", "🗓️ Undated", "Tasks with no due date"),
     ("add", "➕ Add task", "Wizard or one-line add"),
     ("classes", "📚 Classes today", "Timetable for your section"),
+    ("digest", "📰 Daily digest", "Morning/evening briefing"),
     ("send", "✉️ Send email", "Compose with AI help"),
     ("status", "📊 Bot status", "Health and last check times"),
     ("help", "❓ All commands", "Full command list"),
