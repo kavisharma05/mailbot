@@ -12,6 +12,7 @@ from bot.whatsapp_adapter import (
     owner_phone_for_bot,
     whatsapp_bot,
 )
+from services.messaging.phone import normalize_wa_digits, wa_phones_match
 from services.messaging.state import load_user_data, save_user_data
 
 logger = logging.getLogger(__name__)
@@ -86,10 +87,16 @@ async def _dispatch_text(text: str, phone: str, message_id: str, user_data: dict
 async def process_whatsapp_message(phone: str, message: dict) -> None:
     """Handle one inbound WhatsApp message dict from Meta webhook payload."""
     owner = owner_phone_for_bot()
-    normalized = str(phone or "").lstrip("+").replace(" ", "").replace("-", "")
-    if owner and normalized != owner:
-        logger.info("Ignoring WhatsApp message from non-owner %s", normalized)
+    normalized = normalize_wa_digits(phone)
+    if owner and not wa_phones_match(normalized, owner):
+        logger.info(
+            "Ignoring WhatsApp message from non-owner %s (WHATSAPP_OWNER_PHONE=%s)",
+            normalized,
+            owner,
+        )
         return
+
+    logger.info("WhatsApp inbound from %s type=%s", normalized, message.get("type"))
 
     msg_id = str(message.get("id") or "")
     msg_type = message.get("type")

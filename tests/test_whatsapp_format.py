@@ -1,8 +1,14 @@
+from services.messaging.phone import wa_phones_match
 from services.messaging.format import (
     html_to_whatsapp,
     prepare_outbound_text,
     whatsapp_interactive_from_markup,
 )
+
+
+def test_wa_phones_match_country_code():
+    assert wa_phones_match("917489491188", "7489491188")
+    assert wa_phones_match("917489491188", "917489491188")
 
 
 def test_html_to_whatsapp_bold_and_breaks():

@@ -230,7 +230,11 @@ async def healthz():
 
 async def _process_whatsapp_payload(payload: dict) -> None:
     client = get_whatsapp_client()
-    for phone, msg in extract_inbound_messages(payload):
+    messages = extract_inbound_messages(payload)
+    if not messages:
+        logger.debug("WhatsApp webhook POST with no inbound messages")
+        return
+    for phone, msg in messages:
         msg_id = str(msg.get("id") or "")
         if not await should_process_webhook_event(msg_id):
             logger.info("Skipping duplicate WhatsApp message id=%s", msg_id)
@@ -282,6 +286,7 @@ async def whatsapp_webhook(request: Request) -> Response:
         signature = request.headers.get("X-Hub-Signature-256") or ""
         expected = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, signature):
+            logger.warning("WhatsApp webhook POST rejected: invalid X-Hub-Signature-256")
             raise HTTPException(status_code=403, detail="Invalid signature")
 
     try:

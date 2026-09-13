@@ -28,11 +28,16 @@ class WhatsAppClient:
         self._version = (settings.whatsapp_api_version or "v22.0").strip()
 
     @property
+    def can_send(self) -> bool:
+        """Token + phone number ID — enough to reply to inbound messages."""
+        return bool(self._token and self._phone_id)
+
+    @property
     def enabled(self) -> bool:
+        """Owner alert mirroring (requires explicit opt-in)."""
         return bool(
-            self._settings.whatsapp_enabled
-            and self._token
-            and self._phone_id
+            self.can_send
+            and self._settings.whatsapp_enabled
             and self._settings.whatsapp_owner_phone
         )
 
@@ -115,7 +120,9 @@ class WhatsAppClient:
         from_html: bool = True,
         reply_markup: Any = None,
     ) -> bool:
-        if not self.enabled or not text or not str(text).strip():
+        if not self.can_send or not text or not str(text).strip():
+            if not self.can_send:
+                logger.warning("WhatsApp send_text skipped: missing token or phone number ID")
             return False
 
         pieces = prepare_outbound_text(text, from_html=from_html)
