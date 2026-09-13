@@ -11,6 +11,16 @@ class Settings(BaseSettings):
     # Telegram user id for owner-only commands (defaults to owner chat id for DMs)
     telegram_owner_user_id: str = ""
     telegram_webhook_secret: str
+    # WhatsApp Cloud API (Meta) — optional second channel alongside Telegram
+    whatsapp_enabled: bool = False
+    whatsapp_access_token: str = ""
+    whatsapp_phone_number_id: str = ""
+    whatsapp_app_secret: str = ""
+    whatsapp_verify_token: str = ""
+    whatsapp_owner_phone: str = ""
+    whatsapp_api_version: str = "v22.0"
+    whatsapp_alert_template: str = ""
+    whatsapp_waba_id: str = ""
     telegram_chat_deadlines: str = ""
     telegram_chat_placements: str = ""
     telegram_chat_certification: str = ""

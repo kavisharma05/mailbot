@@ -54,7 +54,25 @@ python scripts/get_gmail_token.py
 
 Copy the printed `GMAIL_REFRESH_TOKEN` into `.env`.
 
-### 2. Telegram bot
+### 2. WhatsApp (optional, alongside Telegram)
+
+When `WHATSAPP_ENABLED=true`, owner DMs are mirrored to WhatsApp and you can run the same commands in a 1:1 WhatsApp chat.
+
+1. Create a Meta app with **WhatsApp** product at [developers.facebook.com](https://developers.facebook.com/)
+2. Create a **System User** permanent token with `whatsapp_business_messaging` (test tokens expire in ~24h)
+3. Set `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_OWNER_PHONE` (E.164 digits, no `+`)
+4. Set `WHATSAPP_VERIFY_TOKEN` (any random string) and `WHATSAPP_APP_SECRET` (App Dashboard → Settings → Basic)
+5. In Meta → WhatsApp → Configuration, set callback URL `https://<RENDER_URL>/whatsapp/webhook` and the same verify token; subscribe to **messages**
+6. Approve a **utility template** (e.g. `mailbot_alert_v1`) and set `WHATSAPP_ALERT_TEMPLATE` for proactive digests/reminders outside the 24h session window (paid per conversation on WhatsApp)
+
+```bash
+python scripts/setup_whatsapp_webhook.py --subscribe
+python scripts/setup_whatsapp_webhook.py --test-template --template hello_world
+```
+
+Notes: no Telegram-style groups on WhatsApp; category routing stays on Telegram. Interactive buttons use re-send instead of edit; max 3 quick-reply buttons (more actions use a list message).
+
+### 3. Telegram bot
 
 1. Message [@BotFather](https://t.me/BotFather) → `/newbot`
 2. Copy `TELEGRAM_BOT_TOKEN`
@@ -75,20 +93,20 @@ Create four Telegram groups and add your bot to each:
 
 To get each group's chat ID: send a message in the group, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` in your browser and look for `"chat":{"id":-100...}`. If a category chat ID is blank, alerts fall back to `TELEGRAM_OWNER_CHAT_ID`.
 
-### 3. Supabase
+### 4. Supabase
 
 1. Create a project at [supabase.com](https://supabase.com)
 2. Run `supabase/schema.sql` in the SQL editor
 3. If upgrading an existing project, also run the migration at the bottom of `supabase/schema.sql` to add the `category` column
 4. Copy `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` (service role, not anon)
 
-### 4. Groq (free)
+### 5. Groq (free)
 
 1. Get a free API key from [console.groq.com/keys](https://console.groq.com/keys)
 2. Set `GROQ_API_KEY` and optionally `GROQ_MODEL`
 3. Optionally set `CEREBRAS_API_KEY` as fallback when Groq hits daily limits
 
-### 5. Run locally
+### 6. Run locally
 
 ```bash
 uvicorn app:app --reload --port 8000
@@ -152,6 +170,15 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `TELEGRAM_OWNER_CHAT_ID` | Your Telegram chat ID (fallback for all alerts) |
 | `TELEGRAM_OWNER_USER_ID` | Optional Telegram **user** id for owner-only commands (defaults to owner chat id in DMs) |
 | `TELEGRAM_WEBHOOK_SECRET` | Random secret for webhook path |
+| `WHATSAPP_ENABLED` | `true` to mirror owner alerts and accept inbound WhatsApp commands |
+| `WHATSAPP_ACCESS_TOKEN` | Meta Graph API token (prefer System User permanent token) |
+| `WHATSAPP_PHONE_NUMBER_ID` | Phone number ID from WhatsApp → API Setup |
+| `WHATSAPP_APP_SECRET` | App secret for `X-Hub-Signature-256` on `/whatsapp/webhook` |
+| `WHATSAPP_VERIFY_TOKEN` | Must match Meta webhook verify token |
+| `WHATSAPP_OWNER_PHONE` | Owner WhatsApp number (digits only, e.g. `917489491188`) |
+| `WHATSAPP_API_VERSION` | Graph version (default `v22.0`) |
+| `WHATSAPP_ALERT_TEMPLATE` | Approved template name for outside-24h proactive messages |
+| `WHATSAPP_WABA_ID` | WhatsApp Business Account ID (for `setup_whatsapp_webhook.py --subscribe`) |
 | `TELEGRAM_CHAT_DEADLINES` | Chat ID for deadline alerts (optional) |
 | `TELEGRAM_CHAT_PLACEMENTS` | Chat ID for placement alerts (optional) |
 | `TELEGRAM_CHAT_CERTIFICATION` | Chat ID for certification alerts (optional; falls back to placements) |

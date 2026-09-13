@@ -11,6 +11,7 @@ from collections import OrderedDict
 _DEDUPE_TTL_SECONDS = 600
 _MAX_ENTRIES = 2000
 _seen: OrderedDict[int, float] = OrderedDict()
+_seen_str: OrderedDict[str, float] = OrderedDict()
 _lock = asyncio.Lock()
 
 # Outbound alert dedupe: suppress identical text to the same chat within TTL.
@@ -50,6 +51,24 @@ async def should_process_update(update_id: int | None) -> bool:
         _seen[update_id] = now
         while len(_seen) > _MAX_ENTRIES:
             _seen.popitem(last=False)
+        return True
+
+
+async def should_process_webhook_event(event_id: str | None) -> bool:
+    """Dedupe non-Telegram webhooks (e.g. WhatsApp message.id)."""
+    if not event_id:
+        return True
+    key = str(event_id)
+    now = time.monotonic()
+    async with _lock:
+        expired = [uid for uid, ts in _seen_str.items() if now - ts > _DEDUPE_TTL_SECONDS]
+        for uid in expired:
+            _seen_str.pop(uid, None)
+        if key in _seen_str:
+            return False
+        _seen_str[key] = now
+        while len(_seen_str) > _MAX_ENTRIES:
+            _seen_str.popitem(last=False)
         return True
 
 

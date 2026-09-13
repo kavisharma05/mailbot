@@ -171,7 +171,11 @@ def _is_owner(update: Update) -> bool:
     user = update.effective_user
     if not user:
         return False
-    return str(user.id) == str(settings.owner_user_id())
+    uid = str(user.id)
+    if uid == str(settings.owner_user_id()):
+        return True
+    wa_phone = (getattr(settings, "whatsapp_owner_phone", None) or "").lstrip("+").replace(" ", "").replace("-", "")
+    return bool(wa_phone and uid == wa_phone)
 
 
 def _category_for_chat(chat_id: int | str | None) -> str | None:

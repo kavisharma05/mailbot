@@ -9,12 +9,86 @@ from typing import Any
 from services.alert_actions import build_action_keyboard
 from services.attachments import format_marks_for_telegram, should_forward_attachment
 from services.formatting import escape_html
+from config import get_settings
+from services.messaging.whatsapp import get_whatsapp_client, is_owner_telegram_chat
 from services.telegram_dedupe import already_sent_content, record_content_sent
 from services.telegram_util import deliver_message, send_html_detailed
 
 logger = logging.getLogger(__name__)
 
 _DEDUPE_SENTINEL = -1
+
+
+def _whatsapp_owner_phone() -> str:
+    return (get_settings().whatsapp_owner_phone or "").lstrip("+").replace(" ", "").replace("-", "")
+
+
+async def _deliver_whatsapp_attachments(
+    attachments: list[dict[str, Any]] | None,
+    *,
+    caption_prefix: str | None = None,
+) -> bool:
+    client = get_whatsapp_client()
+    phone = _whatsapp_owner_phone()
+    if not client.enabled or not phone or not attachments:
+        return True
+
+    attempted = 0
+    sent = 0
+    for att in attachments:
+        intent = att.get("intent") or "other"
+        filename = att.get("filename") or "attachment"
+        extracted = (att.get("extracted_text") or "").strip()
+
+        if intent == "marks" and extracted:
+            attempted += 1
+            from services.attachments import format_marks_for_telegram
+
+            if await client.send_text(phone, format_marks_for_telegram(filename, extracted), from_html=True):
+                sent += 1
+            continue
+
+        if not att.get("forward") and intent != "reading":
+            continue
+        if intent == "reading" or should_forward_attachment(att):
+            data = att.get("data")
+            if not data:
+                continue
+            attempted += 1
+            caption = filename
+            if caption_prefix:
+                caption = f"{str(caption_prefix)[:80]}\n{filename}"
+            if await client.send_document(phone, data, filename, caption=caption[:1000]):
+                sent += 1
+    return attempted == 0 or sent == attempted
+
+
+async def _mirror_owner_alert_to_whatsapp(
+    chat_id: str,
+    text: str,
+    *,
+    assignment_id: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    caption_prefix: str | None = None,
+    show_reply: bool = False,
+) -> None:
+    client = get_whatsapp_client()
+    phone = _whatsapp_owner_phone()
+    if not client.enabled or not phone or not is_owner_telegram_chat(chat_id):
+        return
+    if await already_sent_content(phone, text):
+        return
+
+    reply_markup = (
+        build_action_keyboard(assignment_id, show_reply=show_reply) if assignment_id else None
+    )
+    ok = await client.send_text(phone, text, from_html=True, reply_markup=reply_markup)
+    if not ok:
+        return
+    await record_content_sent(phone, text)
+    attach_ok = await _deliver_whatsapp_attachments(attachments, caption_prefix=caption_prefix)
+    if not attach_ok:
+        logger.warning("WhatsApp mirror: text ok but attachments failed for owner %s", phone)
 
 
 async def send_actionable_alert(
@@ -101,6 +175,14 @@ async def send_actionable_alert(
             "send_actionable_alert to %s: text delivered but attachment forwarding failed",
             chat_id,
         )
+    await _mirror_owner_alert_to_whatsapp(
+        chat_id,
+        text,
+        assignment_id=assignment_id,
+        attachments=attachments,
+        caption_prefix=caption_prefix,
+        show_reply=show_reply,
+    )
     return sent_id
 
 
@@ -189,6 +271,8 @@ async def send_owner_update(
     if not result.ok:
         return False
     await record_content_sent(chat_id, text)
+    attach_ok = True
     if attachments:
-        return await deliver_attachments(bot, chat_id, attachments)
-    return True
+        attach_ok = await deliver_attachments(bot, chat_id, attachments)
+    await _mirror_owner_alert_to_whatsapp(chat_id, text, attachments=attachments)
+    return attach_ok

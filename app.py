@@ -1,5 +1,6 @@
 import hashlib
 import asyncio
+import json
 import logging
 import hmac
 from contextlib import asynccontextmanager
@@ -8,7 +9,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from google.auth.exceptions import RefreshError
 from telegram import Update
 
@@ -18,7 +19,10 @@ from services.db import check_db_health
 from services.digest import run_evening_digest, run_morning_digest
 from services.formatting import escape_html as _escape_html
 from services.oauth_state import create_oauth_state, verify_oauth_state
-from services.telegram_dedupe import should_process_update
+from bot.whatsapp_router import process_whatsapp_message
+from services.messaging.webhook import extract_inbound_messages
+from services.messaging.whatsapp import get_whatsapp_client
+from services.telegram_dedupe import should_process_update, should_process_webhook_event
 from services.timeutil import now_ist
 from services.monitoring import ping_heartbeat
 from services.reminders import run_scheduled_reminders
@@ -222,6 +226,53 @@ async def healthz():
     db = check_db_health()
     status = "ok" if db.get("ok") else "degraded"
     return {"status": status, "llm": get_llm_status(), "db": db}
+
+
+async def _process_whatsapp_payload(payload: dict) -> None:
+    client = get_whatsapp_client()
+    for phone, msg in extract_inbound_messages(payload):
+        msg_id = str(msg.get("id") or "")
+        if not await should_process_webhook_event(msg_id):
+            logger.info("Skipping duplicate WhatsApp message id=%s", msg_id)
+            continue
+        if msg_id:
+            await client.mark_read(msg_id)
+        try:
+            await process_whatsapp_message(phone, msg)
+        except Exception as exc:
+            logger.exception("WhatsApp message handling failed: %s", exc)
+
+
+@fastapi_app.get("/whatsapp/webhook")
+async def whatsapp_webhook_verify(
+    hub_mode: str | None = Query(default=None, alias="hub.mode"),
+    hub_verify_token: str | None = Query(default=None, alias="hub.verify_token"),
+    hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
+):
+    settings = get_settings()
+    if hub_mode == "subscribe" and hub_verify_token == settings.whatsapp_verify_token:
+        return PlainTextResponse(content=hub_challenge or "")
+    raise HTTPException(status_code=403, detail="Invalid verify token")
+
+
+@fastapi_app.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request) -> Response:
+    settings = get_settings()
+    body = await request.body()
+    secret = (settings.whatsapp_app_secret or "").strip()
+    if secret:
+        signature = request.headers.get("X-Hub-Signature-256") or ""
+        expected = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            raise HTTPException(status_code=403, detail="Invalid signature")
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+
+    asyncio.create_task(_process_whatsapp_payload(payload))
+    return Response(status_code=200)
 
 
 @fastapi_app.post(f"/telegram/webhook/{{secret}}")
