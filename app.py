@@ -244,15 +244,33 @@ async def _process_whatsapp_payload(payload: dict) -> None:
 
 
 @fastapi_app.get("/whatsapp/webhook")
-async def whatsapp_webhook_verify(
-    hub_mode: str | None = Query(default=None, alias="hub.mode"),
-    hub_verify_token: str | None = Query(default=None, alias="hub.verify_token"),
-    hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
-):
+async def whatsapp_webhook_verify(request: Request):
+    """Meta sends hub.mode, hub.verify_token, hub.challenge as query params."""
+    params = request.query_params
+    hub_mode = params.get("hub.mode")
+    hub_verify_token = (params.get("hub.verify_token") or "").strip()
+    hub_challenge = params.get("hub.challenge") or ""
+
     settings = get_settings()
-    if hub_mode == "subscribe" and hub_verify_token == settings.whatsapp_verify_token:
-        return PlainTextResponse(content=hub_challenge or "")
-    raise HTTPException(status_code=403, detail="Invalid verify token")
+    expected = (settings.whatsapp_verify_token or "").strip()
+
+    if hub_mode != "subscribe":
+        logger.warning("WhatsApp webhook verify: unexpected hub.mode=%s", hub_mode)
+        raise HTTPException(status_code=403, detail="Invalid verify token")
+
+    if not expected:
+        logger.warning("WhatsApp webhook verify: WHATSAPP_VERIFY_TOKEN is not set on server")
+        raise HTTPException(status_code=403, detail="Invalid verify token")
+
+    if not hmac.compare_digest(hub_verify_token, expected):
+        logger.warning(
+            "WhatsApp webhook verify: token mismatch (len sent=%s, len expected=%s)",
+            len(hub_verify_token),
+            len(expected),
+        )
+        raise HTTPException(status_code=403, detail="Invalid verify token")
+
+    return PlainTextResponse(content=hub_challenge)
 
 
 @fastapi_app.post("/whatsapp/webhook")
