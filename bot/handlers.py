@@ -912,11 +912,15 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not _is_owner(update) or not update.message:
         return
 
-    state = await asyncio.to_thread(get_watch_state) or {}
-    digest = await asyncio.to_thread(get_digest_state) or {}
-    pending = await asyncio.to_thread(count_pending_scheduled_reminders)
-    pending_emails = await asyncio.to_thread(count_pending_emails)
-    dead_letters = await asyncio.to_thread(count_dead_letter_emails)
+    state, digest, pending, pending_emails, dead_letters = await asyncio.gather(
+        asyncio.to_thread(get_watch_state),
+        asyncio.to_thread(get_digest_state),
+        asyncio.to_thread(count_pending_scheduled_reminders),
+        asyncio.to_thread(count_pending_emails),
+        asyncio.to_thread(count_dead_letter_emails),
+    )
+    state = state or {}
+    digest = digest or {}
 
     def _fmt_ts(raw) -> str:
         if not raw:
@@ -1873,13 +1877,17 @@ async def _answer_chat_question(
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
 
     try:
-        items = await asyncio.to_thread(get_assignments_for_qa, category=None, limit=25)
         if category:
-            cat_items = await asyncio.to_thread(get_assignments_for_qa, category=category, limit=15)
+            items, cat_items = await asyncio.gather(
+                asyncio.to_thread(get_assignments_for_qa, category=None, limit=25),
+                asyncio.to_thread(get_assignments_for_qa, category=category, limit=15),
+            )
             seen = {i["id"] for i in cat_items}
             items = cat_items + [i for i in items if i["id"] not in seen]
+        else:
+            items = await asyncio.to_thread(get_assignments_for_qa, category=None, limit=25)
 
-        question_text, pasted = await asyncio.to_thread(split_question_and_paste, question_for_qa)
+        question_text, pasted = split_question_and_paste(question_for_qa)
         answer = await asyncio.to_thread(
             answer_question,
             question_text,

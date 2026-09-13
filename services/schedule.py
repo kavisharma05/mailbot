@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -185,6 +186,22 @@ def sessions_for_day(
 
 # In-process cache: avoid re-calling the LLM for the same timetable mail
 _parse_cache: dict[str, dict[str, Any]] = {}
+# Skip another Gmail search when /classes was just refreshed (Render free tier
+# plus several Gmail queries made every tap feel slow).
+_SCHEDULE_REFRESH_TTL_SECONDS = 15 * 60
+_last_gmail_refresh_mono: float = 0.0
+
+
+def schedule_cache_is_fresh() -> bool:
+    return (
+        _last_gmail_refresh_mono > 0
+        and (time.monotonic() - _last_gmail_refresh_mono) < _SCHEDULE_REFRESH_TTL_SECONDS
+    )
+
+
+def _mark_schedule_refreshed() -> None:
+    global _last_gmail_refresh_mono
+    _last_gmail_refresh_mono = time.monotonic()
 
 # Newest-first Gmail searches for timetable mails (incl. PDF attachments)
 _SCHEDULE_QUERIES_BASE = (
@@ -824,6 +841,7 @@ def refresh_schedule_from_gmail() -> dict[str, Any]:
         reused = _cached_or_stored_sessions(message_id)
         if reused:
             logger.info("Reusing cached schedule parse for message %s", message_id)
+            _mark_schedule_refreshed()
             return _realign_cached_with_pdf(message_id, reused)
 
         try:
@@ -883,6 +901,7 @@ def refresh_schedule_from_gmail() -> dict[str, Any]:
             "from_cache": False,
         }
         _parse_cache[message_id] = info
+        _mark_schedule_refreshed()
         return info
 
     reason = last_error or "no_parse"
@@ -1019,6 +1038,10 @@ def classes_command_text(*, refresh: bool = True, section: str | None = None) ->
     day = today_ist()
     section = section or get_preferred_section()
     info: dict[str, Any] = {}
+    if refresh and schedule_cache_is_fresh():
+        cached = load_template_sessions()
+        if cached:
+            refresh = False
     if refresh:
         try:
             info = refresh_schedule_from_gmail()

@@ -1148,6 +1148,41 @@ def load_all_user_data_states() -> dict[str, dict[str, Any]]:
         return dict(_user_state_fallback)
 
 
+def load_user_data_state(user_id: str) -> dict[str, Any]:
+    """Load one persisted user_data blob (Telegram or WhatsApp) by user_id."""
+    global _user_state_table_missing
+    uid = str(user_id)
+    if _user_state_table_missing:
+        data = _user_state_fallback.get(uid)
+        return dict(data) if isinstance(data, dict) else {}
+    cached = _user_state_fallback.get(uid)
+    try:
+        db = get_db()
+        result = (
+            db.table("user_data_state")
+            .select("data")
+            .eq("user_id", uid)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return dict(cached) if isinstance(cached, dict) else {}
+        data = rows[0].get("data") or {}
+        if isinstance(data, dict):
+            _user_state_fallback[uid] = data
+            return dict(data)
+        return {}
+    except Exception as exc:
+        err = str(exc).lower()
+        if "user_data_state" in err or "does not exist" in err or "42p01" in err:
+            _user_state_table_missing = True
+            logger.warning("user_data_state table missing — using in-memory fallback: %s", exc)
+            return dict(cached) if isinstance(cached, dict) else {}
+        logger.exception("load_user_data_state failed for %s: %s", uid, exc)
+        return dict(cached) if isinstance(cached, dict) else {}
+
+
 @_safe_write
 def save_user_data_state(user_id: str, data: dict[str, Any]) -> None:
     """Upsert one user's Telegram user_data blob."""

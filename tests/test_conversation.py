@@ -52,6 +52,29 @@ def test_compose_rejects_generic_faculty_recipient():
     assert not result.get("recipient")
 
 
+def test_ambiguous_question_skips_llm_classify():
+    with patch("ai.intent._llm_classify") as mock_llm:
+        result = classify_message("any update on the CV submission?")
+    mock_llm.assert_not_called()
+    assert result["intent"] == INTENT_MAILBOX_QA
+
+
+def test_ambiguous_compose_still_uses_llm():
+    with patch(
+        "ai.intent._llm_classify",
+        return_value={
+            "intent": INTENT_COMPOSE,
+            "recipient": None,
+            "person": None,
+            "content": None,
+            "confidence": "medium",
+        },
+    ) as mock_llm:
+        result = classify_message("I need to email someone about the assignment")
+    mock_llm.assert_called_once()
+    assert result["intent"] == INTENT_COMPOSE
+
+
 def test_parse_sender_display_email():
     name, email = parse_sender('Dr. Santhi Perumal <santhi.perumal@imtnag.ac.in>')
     assert name == "Dr. Santhi Perumal"

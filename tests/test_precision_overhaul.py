@@ -26,6 +26,31 @@ def test_next_day_with_classes():
     assert len(next_sessions) == 1
 
 
+def test_classes_skips_gmail_when_cache_fresh():
+    import time
+
+    import services.schedule as sch
+
+    day = date(2026, 7, 23)
+    template = [
+        {"session_date": "2026-07-24", "course_or_topic": "OB", "start_time": "09:45", "room": "A1"},
+    ]
+    sch._last_gmail_refresh_mono = time.monotonic()
+    try:
+        with (
+            patch("services.schedule.today_ist", return_value=day),
+            patch("services.schedule.refresh_schedule_from_gmail") as mock_refresh,
+            patch("services.schedule.get_preferred_section", return_value="A"),
+            patch("services.schedule.load_template_sessions", return_value=template),
+            patch("services.schedule.sessions_for_day", return_value=[]),
+        ):
+            text = classes_command_text(refresh=True, section="A")
+        mock_refresh.assert_not_called()
+        assert "No classes today" in text
+    finally:
+        sch._last_gmail_refresh_mono = 0.0
+
+
 def test_classes_command_text_no_classes_today_label():
     day = date(2026, 7, 23)
     template = [

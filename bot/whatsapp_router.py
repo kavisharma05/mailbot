@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 
 from bot import handlers
@@ -128,7 +129,35 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
 
     msg_id = str(message.get("id") or "")
     msg_type = message.get("type")
+
+    # Menu-only turns never touch session state — skip the Supabase round-trip.
+    if msg_type == "text":
+        body = (message.get("text") or {}).get("body") or ""
+        stripped = body.strip()
+        if stripped.startswith("/"):
+            cmd = stripped.split()[0][1:].split("@")[0].lower()
+            if cmd in _MENU_COMMAND_STYLES:
+                await send_main_menu(normalized, style=_MENU_COMMAND_STYLES[cmd])
+                return
+        if stripped.lower() in MENU_KEYWORDS:
+            await send_main_menu(normalized, style="menu")
+            return
+    elif msg_type == "interactive":
+        interactive = message.get("interactive") or {}
+        if interactive.get("type") == "list_reply":
+            cb = (interactive.get("list_reply") or {}).get("id") or ""
+        elif interactive.get("type") == "button_reply":
+            cb = (interactive.get("button_reply") or {}).get("id") or ""
+        else:
+            cb = ""
+        if cb.startswith(CMD_PREFIX):
+            cmd = cb[len(CMD_PREFIX):].strip().lower()
+            if cmd in _MENU_COMMAND_STYLES:
+                await send_main_menu(normalized, style=_MENU_COMMAND_STYLES[cmd])
+                return
+
     user_data = await load_user_data(normalized)
+    snapshot = copy.deepcopy(user_data)
 
     try:
         if msg_type == "text":
@@ -147,4 +176,5 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
         else:
             logger.debug("Unsupported WhatsApp message type: %s", msg_type)
     finally:
-        await save_user_data(normalized, user_data)
+        if user_data != snapshot:
+            await save_user_data(normalized, user_data)

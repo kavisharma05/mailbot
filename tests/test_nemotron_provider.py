@@ -141,7 +141,9 @@ def test_reasoning_only_response_is_not_served_as_answer():
             {"message": {"content": "", "reasoning": "The user said ping. I should..."}}
         ]
     }
-    with patch("ai.client.httpx.post", return_value=fake_resp):
+    fake_http = MagicMock()
+    fake_http.post.return_value = fake_resp
+    with patch("ai.client._http", return_value=fake_http):
         out = client_module._openai_compatible_post(
             url="https://example.invalid/v1/chat/completions",
             api_key="k",

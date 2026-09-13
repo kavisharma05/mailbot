@@ -390,7 +390,19 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
             "confidence": "high",
         }
 
-    # Ambiguous — LLM fallback
+    # Only spend an LLM round-trip when the user *might* be composing —
+    # otherwise default to mailbox Q&A (the answer LLM already handles it).
+    # This cuts ~1-3s off most free-text questions.
+    if not any(v in q for v in _COMPOSE_VERBS):
+        return {
+            "intent": INTENT_MAILBOX_QA,
+            "recipient": None,
+            "person": None,
+            "content": None,
+            "confidence": "low",
+        }
+
+    # Ambiguous compose-ish phrasing — LLM fallback
     llm = _llm_classify(cleaned, convo)
     if llm:
         intent = llm.get("intent", INTENT_MAILBOX_QA)

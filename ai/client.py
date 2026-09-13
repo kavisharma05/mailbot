@@ -24,6 +24,30 @@ _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/comp
 _GITHUB_MODELS_URL = "https://models.github.ai/inference/chat/completions"
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Shared keep-alive client: a fresh httpx.post() does a TLS handshake per call
+# (~150-400ms). Fail over faster than 60s so a hung provider doesn't stall the user.
+_LLM_TIMEOUT = httpx.Timeout(25.0, connect=8.0)
+_shared_http: httpx.Client | None = None
+_groq_clients: dict[str, Groq] = {}
+
+
+def _http() -> httpx.Client:
+    global _shared_http
+    if _shared_http is None or _shared_http.is_closed:
+        _shared_http = httpx.Client(
+            timeout=_LLM_TIMEOUT,
+            limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=120),
+        )
+    return _shared_http
+
+
+def _groq_client(api_key: str) -> Groq:
+    client = _groq_clients.get(api_key)
+    if client is None:
+        client = Groq(api_key=api_key)
+        _groq_clients[api_key] = client
+    return client
+
 _last_error: str | None = None
 _last_status: int | None = None
 _last_provider: str | None = None
@@ -160,7 +184,7 @@ def _openai_compatible_post(
 
     for attempt in range(1, 3):
         try:
-            resp = httpx.post(url, headers=headers, json=payload, timeout=60)
+            resp = _http().post(url, headers=headers, json=payload)
             if resp.status_code in _RETRY_STATUS and attempt < 2:
                 delay = min(2 ** (attempt - 1), 2)
                 logger.warning(
@@ -237,7 +261,7 @@ def _call_groq(
     if _is_cooled(provider):
         return None
 
-    client = Groq(api_key=api_key)
+    client = _groq_client(api_key)
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
             kwargs: dict[str, Any] = {
