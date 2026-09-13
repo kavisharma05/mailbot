@@ -1470,7 +1470,10 @@ async def _draft_and_show_compose(update: Update, context: ContextTypes.DEFAULT_
             "composer",
             {"instructions": instructions, "draft": draft},
         )
-        await update.message.reply_text("Couldn't draft the email. Try rephrasing your instructions.")
+        await update.message.reply_text(
+            "Couldn't draft the email right now — the AI service is briefly "
+            "unavailable. Please try /send again in a minute or two."
+        )
         _clear_compose(context.user_data)
         return
 

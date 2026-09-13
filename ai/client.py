@@ -552,10 +552,12 @@ def _complete(
     # `model` arg kept for API compat; per-provider env models are used.
     _ = model
 
+    attempted = False
     for name, fn in _provider_chain(json_mode=json_mode):
         if _is_cooled(name):
             logger.info("Skipping %s (cooldown)", name)
             continue
+        attempted = True
         logger.info("Trying LLM provider %s", name)
         text = fn(
             system,
@@ -574,6 +576,10 @@ def _complete(
             _cooldown(name, seconds=45)
             continue
         return text
+    if not attempted:
+        # Every provider was skipped due to cooldown — keep this visible in
+        # /healthz instead of silently returning None with a clean status.
+        _set_last_error("all providers in cooldown", None, None)
     logger.error("All LLM providers failed or cooled down")
     return None
 

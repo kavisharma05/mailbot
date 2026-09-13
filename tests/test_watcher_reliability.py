@@ -61,6 +61,61 @@ def test_list_history_failure_marks_fallback():
     assert ids == ["a", "b"]
 
 
+def test_list_history_stale_404_returns_fresh_anchor():
+    from googleapiclient.errors import HttpError
+
+    from gmail_api.client import list_history_message_ids
+
+    resp = MagicMock()
+    resp.status = 404
+    service = MagicMock()
+    service.users.return_value.history.return_value.list.return_value.execute.side_effect = HttpError(
+        resp, b"not found"
+    )
+
+    with (
+        patch("gmail_api.client.get_gmail_service", return_value=service),
+        patch("gmail_api.client.get_profile_history_id", return_value="7777"),
+        patch("gmail_api.client.list_recent_inbox_message_ids", return_value=["x"]),
+    ):
+        ids, latest, failed = list_history_message_ids("19204")
+
+    assert failed is True
+    assert latest == "7777"  # fresh anchor so the watcher can re-anchor
+    assert ids == ["x"]
+
+
+def test_watcher_reanchors_on_stale_history_id_404():
+    state = {"last_history_id": "19204"}
+    update_calls: list[dict] = []
+
+    def fake_update_watch_state(**kwargs):
+        update_calls.append(kwargs)
+
+    async def fake_process(_message_id, _bot, **kwargs):
+        return {"processed": 1, "alerts": 0}
+
+    async def _run():
+        with (
+            patch("services.watcher.get_watch_state", return_value=state),
+            patch(
+                "services.watcher._collect_message_ids",
+                new=AsyncMock(return_value=(["msg-1"], "7777", True)),
+            ),
+            patch("services.watcher.is_email_processed_cached", return_value=False),
+            patch("services.watcher._process_message", side_effect=fake_process),
+            patch("services.watcher.update_watch_state", side_effect=fake_update_watch_state),
+            patch("services.watcher.get_profile_history_id", return_value="9999"),
+        ):
+            result = await run_gmail_watcher(bot=object())
+
+        assert result["history_failed"] is True
+        assert result["history_id"] == "7777"
+        assert update_calls[0].get("last_history_id") == "7777"
+
+    asyncio.run(_run())
+
+
 def test_watcher_defers_history_advance_on_history_api_failure():
     state = {"last_history_id": "1000"}
     update_calls: list[dict] = []

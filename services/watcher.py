@@ -842,13 +842,19 @@ async def _run_gmail_watcher_inner(bot) -> dict:
         alerts += outcome["alerts"]
         notifications += int(outcome.get("notifications") or 0)
 
-    if failed == 0 and not history_failed and not hit_cap:
+    # Advance when healthy — OR when history failed but the API returned a
+    # fresh anchor (stale startHistoryId 404 reset): the fallback recent-inbox
+    # scan already covered the gap, so re-anchoring is safe and self-healing.
+    can_advance = failed == 0 and not hit_cap and (not history_failed or bool(latest_or_init))
+    if can_advance:
         new_history_id = latest_or_init or await asyncio.to_thread(get_profile_history_id)
         await asyncio.to_thread(
             update_watch_state,
             last_history_id=new_history_id,
             last_checked_at=now,
         )
+        if history_failed:
+            logger.info("Re-anchored watch state to fresh historyId=%s after stale 404", new_history_id)
     else:
         new_history_id = start_id
         await asyncio.to_thread(update_watch_state, last_checked_at=now)

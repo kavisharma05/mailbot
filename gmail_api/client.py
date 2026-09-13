@@ -7,6 +7,7 @@ from typing import Any
 
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from gmail_api.auth import get_credentials
 
@@ -71,6 +72,24 @@ def list_history_message_ids(start_history_id: str) -> tuple[list[str], str | No
     except RefreshError:
         clear_gmail_service_cache()
         raise
+    except HttpError as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 404:
+            # startHistoryId is stale/expired — Gmail keeps history for a
+            # limited window. Returning the CURRENT profile historyId lets the
+            # watcher re-anchor instead of retrying the dead id forever.
+            logger.warning(
+                "startHistoryId %s is stale (404) — resetting to current historyId",
+                start_history_id,
+            )
+            fresh_id: str | None = None
+            try:
+                fresh_id = get_profile_history_id()
+            except Exception as profile_exc:
+                logger.warning("Could not fetch fresh historyId: %s", profile_exc)
+            return list_recent_inbox_message_ids(), fresh_id, True
+        logger.warning("History list failed (%s), falling back to recent messages", exc)
+        return list_recent_inbox_message_ids(), None, True
     except Exception as exc:
         logger.warning("History list failed (%s), falling back to recent messages", exc)
         return list_recent_inbox_message_ids(), None, True
