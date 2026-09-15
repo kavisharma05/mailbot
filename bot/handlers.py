@@ -47,6 +47,7 @@ from services.contacts import (
     resolve_email_robust,
     canonical_person_name,
 )
+from services.media_ai import analyze_image, transcribe_audio
 from services.watcher import watcher_lock
 from services.conversation import clear_convo, get_convo, remember_turn
 from services.alert_actions import (
@@ -1697,13 +1698,19 @@ async def _continue_compose_flow(update: Update, context: ContextTypes.DEFAULT_T
         return
 
 
-async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def chat_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    text_override: str | None = None,
+) -> None:
     """Answer free-text questions in DMs, mentions, or replies to the bot."""
-    if not _is_owner(update) or not update.message or not update.message.text:
+    if not _is_owner(update) or not update.message or not (text_override or update.message.text):
         return
+    input_text = text_override or update.message.text
 
     if _get_compose(context.user_data):
-        text = update.message.text
+        text = input_text
         lower = text.strip().lower()
         if lower in _COMPOSE_CANCEL_WORDS:
             _clear_compose(context.user_data)
@@ -1732,7 +1739,7 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 return
 
     if _get_add_task(context.user_data):
-        text = update.message.text
+        text = input_text
         if text.strip().lower() in _TASK_CANCEL_WORDS:
             _clear_add_task(context.user_data)
             await update.message.reply_text("Cancelled.")
@@ -1741,7 +1748,7 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if _get_edit_task(context.user_data):
-        text = update.message.text
+        text = input_text
         state = _get_edit_task(context.user_data)
         if text.strip().lower() in _TASK_CANCEL_WORDS:
             _clear_edit_task(context.user_data)
@@ -1751,7 +1758,7 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await _continue_edit_task_flow(update, context, text)
             return
 
-    text = update.message.text
+    text = input_text
     bot_username = context.bot.username
     chat = update.effective_chat
     is_private = chat and chat.type == ChatType.PRIVATE
@@ -1859,6 +1866,62 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         person_hint=classified.get("person"),
         intent=intent,
     )
+
+
+async def media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process owner images and voice/audio messages, replying in text."""
+    if not _is_owner(update) or not update.message:
+        return
+    message = update.message
+    try:
+        if message.photo:
+            photo = message.photo[-1]
+            file = await context.bot.get_file(photo.file_id)
+            data = bytes(await file.download_as_bytearray())
+            await message.reply_text("Processing the image…")
+            result = await asyncio.to_thread(
+                analyze_image,
+                data,
+                mime_type="image/jpeg",
+                caption=message.caption,
+            )
+            if result:
+                await reply_long(message, result)
+            else:
+                await message.reply_text(
+                    "I couldn't read that image accurately. Please try a clearer image."
+                )
+            return
+
+        media = message.voice or message.audio
+        if media:
+            file = await context.bot.get_file(media.file_id)
+            data = bytes(await file.download_as_bytearray())
+            mime_type = getattr(media, "mime_type", None) or (
+                "audio/ogg" if message.voice else "audio/mpeg"
+            )
+            filename = getattr(media, "file_name", None) or (
+                "voice.ogg" if message.voice else "audio.mp3"
+            )
+            await message.reply_text("Transcribing the audio…")
+            transcript = await asyncio.to_thread(
+                transcribe_audio,
+                data,
+                filename=filename,
+                mime_type=mime_type,
+            )
+            if not transcript:
+                await message.reply_text(
+                    "I couldn't transcribe that audio accurately. Please try again "
+                    "with less background noise."
+                )
+                return
+            # Voice notes are user commands/questions: feed the transcript into
+            # the same text pipeline, which always replies in text.
+            await chat_message(update, context, text_override=transcript)
+    except Exception as exc:
+        logger.exception("Telegram media processing failed: %s", exc)
+        await message.reply_text("I couldn't process that media. Please try again.")
 
 
 async def _answer_chat_question(
@@ -2083,5 +2146,8 @@ def register_handlers(application) -> None:
             filters.TEXT & filters.Regex("^(" + "|".join(map(re.escape, QUICK_ACTION_LABELS)) + ")$"),
             quick_action_message,
         )
+    )
+    application.add_handler(
+        MessageHandler(filters.PHOTO | filters.VOICE | filters.AUDIO, media_message)
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_message))

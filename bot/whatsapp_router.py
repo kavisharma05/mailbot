@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import asyncio
 import logging
 
 from bot import handlers
@@ -18,6 +19,7 @@ from services.messaging.pending_digest import DIGEST_KEYWORDS, flush_pending_dig
 from services.messaging.phone import normalize_wa_digits, wa_phones_match
 from services.messaging.state import load_user_data, save_user_data
 from services.messaging.whatsapp import get_whatsapp_client
+from services.media_ai import analyze_image, transcribe_audio
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +117,71 @@ async def _dispatch_text(text: str, phone: str, message_id: str, user_data: dict
     await handlers.chat_message(update, context)
 
 
+async def _process_media(
+    message: dict,
+    *,
+    phone: str,
+    message_id: str,
+    user_data: dict,
+) -> None:
+    """Download and understand an inbound WhatsApp image or audio message."""
+    msg_type = str(message.get("type") or "")
+    media_info = message.get(msg_type) or {}
+    media_id = str(media_info.get("id") or "")
+    client = get_whatsapp_client()
+    await client.send_text(
+        phone,
+        "Processing the image…" if msg_type == "image" else "Transcribing the audio…",
+        from_html=False,
+        template_fallback=False,
+    )
+    downloaded = await client.download_media(media_id)
+    if not downloaded:
+        await client.send_text(
+            phone,
+            "I couldn't download that media. Please send it again.",
+            from_html=False,
+            template_fallback=False,
+        )
+        return
+    data, downloaded_mime = downloaded
+    mime_type = str(media_info.get("mime_type") or downloaded_mime)
+    if msg_type == "image":
+        result = await asyncio.to_thread(
+            analyze_image,
+            data,
+            mime_type=mime_type,
+            caption=str(media_info.get("caption") or ""),
+        )
+        await client.send_text(
+            phone,
+            result
+            or "I couldn't read that image accurately. Please try a clearer image.",
+            from_html=False,
+            template_fallback=False,
+        )
+        return
+
+    extension = "ogg" if "ogg" in mime_type else "mp4" if "mp4" in mime_type else "mp3"
+    transcript = await asyncio.to_thread(
+        transcribe_audio,
+        data,
+        filename=f"voice.{extension}",
+        mime_type=mime_type,
+    )
+    if not transcript:
+        await client.send_text(
+            phone,
+            "I couldn't transcribe that audio accurately. Please try again with "
+            "less background noise.",
+            from_html=False,
+            template_fallback=False,
+        )
+        return
+    # Route the spoken request through the existing bot and reply in text.
+    await _dispatch_text(transcript, phone, message_id, user_data)
+
+
 async def process_whatsapp_message(phone: str, message: dict) -> None:
     """Handle one inbound WhatsApp message dict from Meta webhook payload."""
     owner = owner_phone_for_bot()
@@ -206,6 +273,13 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
                 cb = ""
             if cb:
                 await _dispatch_callback(cb, normalized, user_data)
+        elif msg_type in {"image", "audio", "voice"}:
+            await _process_media(
+                message,
+                phone=normalized,
+                message_id=msg_id,
+                user_data=user_data,
+            )
         else:
             logger.debug("Unsupported WhatsApp message type: %s", msg_type)
     finally:

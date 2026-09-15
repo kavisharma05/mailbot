@@ -132,6 +132,46 @@ class WhatsAppClient:
         body = {"messaging_product": "whatsapp", "to": self._normalize_to(to), **payload}
         return await _http().post(self._messages_url(), headers=self._headers(), json=body)
 
+    async def download_media(self, media_id: str) -> tuple[bytes, str] | None:
+        """Resolve and download inbound WhatsApp media from the Graph API."""
+        if not self.can_send or not media_id:
+            return None
+        auth = {"Authorization": f"Bearer {self._token}"}
+        try:
+            metadata = await _http().get(
+                f"https://graph.facebook.com/{self._version}/{media_id}",
+                headers=auth,
+                timeout=30,
+            )
+            if metadata.status_code >= 400:
+                logger.warning(
+                    "WhatsApp media metadata failed %s: %s",
+                    metadata.status_code,
+                    metadata.text[:300],
+                )
+                return None
+            info = metadata.json()
+            url = str(info.get("url") or "")
+            if not url:
+                return None
+            media = await _http().get(url, headers=auth, timeout=60)
+            if media.status_code >= 400:
+                logger.warning(
+                    "WhatsApp media download failed %s: %s",
+                    media.status_code,
+                    media.text[:300],
+                )
+                return None
+            mime_type = str(
+                info.get("mime_type")
+                or media.headers.get("content-type")
+                or "application/octet-stream"
+            ).split(";", 1)[0]
+            return media.content, mime_type
+        except Exception as exc:
+            logger.warning("WhatsApp media download exception: %s", exc)
+            return None
+
     async def send_template(
         self,
         to: str,
