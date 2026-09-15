@@ -9,6 +9,7 @@ supabase>=2.10.0
 pydantic-settings>=2.6.0
 python-dotenv>=1.0.1
 httpx>=0.28.0
+curl_cffi>=0.13.0
 tzdata>=2024.1
 python-dateutil>=2.9.0
 pypdf>=5.0.0

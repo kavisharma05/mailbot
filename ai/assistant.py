@@ -10,6 +10,7 @@ from config import get_settings
 from gmail_api.client import (
     count_messages,
     get_message_details,
+    get_thread_message_details,
     list_message_summaries,
     search_message_ids,
 )
@@ -49,6 +50,9 @@ _MAILBOX_BODY_CHARS = 1800
 _ATTACHMENT_CHARS = 6000
 _ATTACHMENT_CHARS_PER_EMAIL = 3500
 _MAX_ATTACHMENT_EMAILS = 3
+_MAX_THREAD_CONTEXT_EMAILS = 2
+_MAX_THREAD_MESSAGES = 6
+_THREAD_BODY_CHARS = 1200
 _MAX_USER_CHARS = 14000
 _PASTED_CHARS = 1800
 _MAX_ITEMS = 20
@@ -729,6 +733,7 @@ def _email_for_prompt(
     """Build a slim email dict for LLM context, optionally including attachment text."""
     item: dict[str, Any] = {
         "message_id": details.get("message_id"),
+        "thread_id": details.get("thread_id"),
         "subject": details.get("subject"),
         "sender": details.get("sender"),
         "received_at": details.get("received_at"),
@@ -780,6 +785,104 @@ def _apply_attachment_budget(
         else:
             m.pop("attachment_text", None)
             m.pop("attachment_filenames", None)
+        out.append(m)
+    return out
+
+
+def _wants_thread_context(question: str) -> bool:
+    q = question.lower()
+    return any(
+        marker in q
+        for marker in (
+            "thread",
+            "reply",
+            "replies",
+            "conversation",
+            "mail chain",
+            "email chain",
+            "latest mail",
+            "latest email",
+            "last mail",
+            "last email",
+        )
+    )
+
+
+def _apply_thread_context(
+    emails: list[dict[str, Any]],
+    *,
+    question: str,
+    wants_attachments: bool = False,
+) -> list[dict[str, Any]]:
+    """Promote the newest message in a Gmail thread and include recent replies.
+
+    Sender/subject searches can match the first message in a conversation while
+    missing later replies (especially replies sent by the student). The LLM should
+    summarize the latest state, not stop at the first message.
+    """
+    if not emails:
+        return emails
+
+    thread_counts: dict[str, int] = {}
+    for mail in emails:
+        tid = str(mail.get("thread_id") or "")
+        if tid:
+            thread_counts[tid] = thread_counts.get(tid, 0) + 1
+    explicit = _wants_thread_context(question)
+    if not explicit and not any(count > 1 for count in thread_counts.values()):
+        return emails
+
+    out: list[dict[str, Any]] = []
+    enriched_threads: set[str] = set()
+    for mail in emails:
+        m = dict(mail)
+        tid = str(m.get("thread_id") or "")
+        mid = str(m.get("message_id") or "")
+        should_enrich = bool(
+            mid
+            and tid
+            and tid not in enriched_threads
+            and len(enriched_threads) < _MAX_THREAD_CONTEXT_EMAILS
+            and (explicit or thread_counts.get(tid, 0) > 1)
+        )
+        if should_enrich:
+            try:
+                thread_details = get_thread_message_details(
+                    mid,
+                    max_messages=_MAX_THREAD_MESSAGES,
+                    load_attachments=wants_attachments,
+                )
+            except Exception as exc:
+                logger.warning("Thread context fetch failed for %s: %s", mid, exc)
+                thread_details = []
+            slim_thread = [
+                _email_for_prompt(
+                    item,
+                    body_chars=_THREAD_BODY_CHARS,
+                    attachment_chars=_ATTACHMENT_CHARS_PER_EMAIL,
+                    include_attachments=wants_attachments,
+                )
+                for item in thread_details
+            ]
+            if len(slim_thread) > 1:
+                latest = dict(slim_thread[-1])
+                m["thread_matched_message_id"] = m.get("message_id")
+                m["thread_message_count"] = len(slim_thread)
+                m["thread_messages"] = slim_thread
+                # Make the latest reply the primary message fields so summaries
+                # and Sources reflect the current state of the thread.
+                for key in (
+                    "message_id",
+                    "subject",
+                    "sender",
+                    "received_at",
+                    "body",
+                    "attachment_filenames",
+                    "attachment_text",
+                ):
+                    if latest.get(key) not in (None, ""):
+                        m[key] = latest[key]
+                enriched_threads.add(tid)
         out.append(m)
     return out
 
@@ -854,6 +957,11 @@ def _gather_mailbox_context(
         stats["person_no_match"] = True
         stats["listed"] = 0
         return stats, []
+    emails = _apply_thread_context(
+        emails,
+        question=question,
+        wants_attachments=wants_attachments,
+    )
     if wants_attachments:
         emails = _apply_attachment_budget(emails, wants_attachments=True)
     return stats, emails
@@ -1117,6 +1225,11 @@ def _fetch_relevant_emails(question: str, pasted_email: str | None = None) -> li
             if len(emails) >= _MAX_EMAILS:
                 break
 
+    emails = _apply_thread_context(
+        emails,
+        question=question,
+        wants_attachments=wants_attachments,
+    )
     if wants_attachments:
         emails = _apply_attachment_budget(emails, wants_attachments=True)
     return emails

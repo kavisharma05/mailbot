@@ -94,7 +94,10 @@ async def deliver_whatsapp_digest(text: str, *, kind: str) -> str:
     await stash_pending_digest(phone, kind=kind, text=text)
     tmpl = digest_template_name()
     if tmpl:
-        nudged = await client.send_template(phone, tmpl, body_parameter=_teaser(kind))
+        # Static digest templates have no {{1}}; alert templates need a teaser.
+        digest_only = (get_settings().whatsapp_digest_template or "").strip()
+        body = None if digest_only else _teaser(kind)
+        nudged = await client.send_template(phone, tmpl, body_parameter=body)
         logger.info(
             "WhatsApp %s digest stashed for %s; template nudge %s",
             kind,

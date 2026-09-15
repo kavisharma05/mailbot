@@ -420,9 +420,12 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
             INTENT_SMALLTALK,
         }:
             intent = INTENT_MAILBOX_QA
+        recipient = llm.get("recipient")
+        if recipient and is_generic_person(str(recipient)):
+            recipient = None
         return {
             "intent": intent,
-            "recipient": llm.get("recipient"),
+            "recipient": recipient,
             "person": llm.get("person"),
             "content": llm.get("content"),
             "confidence": llm.get("confidence") or "medium",

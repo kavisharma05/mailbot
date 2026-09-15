@@ -36,6 +36,7 @@ _HONORIFICS = {
     "ji",
 }
 _ARTICLE_TOKENS = {"a", "an", "the", "my", "your", "any", "some"}
+_CONNECTOR_TOKENS = {"or", "and", "of", "name"}
 GENERIC_PERSON_WORDS = {
     "faculty",
     "professor",
@@ -44,6 +45,11 @@ GENERIC_PERSON_WORDS = {
     "somebody",
     "person",
     "prof",
+    "friend",
+    "friendly",
+    "buddy",
+    "pal",
+    "recipient",
     "the faculty",
     "a faculty",
     "the professor",
@@ -52,9 +58,12 @@ GENERIC_PERSON_WORDS = {
     "a teacher",
     "my professor",
     "my faculty",
+    "my friend",
+    "a friend",
     "any faculty",
     "any professor",
     "any teacher",
+    "any friend",
 }
 
 
@@ -137,7 +146,10 @@ def is_generic_person(name: str | None) -> bool:
     tokens = [t for t in key.split() if t not in _ARTICLE_TOKENS]
     if not tokens:
         return True
-    if all(token in GENERIC_PERSON_WORDS for token in tokens):
+    meaningful = [t for t in tokens if t not in _CONNECTOR_TOKENS]
+    if not meaningful:
+        return True
+    if all(token in GENERIC_PERSON_WORDS for token in meaningful):
         return True
     return False
 
@@ -299,7 +311,7 @@ def resolve_email_robust(
         return text.lower(), [], None
 
     if is_generic_person(text):
-        return None, [], "Which faculty? Tell me their name or email."
+        return None, [], "Who should I send it to? Tell me their name or email address."
 
     matches = resolve_contact(text)
     if len(matches) == 1:

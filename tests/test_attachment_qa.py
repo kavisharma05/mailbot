@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from ai.assistant import (
     _apply_attachment_budget,
+    _apply_thread_context,
     _build_user_prompt,
     _email_for_prompt,
     _extract_person_query,
@@ -101,3 +102,38 @@ def test_telegram_dedupe_ordered_dict_popitem():
     assert isinstance(telegram_dedupe._seen, OrderedDict)
     telegram_dedupe._seen.popitem(last=False)
     telegram_dedupe._seen.clear()
+
+
+def test_thread_context_promotes_latest_reply():
+    emails = [
+        {
+            "message_id": "first",
+            "thread_id": "thread-1",
+            "subject": "Project",
+            "sender": "Prof <prof@x.edu>",
+            "received_at": "2026-09-14 10:00 AM IST",
+            "body": "Please submit the first draft.",
+        }
+    ]
+    thread = [
+        emails[0],
+        {
+            "message_id": "latest",
+            "thread_id": "thread-1",
+            "subject": "Re: Project",
+            "sender": "Prof <prof@x.edu>",
+            "received_at": "2026-09-15 09:30 AM IST",
+            "body": "Latest update: submit the final version by Friday.",
+            "attachments": [],
+            "attachment_text": "",
+        },
+    ]
+    with patch("ai.assistant.get_thread_message_details", return_value=thread):
+        out = _apply_thread_context(
+            emails,
+            question="summarize the latest mail in this thread",
+        )
+    assert out[0]["message_id"] == "latest"
+    assert "final version by Friday" in out[0]["body"]
+    assert out[0]["thread_matched_message_id"] == "first"
+    assert out[0]["thread_message_count"] == 2

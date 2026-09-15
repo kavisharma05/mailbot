@@ -247,6 +247,7 @@ def list_message_summaries(
             continue
         item: dict[str, Any] = {
             "message_id": details.get("message_id"),
+            "thread_id": details.get("thread_id"),
             "subject": details.get("subject"),
             "sender": details.get("sender"),
             "to": details.get("to"),
@@ -415,6 +416,56 @@ def get_message_details(message_id: str, *, load_attachments: bool = True) -> di
         "attachment_text": attachment_text,
         "label_ids": msg.get("labelIds") or [],
     }
+
+
+def get_thread_message_details(
+    message_id: str,
+    *,
+    max_messages: int = 6,
+    load_attachments: bool = False,
+) -> list[dict[str, Any]]:
+    """Return chronological details for the Gmail thread containing message_id.
+
+    Gmail search returns individual messages, and sender-filtered queries often match
+    only the first inbound mail. Reading the thread ensures reply context and the
+    latest message are available for summaries.
+    """
+    service = get_gmail_service()
+    seed = (
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="metadata")
+        .execute()
+    )
+    thread_id = seed.get("threadId")
+    if not thread_id:
+        return [get_message_details(message_id, load_attachments=load_attachments)]
+
+    thread = (
+        service.users()
+        .threads()
+        .get(userId="me", id=thread_id, format="metadata")
+        .execute()
+    )
+    messages = list(thread.get("messages") or [])
+    messages.sort(key=lambda m: int(m.get("internalDate") or 0))
+    selected = messages[-max_messages:] if max_messages > 0 else messages
+    details: list[dict[str, Any]] = []
+    for idx, item in enumerate(selected):
+        mid = item.get("id")
+        if not mid:
+            continue
+        is_latest = idx == len(selected) - 1
+        try:
+            details.append(
+                get_message_details(
+                    str(mid),
+                    load_attachments=load_attachments and is_latest,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Thread message fetch failed for %s: %s", mid, exc)
+    return details
 
 
 def send_email(to: str, subject: str, body: str, thread_id: str | None = None, from_addr: str | None = None) -> dict[str, str]:

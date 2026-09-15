@@ -1,4 +1,4 @@
-"""Free multi-provider LLM client with cooldowns and failover."""
+"""Multi-provider LLM client with cooldowns and failover."""
 
 from __future__ import annotations
 
@@ -8,9 +8,15 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
+from urllib.parse import quote
 
 import httpx
 from groq import APIStatusError, Groq
+
+try:
+    from curl_cffi import requests as _curl_requests
+except ImportError:  # pragma: no cover - requirements include it, fallback is for safety
+    _curl_requests = None
 
 from config import get_settings
 
@@ -23,6 +29,11 @@ _CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 _GITHUB_MODELS_URL = "https://models.github.ai/inference/chat/completions"
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_CLAUDE_BASE_URL = "https://claude.ai"
+_CLAUDE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+)
 
 # Shared keep-alive client: a fresh httpx.post() does a TLS handshake per call
 # (~150-400ms). Fail over faster than 60s so a hung provider doesn't stall the user.
@@ -466,6 +477,225 @@ def _call_nemotron(
     )
 
 
+def _claude_session_configured(settings: Any) -> bool:
+    return bool(
+        settings.claude_session_enabled
+        and settings.claude_org_uuid
+        and (settings.claude_session_key or settings.claude_cookie_header)
+    )
+
+
+def _claude_cookie_header(settings: Any) -> str:
+    """Build a complete browser Cookie header without logging any secret values."""
+    parts: list[str] = []
+    seen: set[str] = set()
+    raw = (settings.claude_cookie_header or "").strip()
+    for chunk in raw.split(";"):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        name = item.split("=", 1)[0].strip()
+        if not name:
+            continue
+        seen.add(name)
+        parts.append(item)
+    if settings.claude_session_key and "sessionKey" not in seen:
+        parts.append(f"sessionKey={settings.claude_session_key.strip()}")
+        seen.add("sessionKey")
+    if settings.claude_org_uuid and "lastActiveOrg" not in seen:
+        parts.append(f"lastActiveOrg={settings.claude_org_uuid.strip()}")
+    return "; ".join(parts)
+
+
+def _claude_headers(settings: Any, *, accept: str) -> dict[str, str]:
+    return {
+        "Accept": accept,
+        "Content-Type": "application/json",
+        "Cookie": _claude_cookie_header(settings),
+        "Origin": _CLAUDE_BASE_URL,
+        "Referer": f"{_CLAUDE_BASE_URL}/",
+        "User-Agent": _CLAUDE_USER_AGENT,
+    }
+
+
+def _claude_request(method: str, url: str, **kwargs: Any):
+    """HTTP request with Chrome TLS impersonation when curl_cffi is available.
+
+    Claude.ai sits behind Cloudflare; plain httpx often receives a 403 challenge
+    even with a valid sessionKey. curl_cffi's Chrome fingerprint matches the
+    browser that produced the cookie. httpx remains a safe fallback.
+    """
+    if _curl_requests is not None:
+        kwargs.setdefault("impersonate", "chrome")
+        return _curl_requests.request(method, url, **kwargs)
+    return _http().request(method, url, **kwargs)
+
+
+def _claude_error(resp: Any, *, provider: str) -> None:
+    body = (resp.text or "")[:500]
+    _set_last_error(body, resp.status_code, provider)
+    logger.error("claude_session failed (%s): %s", resp.status_code, body[:300])
+    if resp.status_code == 429 or _is_daily_limit_text(body):
+        _cooldown(provider, daily=_is_daily_limit_text(body), seconds=180)
+    elif resp.status_code in (401, 403):
+        _cooldown(provider, seconds=3600)
+    elif resp.status_code == 402:
+        _cooldown(provider, seconds=3600)
+
+
+def _extract_claude_stream_text(body: str) -> str:
+    """Parse Claude web SSE (and occasional JSON/non-SSE fallback) into plain text."""
+    chunks: list[str] = []
+    saw_event = False
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        saw_event = True
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        if event_type == "content_block_delta":
+            delta = event.get("delta") or {}
+            text = delta.get("text") or delta.get("partial_json") or ""
+            if text:
+                chunks.append(str(text))
+        elif event_type == "content_block_start":
+            block = event.get("content_block") or {}
+            if block.get("text"):
+                chunks.append(str(block["text"]))
+        elif isinstance(event.get("completion"), str):
+            chunks.append(event["completion"])
+        elif event_type == "message_delta":
+            delta = event.get("delta") or {}
+            if isinstance(delta.get("content"), str):
+                chunks.append(delta["content"])
+        elif event_type == "error":
+            message = (event.get("error") or {}).get("message") or str(event)
+            raise ValueError(message)
+
+    if chunks:
+        return "".join(chunks).strip()
+    if saw_event:
+        return ""
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return body.strip()
+    if isinstance(data, dict):
+        if isinstance(data.get("completion"), str):
+            return data["completion"].strip()
+        if isinstance(data.get("text"), str):
+            return data["text"].strip()
+        content = data.get("content")
+        if isinstance(content, list):
+            texts = [
+                str(part.get("text"))
+                for part in content
+                if isinstance(part, dict) and part.get("text")
+            ]
+            return "".join(texts).strip()
+    return ""
+
+
+def _delete_claude_conversation(settings: Any, conversation_id: str) -> None:
+    """Best-effort cleanup so one-shot bot calls do not clutter Claude history."""
+    org = quote(settings.claude_org_uuid, safe="")
+    conv = quote(conversation_id, safe="")
+    url = f"{_CLAUDE_BASE_URL}/api/organizations/{org}/chat_conversations/{conv}"
+    try:
+        _claude_request(
+            "DELETE",
+            url,
+            headers=_claude_headers(settings, accept="application/json"),
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.debug("claude_session cleanup failed: %s", exc)
+
+
+def _call_claude_session(
+    system: str,
+    user: str,
+    *,
+    json_mode: bool,
+    max_tokens: int,
+    temperature: float,
+) -> str | None:
+    """Use the single configured Claude.ai browser session as an additive provider.
+
+    This intentionally lives behind CLAUDE_SESSION_ENABLED and uses the same
+    cooldown/failover conventions as the free providers. The web endpoint does
+    not expose max_tokens/temperature, so prompt instructions carry JSON mode.
+    """
+    del max_tokens, temperature
+    settings = get_settings()
+    provider = "claude_session"
+    if not _claude_session_configured(settings) or _is_cooled(provider):
+        return None
+
+    org = quote(settings.claude_org_uuid.strip(), safe="")
+    base = f"{_CLAUDE_BASE_URL}/api/organizations/{org}/chat_conversations"
+    conversation_id = ""
+    try:
+        created = _claude_request(
+            "POST",
+            base,
+            headers=_claude_headers(settings, accept="application/json"),
+            json={"uuid": None, "name": "", "model": settings.claude_model},
+            timeout=30,
+        )
+        if created.status_code >= 400:
+            _claude_error(created, provider=provider)
+            return None
+        data = created.json()
+        conversation_id = str(data.get("uuid") or data.get("conversation_uuid") or "")
+        if not conversation_id:
+            _set_last_error("missing Claude conversation uuid", None, provider)
+            return None
+
+        prompt = f"{system.strip()}\n\n{user.strip()}"
+        if json_mode:
+            prompt += "\n\nRespond ONLY with valid strict JSON. No markdown fences or prose."
+        completion = _claude_request(
+            "POST",
+            f"{base}/{quote(conversation_id, safe='')}/completion",
+            headers=_claude_headers(settings, accept="text/event-stream"),
+            json={
+                "prompt": prompt,
+                "model": settings.claude_model,
+                "timezone": "Asia/Kolkata",
+                "attachments": [],
+                "files": [],
+            },
+            timeout=90,
+        )
+        if completion.status_code >= 400:
+            _claude_error(completion, provider=provider)
+            return None
+        text = _extract_claude_stream_text(completion.text)
+        if text:
+            logger.info("LLM answered via claude_session model=%s", settings.claude_model)
+            _mark_ok(provider)
+            return text
+        _set_last_error("empty Claude session response", completion.status_code, provider)
+        return None
+    except Exception as exc:
+        _set_last_error(str(exc), None, provider)
+        logger.error("claude_session exception: %s", exc)
+        _cooldown(provider, seconds=300)
+        return None
+    finally:
+        if conversation_id:
+            _delete_claude_conversation(settings, conversation_id)
+
+
 ProviderFn = Callable[..., str | None]
 
 
@@ -479,6 +709,10 @@ def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
     """
     settings = get_settings()
     chain: list[tuple[str, ProviderFn]] = []
+
+    def add_claude_session() -> None:
+        if _claude_session_configured(settings):
+            chain.append(("claude_session", _call_claude_session))
 
     def add_nemotron() -> None:
         if settings.nemotron_api_key:
@@ -535,6 +769,9 @@ def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
             chain.append(("github_models", _call_github_models))
 
     if json_mode:
+        # Enabled Claude session is intentionally first so account 1 is actually used;
+        # existing providers remain as automatic fallbacks when Claude cools down/fails.
+        add_claude_session()
         add_groq()
         add_gemini()
         add_cerebras()
@@ -542,6 +779,7 @@ def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
         add_openrouter()
         add_github_models()
     else:
+        add_claude_session()
         add_nemotron()
         add_groq()
         add_gemini()
@@ -565,7 +803,7 @@ def _complete(
     temperature: float = 0.3,
     validator: Callable[[str], bool] | None = None,
 ) -> str | None:
-    """Try free providers in order; skip cooled-down ones.
+    """Try configured providers in order; skip cooled-down ones.
 
     When ``validator`` is given, a provider whose response fails validation is
     skipped (brief cooldown) and the next provider is tried — a model that

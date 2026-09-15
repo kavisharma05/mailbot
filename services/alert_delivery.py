@@ -58,7 +58,13 @@ async def _deliver_whatsapp_attachments(
             caption = filename
             if caption_prefix:
                 caption = f"{str(caption_prefix)[:80]}\n{filename}"
-            if await client.send_document(phone, data, filename, caption=caption[:1000]):
+            if await client.send_document(
+                phone,
+                data,
+                filename,
+                caption=caption[:1000],
+                mime_type=att.get("mime_type"),
+            ):
                 sent += 1
     return attempted == 0 or sent == attempted
 

@@ -71,6 +71,47 @@ def test_deliver_stashes_when_freeform_fails(monkeypatch):
     assert "Morning digest ready" in str(sent["template"][2])
 
 
+def test_deliver_uses_static_digest_template_without_body_param(monkeypatch):
+    monkeypatch.setenv("WHATSAPP_ENABLED", "true")
+    monkeypatch.setenv("WHATSAPP_OWNER_PHONE", "1111111111")
+    monkeypatch.setenv("WHATSAPP_ACCESS_TOKEN", "tok")
+    monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "123")
+    monkeypatch.setenv("WHATSAPP_DIGEST_TEMPLATE", "mailbot_digest_v1")
+    monkeypatch.setenv("WHATSAPP_ALERT_TEMPLATE", "mailbot_alert_v1")
+    from config import get_settings
+
+    get_settings.cache_clear()
+
+    sent: dict[str, object] = {}
+
+    class FakeClient:
+        enabled = True
+
+        async def send_text(self, *a, **k):
+            return False
+
+        async def send_template(self, to, name, body_parameter=None, **k):
+            sent["template"] = (to, name, body_parameter)
+            return True
+
+    stored: dict = {}
+
+    async def fake_load(_phone):
+        return dict(stored)
+
+    async def fake_save(_phone, data):
+        stored.clear()
+        stored.update(data)
+
+    monkeypatch.setattr("services.messaging.pending_digest.get_whatsapp_client", lambda: FakeClient())
+    monkeypatch.setattr("services.messaging.pending_digest.load_user_data", fake_load)
+    monkeypatch.setattr("services.messaging.pending_digest.save_user_data", fake_save)
+
+    result = _run(deliver_whatsapp_digest("due: 2", kind="evening"))
+    assert result == "stashed"
+    assert sent["template"] == ("1111111111", "mailbot_digest_v1", None)
+
+
 def test_flush_sends_stashed_digest(monkeypatch):
     class FakeClient:
         enabled = True

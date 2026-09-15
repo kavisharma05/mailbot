@@ -185,7 +185,13 @@ class WhatsAppBot:
             data = bytes(document)
         if not data:
             return None
-        await client.send_document(phone, data, str(filename), caption=caption)
+        await client.send_document(
+            phone,
+            data,
+            str(filename),
+            caption=caption,
+            mime_type=getattr(document, "mime_type", None),
+        )
         return _SentMessageStub()
 
 

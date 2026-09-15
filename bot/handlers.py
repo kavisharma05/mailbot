@@ -1507,6 +1507,18 @@ async def _begin_compose_flow(
 ) -> None:
     convo = get_convo(context.user_data)
     compose: dict = {"step": COMPOSE_NEED_CONTENT, "instructions": None, "recipient": None, "draft": None}
+    raw_text = (getattr(update.message, "text", "") or "").strip()
+    if not recipient and not content and re.search(
+        r"\b(?:to|mail|email)\s+(?:a|an|the|my|any|some)?\s*"
+        r"(?:friend|friendly|buddy|faculty|professor|teacher|someone|somebody|person)\b",
+        raw_text,
+        flags=re.IGNORECASE,
+    ):
+        compose["step"] = COMPOSE_NEED_RECIPIENT
+        context.user_data["compose"] = compose
+        await update.message.reply_text("Who should I send it to? (name or email address)")
+        remember_turn(context.user_data, user_text=raw_text, intent="compose")
+        return
     if content:
         compose["instructions"] = content.strip()
     if recipient:

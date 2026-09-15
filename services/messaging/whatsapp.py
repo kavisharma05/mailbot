@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 from functools import lru_cache
 from typing import Any
 
@@ -198,17 +199,23 @@ class WhatsAppClient:
         filename: str,
         *,
         caption: str | None = None,
+        mime_type: str | None = None,
     ) -> bool:
         if not self.enabled or not data:
             return False
         to_norm = self._normalize_to(to)
+        content_type = (
+            (mime_type or "").strip()
+            or mimetypes.guess_type(filename or "")[0]
+            or "application/octet-stream"
+        )
         try:
             client = _http()
             upload = await client.post(
                 self._media_url(),
                 headers={"Authorization": f"Bearer {self._token}"},
-                data={"messaging_product": "whatsapp", "type": "application/octet-stream"},
-                files={"file": (filename or "attachment", data)},
+                data={"messaging_product": "whatsapp", "type": content_type},
+                files={"file": (filename or "attachment", data, content_type)},
                 timeout=60,
             )
             if upload.status_code >= 400:

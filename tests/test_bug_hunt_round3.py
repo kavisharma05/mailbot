@@ -325,6 +325,27 @@ def test_compose_breakout_does_not_clear_short_recipient_name():
     assert _looks_like_compose_breakout("what's due today?")
 
 
+def test_compose_generic_friend_asks_for_recipient_first():
+    """Natural compose with only 'a friend' must ask who, not draft placeholders."""
+    from bot.handlers import COMPOSE_NEED_RECIPIENT, _begin_compose_flow, _get_compose
+
+    user_data: dict = {}
+    update = MagicMock()
+    update.message.text = "write a mail to my friend"
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.user_data = user_data
+
+    async def _run():
+        await _begin_compose_flow(update, context, recipient=None, content=None)
+        compose = _get_compose(user_data)
+        assert compose is not None
+        assert compose["step"] == COMPOSE_NEED_RECIPIENT
+        assert "Who should I send it to?" in update.message.reply_text.call_args.args[0]
+
+    asyncio.run(_run())
+
+
 def test_send_flow_content_then_ask_recipient_not_misrouted():
     """End-to-end: /send with no args asks for content; user replies with
     text containing 'from'/'class'; the content is captured and the bot

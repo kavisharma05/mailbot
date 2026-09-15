@@ -52,6 +52,17 @@ def test_compose_rejects_generic_faculty_recipient():
     assert not result.get("recipient")
 
 
+def test_compose_rejects_generic_friend_recipient():
+    for text in (
+        "write a mail to a friend",
+        "write a mail to my friend saying happy birthday",
+        "write a mail to faculty or a friendly",
+    ):
+        result = classify_message(text)
+        assert result["intent"] == INTENT_COMPOSE
+        assert not result.get("recipient"), text
+
+
 def test_ambiguous_question_skips_llm_classify():
     with patch("ai.intent._llm_classify") as mock_llm:
         result = classify_message("any update on the CV submission?")
@@ -109,6 +120,10 @@ def test_is_generic_person():
     assert is_generic_person("a faculty")
     assert is_generic_person("the professor")
     assert is_generic_person("faculty")
+    assert is_generic_person("a friend")
+    assert is_generic_person("my friend")
+    assert is_generic_person("faculty or a friendly")
+    assert is_generic_person("name of the friend")
     assert not is_generic_person("Saleena Khan")
     assert not is_generic_person("saleena.khan@imtnag.ac.in")
 
@@ -200,7 +215,7 @@ def test_resolve_email_robust_generic_person():
     email, matches, note = resolve_email_robust("a faculty")
     assert email is None
     assert matches == []
-    assert note == "Which faculty? Tell me their name or email."
+    assert note == "Who should I send it to? Tell me their name or email address."
 
 
 def test_conversation_memory_remember_turn():

@@ -1,5 +1,7 @@
 from functools import lru_cache
+from pathlib import Path
 
+from dotenv import dotenv_values
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -58,6 +60,17 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_model: str = "google/gemma-4-31b-it:free"
 
+    # Optional Claude.ai browser-session provider (account 1 only for now).
+    # This is additive: existing free providers stay configured and are used as fallbacks.
+    claude_session_enabled: bool = False
+    claude_session_label: str = ""
+    claude_org_uuid: str = ""
+    claude_account_uuid: str = ""
+    claude_email: str = ""
+    claude_session_key: str = ""
+    claude_cookie_header: str = ""
+    claude_model: str = "claude-sonnet-4-6"
+
     gmail_client_id: str
     gmail_client_secret: str
     gmail_refresh_token: str
@@ -87,6 +100,38 @@ class Settings(BaseSettings):
         return (self.telegram_owner_user_id or self.telegram_owner_chat_id).strip()
 
 
+_CLAUDE_SESSION_FILE = Path(__file__).resolve().with_name(".env.claude_session.account1")
+_CLAUDE_SESSION_FIELDS = {
+    "CLAUDE_SESSION_ENABLED": "claude_session_enabled",
+    "CLAUDE_SESSION_LABEL": "claude_session_label",
+    "CLAUDE_ORG_UUID": "claude_org_uuid",
+    "CLAUDE_ACCOUNT_UUID": "claude_account_uuid",
+    "CLAUDE_EMAIL": "claude_email",
+    "CLAUDE_SESSION_KEY": "claude_session_key",
+    "CLAUDE_COOKIE_HEADER": "claude_cookie_header",
+    "CLAUDE_MODEL": "claude_model",
+}
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    # Keep the browser-session export out of the normal Settings constructor so
+    # tests and scripts that build isolated Settings objects never pick it up.
+    if _CLAUDE_SESSION_FILE.exists():
+        values = dotenv_values(_CLAUDE_SESSION_FILE)
+        enabled = str(values.get("CLAUDE_SESSION_ENABLED") or "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if enabled:
+            for env_name, field_name in _CLAUDE_SESSION_FIELDS.items():
+                value = values.get(env_name)
+                if value in (None, ""):
+                    continue
+                if field_name == "claude_session_enabled":
+                    value = enabled
+                setattr(settings, field_name, value)
+    return settings

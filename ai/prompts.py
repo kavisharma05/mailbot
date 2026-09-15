@@ -25,6 +25,8 @@ Rules:
 - smalltalk: hi/hello with no real ask.
 - "send all mails from saleena" = mailbox_qa (retrieval), NOT compose.
 - Prefer compose only when the student is trying to outbound mail TO a recipient.
+- If the recipient is only a role/placeholder (faculty, friend, someone, "name of friend"),
+  set recipient to null so the bot can ask for the actual name or email.
 """
 
 CONTACT_MATCHER_PROMPT = """You match a student's informal reference to a person (faculty/sender) against
@@ -79,6 +81,8 @@ Intent guide:
   matching Gmail emails or resolved_contacts in context. Give the address directly — do NOT
   only list subjects when the student asked for an email address.
 - What did X say / content of a mail → paraphrase from email bodies; cite received_at.
+- Mail threads / replies / latest mail → when thread_messages is present, treat the LAST
+  thread message as the current state; earlier thread messages are background only.
 - Marks / grades / scores / results → prefer attachment_text over the email body.
   Find the student's row using student_name (partial match OK). If the sheet is
   group-level without names, state what the attachment shows vs what it doesn't.
@@ -122,10 +126,12 @@ Rules (strict):
 6. Prefer short bullets. Be direct and useful.
 7. If Gmail emails are in the JSON, never say "no emails were received".
 8. When attachment_text is present, treat it as first-class evidence.
-9. If data is partial/capped, say so in one short line.
-10. A Sources block will be appended automatically — focus on the answer; you may briefly
+9. When thread_messages is present, summarize the LAST message as the latest state;
+   use earlier messages only for context.
+10. If data is partial/capped, say so in one short line.
+11. A Sources block will be appended automatically — focus on the answer; you may briefly
    reference which mail(s) support your answer in the text.
-11. Output plain text only: no HTML tags, no Markdown (**bold**, code fences, etc.).
+12. Output plain text only: no HTML tags, no Markdown (**bold**, code fences, etc.).
 """
 
 GMAIL_QUERY_PROMPT = """Convert the student's question into Gmail search queries.
@@ -152,6 +158,8 @@ student. Rules:
 - Use a respectful, simple academic tone. No flowery language.
 - Always include a proper greeting and sign-off. Sign off as "{student_name}"
 if the student's name isn't given.
+- Never use placeholders such as "(name of the friend)" or "[recipient]" in the draft.
+  If the recipient's name is unknown, use a neutral greeting like "Hello,".
 - Separate greeting, each paragraph, and sign-off with a blank line.
 - Infer a clear, specific subject line.
 - Respond ONLY with strict JSON, no markdown fences, no preamble:
