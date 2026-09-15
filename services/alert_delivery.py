@@ -83,6 +83,7 @@ async def _mirror_owner_alert_to_whatsapp(
     if not client.enabled or not phone or not is_owner_telegram_chat(chat_id):
         return
     if await already_sent_content(phone, text):
+        logger.info("WhatsApp mirror skipped as duplicate for Telegram chat %s", chat_id)
         return
 
     reply_markup = (
@@ -90,7 +91,9 @@ async def _mirror_owner_alert_to_whatsapp(
     )
     ok = await client.send_text(phone, text, from_html=True, reply_markup=reply_markup)
     if not ok:
+        logger.warning("WhatsApp mirror failed for owner alert on Telegram chat %s", chat_id)
         return
+    logger.info("WhatsApp mirror sent for owner alert on Telegram chat %s", chat_id)
     await record_content_sent(phone, text)
     attach_ok = await _deliver_whatsapp_attachments(attachments, caption_prefix=caption_prefix)
     if not attach_ok:

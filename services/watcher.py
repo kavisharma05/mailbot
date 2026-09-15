@@ -447,6 +447,7 @@ async def _process_message(
         nonlocal notifications, delivery_ok
         delivered[channel] = True
         notifications += 1
+        logger.info("Mail alert delivered via %s for message %s", channel, message_id)
         # Durable anti-storm: once ANY Telegram send succeeds, persist processed
         # immediately so a later mark failure / process restart cannot re-alert.
         if not marked_early:

@@ -75,3 +75,38 @@ def test_extract_inbound_skips_statuses():
     msgs = extract_inbound_messages(payload)
     assert len(msgs) == 1
     assert msgs[0][0] == "917489491188"
+
+
+def test_extract_status_events_includes_failures():
+    from services.messaging.webhook import extract_status_events
+
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "statuses": [
+                                {
+                                    "id": "wamid.failed",
+                                    "status": "failed",
+                                    "recipient_id": "917489491188",
+                                    "errors": [{"code": 131047, "title": "Re-engagement message"}],
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ],
+    }
+    statuses = extract_status_events(payload)
+    assert statuses == [
+        {
+            "id": "wamid.failed",
+            "status": "failed",
+            "recipient_id": "917489491188",
+            "errors": [{"code": 131047, "title": "Re-engagement message"}],
+        }
+    ]

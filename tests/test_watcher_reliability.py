@@ -642,10 +642,10 @@ def test_send_actionable_alert_failed_send_not_deduped():
     asyncio.run(_run())
 
 
-def test_pending_email_db_falls_back_without_delivered_channels_column():
+def test_pending_email_db_falls_back_without_optional_columns():
     import services.db as db_module
 
-    db_module._pending_delivered_channels_missing = False
+    db_module._pending_email_missing_columns.clear()
 
     table = MagicMock()
     select_chain = MagicMock()
@@ -658,11 +658,11 @@ def test_pending_email_db_falls_back_without_delivered_channels_column():
         "attempts": 1,
         "last_error": "alert_delivery_failed",
         "dead_letter": False,
-        "classified_result": {"task": "x"},
-        "already_alerted": False,
     }
 
     select_chain.execute.side_effect = [
+        RuntimeError("column pending_emails.already_alerted does not exist"),
+        RuntimeError("column pending_emails.classified_result does not exist"),
         RuntimeError("column pending_emails.delivered_channels does not exist"),
         MagicMock(data=[row]),
     ]
@@ -671,15 +671,22 @@ def test_pending_email_db_falls_back_without_delivered_channels_column():
         result = db_module.get_pending_email("msg-1")
 
     assert result == row
-    assert db_module._pending_delivered_channels_missing is True
-    assert table.select.call_count == 2
-    assert "delivered_channels" not in table.select.call_args_list[1].args[0]
+    assert db_module._pending_email_missing_columns == {
+        "already_alerted",
+        "classified_result",
+        "delivered_channels",
+    }
+    assert table.select.call_count == 4
+    final_columns = table.select.call_args_list[-1].args[0]
+    assert "already_alerted" not in final_columns
+    assert "classified_result" not in final_columns
+    assert "delivered_channels" not in final_columns
 
 
-def test_enqueue_pending_email_falls_back_without_delivered_channels_column():
+def test_enqueue_pending_email_falls_back_without_optional_columns():
     import services.db as db_module
 
-    db_module._pending_delivered_channels_missing = False
+    db_module._pending_email_missing_columns.clear()
 
     table = MagicMock()
     select_chain = MagicMock()
@@ -691,6 +698,8 @@ def test_enqueue_pending_email_falls_back_without_delivered_channels_column():
     insert_chain.execute.return_value = MagicMock(data=[{"message_id": "msg-2"}])
 
     select_chain.execute.side_effect = [
+        RuntimeError("column pending_emails.already_alerted does not exist"),
+        RuntimeError("column pending_emails.classified_result does not exist"),
         RuntimeError("column pending_emails.delivered_channels does not exist"),
         MagicMock(data=[]),
     ]
@@ -700,13 +709,22 @@ def test_enqueue_pending_email_falls_back_without_delivered_channels_column():
             "msg-2",
             "alert_delivery_failed",
             classified_result={"task": "x"},
+            already_alerted=True,
             delivered_channels={"owner": True},
         )
 
-    assert db_module._pending_delivered_channels_missing is True
-    assert table.select.call_count == 2
+    assert db_module._pending_email_missing_columns == {
+        "already_alerted",
+        "classified_result",
+        "delivered_channels",
+    }
+    assert table.select.call_count == 4
     insert_payload = table.insert.call_args.args[0]
+    assert "already_alerted" not in insert_payload
+    assert "classified_result" not in insert_payload
     assert "delivered_channels" not in insert_payload
+    assert insert_payload["message_id"] == "msg-2"
+    assert insert_payload["last_error"] == "alert_delivery_failed"
 
 
 def test_is_email_processed_returns_none_on_real_db_error():

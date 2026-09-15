@@ -20,7 +20,7 @@ from services.digest import run_evening_digest, run_morning_digest
 from services.formatting import escape_html as _escape_html
 from services.oauth_state import create_oauth_state, verify_oauth_state
 from bot.whatsapp_router import process_whatsapp_message
-from services.messaging.webhook import extract_inbound_messages
+from services.messaging.webhook import extract_inbound_messages, extract_status_events
 from services.messaging.whatsapp import get_whatsapp_client
 from services.telegram_dedupe import should_process_update, should_process_webhook_event
 from services.timeutil import now_ist
@@ -258,6 +258,15 @@ via the same Telegram or email account linked to the bot.</p>
 
 async def _process_whatsapp_payload(payload: dict) -> None:
     client = get_whatsapp_client()
+    for status in extract_status_events(payload):
+        state = str(status.get("status") or "").lower()
+        if state == "failed":
+            logger.warning(
+                "WhatsApp delivery failed for message %s to %s: %s",
+                status.get("id"),
+                status.get("recipient_id"),
+                status.get("errors") or status,
+            )
     messages = extract_inbound_messages(payload)
     if not messages:
         logger.debug("WhatsApp webhook POST with no inbound messages")
