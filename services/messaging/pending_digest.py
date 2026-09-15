@@ -41,17 +41,31 @@ def _owner_phone() -> str:
 
 
 def _teaser(kind: str) -> str:
-    label = "Morning" if kind == "morning" else "Evening"
-    return f"{label} digest ready. Reply DIGEST or tap Menu to open it."
+    if kind == "morning":
+        return "Morning digest ready. Reply DIGEST or tap Menu to open it."
+    if kind == "evening":
+        return "Evening digest ready. Reply DIGEST or tap Menu to open it."
+    return "New mail alert waiting. Reply to open it."
 
 
 async def stash_pending_digest(phone: str, *, kind: str, text: str) -> None:
     data = await load_user_data(phone)
-    data[PENDING_KEY] = {
-        "kind": kind,
-        "text": text,
-        "stashed_at": datetime.now(timezone.utc).isoformat(),
-    }
+    existing = data.get(PENDING_KEY)
+    if isinstance(existing, dict) and existing.get("text"):
+        # Keep everything the owner has not seen yet instead of overwriting.
+        combined = f"{str(existing['text']).rstrip()}\n\n— — —\n\n{text.strip()}"[:3800]
+        data[PENDING_KEY] = {
+            "kind": existing.get("kind") or kind,
+            "text": combined,
+            "stashed_at": existing.get("stashed_at")
+            or datetime.now(timezone.utc).isoformat(),
+        }
+    else:
+        data[PENDING_KEY] = {
+            "kind": kind,
+            "text": text,
+            "stashed_at": datetime.now(timezone.utc).isoformat(),
+        }
     await save_user_data(phone, data)
 
 
@@ -68,13 +82,47 @@ async def flush_pending_digest(phone: str, user_data: dict[str, Any] | None = No
     if not pending:
         return False
     client = get_whatsapp_client()
-    ok = await client.send_text(phone, str(pending["text"]), from_html=True, template_fallback=False)
+    ok = await client.send_text(
+        phone,
+        str(pending["text"]),
+        from_html=True,
+        template_fallback=False,
+        outbox_kind=str(pending.get("kind") or "digest"),
+    )
     if not ok:
         data[PENDING_KEY] = pending
         logger.warning("Could not flush pending WhatsApp %s digest for %s", pending.get("kind"), phone)
     if owned:
         await save_user_data(phone, data)
     return ok
+
+
+async def stash_and_nudge(phone: str, *, kind: str, text: str) -> bool:
+    """Stash content for later and send the approved template nudge.
+
+    Returns True when the template nudge was sent. The stashed text flushes
+    automatically when the owner's next inbound message opens the 24h window.
+    """
+    await stash_pending_digest(phone, kind=kind, text=text)
+    tmpl = digest_template_name()
+    if not tmpl:
+        logger.info(
+            "WhatsApp %s stashed for %s (no utility template configured)",
+            kind,
+            phone,
+        )
+        return False
+    # Static digest templates have no {{1}}; alert templates need a teaser.
+    digest_only = (get_settings().whatsapp_digest_template or "").strip()
+    body = None if digest_only else _teaser(kind)
+    nudged = await get_whatsapp_client().send_template(phone, tmpl, body_parameter=body)
+    logger.info(
+        "WhatsApp %s stashed for %s; template nudge %s",
+        kind,
+        phone,
+        "sent" if nudged else "failed",
+    )
+    return nudged
 
 
 async def deliver_whatsapp_digest(text: str, *, kind: str) -> str:
@@ -87,27 +135,11 @@ async def deliver_whatsapp_digest(text: str, *, kind: str) -> str:
     if not client.enabled or not phone or not (text or "").strip():
         return "skipped"
 
-    ok = await client.send_text(phone, text, from_html=True, template_fallback=False)
+    ok = await client.send_text(
+        phone, text, from_html=True, template_fallback=False, outbox_kind=kind
+    )
     if ok:
         return "sent"
 
-    await stash_pending_digest(phone, kind=kind, text=text)
-    tmpl = digest_template_name()
-    if tmpl:
-        # Static digest templates have no {{1}}; alert templates need a teaser.
-        digest_only = (get_settings().whatsapp_digest_template or "").strip()
-        body = None if digest_only else _teaser(kind)
-        nudged = await client.send_template(phone, tmpl, body_parameter=body)
-        logger.info(
-            "WhatsApp %s digest stashed for %s; template nudge %s",
-            kind,
-            phone,
-            "sent" if nudged else "failed",
-        )
-    else:
-        logger.info(
-            "WhatsApp %s digest stashed for %s (no utility template configured)",
-            kind,
-            phone,
-        )
+    await stash_and_nudge(phone, kind=kind, text=text)
     return "stashed"

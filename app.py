@@ -20,8 +20,10 @@ from services.digest import run_evening_digest, run_morning_digest
 from services.formatting import escape_html as _escape_html
 from services.oauth_state import create_oauth_state, verify_oauth_state
 from bot.whatsapp_router import process_whatsapp_message
+from services.messaging.outbox import take_outbound
+from services.messaging.pending_digest import stash_and_nudge
 from services.messaging.webhook import extract_inbound_messages, extract_status_events
-from services.messaging.whatsapp import get_whatsapp_client
+from services.messaging.whatsapp import errors_indicate_outside_window, get_whatsapp_client
 from services.telegram_dedupe import should_process_update, should_process_webhook_event
 from services.timeutil import now_ist
 from services.monitoring import ping_heartbeat
@@ -260,13 +262,35 @@ async def _process_whatsapp_payload(payload: dict) -> None:
     client = get_whatsapp_client()
     for status in extract_status_events(payload):
         state = str(status.get("status") or "").lower()
-        if state == "failed":
-            logger.warning(
-                "WhatsApp delivery failed for message %s to %s: %s",
-                status.get("id"),
-                status.get("recipient_id"),
-                status.get("errors") or status,
-            )
+        if state != "failed":
+            continue
+        errors = status.get("errors") or status
+        logger.warning(
+            "WhatsApp delivery failed for message %s to %s: %s",
+            status.get("id"),
+            status.get("recipient_id"),
+            errors,
+        )
+        # Meta sometimes accepts a free-form message and only fails it here,
+        # asynchronously (e.g. 131047 outside the 24h window). Recover the
+        # tracked payload: stash it and nudge the owner with the approved
+        # template so the alert is not silently dropped.
+        if not errors_indicate_outside_window(errors):
+            continue
+        phone = str(status.get("recipient_id") or "")
+        item = await take_outbound(phone, str(status.get("id") or ""))
+        if not item:
+            continue
+        logger.info(
+            "Stashing undelivered WhatsApp %s for %s after async delivery failure",
+            item.get("kind") or "alert",
+            phone,
+        )
+        await stash_and_nudge(
+            phone,
+            kind=str(item.get("kind") or "alert"),
+            text=str(item.get("text") or ""),
+        )
     messages = extract_inbound_messages(payload)
     if not messages:
         logger.debug("WhatsApp webhook POST with no inbound messages")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 from functools import lru_cache
@@ -14,11 +15,31 @@ from services.messaging.format import (
     prepare_outbound_text,
     whatsapp_interactive_from_markup,
 )
+from services.messaging.outbox import register_outbound
 
 logger = logging.getLogger(__name__)
 
 # Re-engagement / outside 24h customer service window (common subcodes vary).
 _OUTSIDE_WINDOW_MARKERS = ("131047", "131026", "470", "outside the allowed window")
+
+
+def errors_indicate_outside_window(errors: Any) -> bool:
+    """True when a webhook status error list means the 24h window is closed."""
+    if not errors:
+        return False
+    text = errors if isinstance(errors, str) else json.dumps(errors)
+    return any(marker in text for marker in _OUTSIDE_WINDOW_MARKERS)
+
+
+def _message_id_from_response(resp: httpx.Response) -> str | None:
+    try:
+        messages = resp.json().get("messages") or []
+    except Exception:
+        return None
+    if not messages or not isinstance(messages[0], dict):
+        return None
+    mid = messages[0].get("id")
+    return str(mid) if mid else None
 
 # Shared HTTP client: keep-alive pooling avoids a fresh TLS handshake to
 # graph.facebook.com on every send (saves ~100-300ms per API call).
@@ -146,6 +167,7 @@ class WhatsAppClient:
         from_html: bool = True,
         reply_markup: Any = None,
         template_fallback: bool = True,
+        outbox_kind: str = "alert",
     ) -> bool:
         if not self.can_send or not text or not str(text).strip():
             if not self.can_send:
@@ -158,6 +180,7 @@ class WhatsAppClient:
 
         interactive = whatsapp_interactive_from_markup(reply_markup, body_hint=pieces[-1][:200])
         ok = True
+        wamids: list[str] = []
         for i, piece in enumerate(pieces):
             is_last = i == len(pieces) - 1
             if is_last and interactive:
@@ -180,6 +203,14 @@ class WhatsAppClient:
                         fallback_body = summary[0] if summary else piece
                         return await self.send_template(to, tmpl, body_parameter=fallback_body[:1024])
                 break
+            mid = _message_id_from_response(resp)
+            if mid:
+                wamids.append(mid)
+        if ok and wamids:
+            # Meta can still fail delivery asynchronously (24h window); remember
+            # the payload so the webhook handler can stash + nudge instead of
+            # silently dropping the message.
+            await register_outbound(self._normalize_to(to), wamids, text, kind=outbox_kind)
         return ok
 
     async def send_interactive(self, to: str, interactive: dict[str, Any]) -> bool:
