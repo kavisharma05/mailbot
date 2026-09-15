@@ -21,6 +21,7 @@ _VISION_PROMPT = (
     "image contains and answer the user's caption/request if provided. Do not "
     "invent unreadable details."
 )
+_VISION_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
 
 
 def _response_text(data: dict[str, Any]) -> str | None:
@@ -36,6 +37,16 @@ def _response_text(data: dict[str, Any]) -> str | None:
     return text or None
 
 
+def _vision_models(configured: str) -> list[str]:
+    """Configured model first, then stable vision-capable Flash fallbacks."""
+    models: list[str] = []
+    for model in (configured, *_VISION_FALLBACK_MODELS):
+        clean = (model or "").strip()
+        if clean and clean not in models:
+            models.append(clean)
+    return models
+
+
 def analyze_image(
     data: bytes,
     *,
@@ -49,11 +60,6 @@ def analyze_image(
     prompt = _VISION_PROMPT
     if caption and caption.strip():
         prompt += f"\n\nUser caption/request: {caption.strip()}"
-    model = (settings.gemini_model or "gemini-2.5-flash").strip()
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        f"?key={settings.gemini_api_key}"
-    )
     payload = {
         "contents": [
             {
@@ -70,15 +76,34 @@ def analyze_image(
         ],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1800},
     }
-    try:
-        resp = httpx.post(url, json=payload, timeout=_TIMEOUT)
-        if resp.status_code >= 400:
-            logger.warning("Gemini image analysis failed %s: %s", resp.status_code, resp.text[:300])
-            return None
-        return _response_text(resp.json())
-    except Exception as exc:
-        logger.warning("Gemini image analysis exception: %s", exc)
-        return None
+    for model in _vision_models(settings.gemini_model):
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            f"?key={settings.gemini_api_key}"
+        )
+        try:
+            resp = httpx.post(url, json=payload, timeout=_TIMEOUT)
+            if resp.status_code >= 400:
+                logger.warning(
+                    "Gemini image analysis failed model=%s status=%s: %s",
+                    model,
+                    resp.status_code,
+                    resp.text[:300],
+                )
+                continue
+            body = resp.json()
+            text = _response_text(body)
+            if text:
+                logger.info("Image analyzed via Gemini model=%s bytes=%d", model, len(data))
+                return text
+            logger.warning(
+                "Gemini image analysis returned no text model=%s response=%s",
+                model,
+                str(body)[:500],
+            )
+        except Exception as exc:
+            logger.warning("Gemini image analysis exception model=%s: %s", model, exc)
+    return None
 
 
 def transcribe_audio(

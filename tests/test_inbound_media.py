@@ -35,6 +35,26 @@ def test_analyze_image_uses_gemini_multimodal(monkeypatch):
     assert "What is the total?" in parts[0]["text"]
 
 
+def test_analyze_image_falls_back_to_stable_flash_model(monkeypatch):
+    settings = SimpleNamespace(gemini_api_key="g-key", gemini_model="bad-model")
+    monkeypatch.setattr(media_ai, "get_settings", lambda: settings)
+    failed = MagicMock(status_code=404, text="model not found")
+    ok = MagicMock(status_code=200)
+    ok.json.return_value = {
+        "candidates": [{"content": {"parts": [{"text": "Readable fallback result"}]}}]
+    }
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        return failed if len(calls) == 1 else ok
+
+    monkeypatch.setattr(media_ai.httpx, "post", fake_post)
+    assert media_ai.analyze_image(b"jpeg") == "Readable fallback result"
+    assert "bad-model:generateContent" in calls[0]
+    assert "gemini-2.5-flash:generateContent" in calls[1]
+
+
 def test_transcribe_audio_uses_groq_whisper(monkeypatch):
     settings = SimpleNamespace(groq_api_key="g-key", groq_api_key_2="")
     monkeypatch.setattr(media_ai, "get_settings", lambda: settings)
