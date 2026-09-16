@@ -20,6 +20,7 @@ from telegram import Update
 
 from bot.telegram_app import build_telegram_application, register_bot_commands
 from config import get_settings
+from services.alert_delivery import send_owner_update
 from services.db import check_db_health
 from services.digest import run_evening_digest, run_morning_digest
 from services.formatting import escape_html as _escape_html
@@ -488,6 +489,27 @@ async def run_reminders_task(x_task_secret: str = Header(..., alias="x-task-secr
     due_result = await run_due_reminders(ptb_app.bot)
     sched_result = await run_scheduled_reminders(ptb_app.bot)
     return {"due_reminders": due_result, "scheduled_reminders": sched_result}
+
+
+@fastapi_app.post("/tasks/notify-owner")
+async def notify_owner_task(request: Request, x_task_secret: str = Header(..., alias="x-task-secret")):
+    settings = get_settings()
+    if not hmac.compare_digest(x_task_secret, settings.task_secret):
+        raise HTTPException(status_code=403, detail="Invalid task secret")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    url = str((payload or {}).get("url") or (payload or {}).get("text") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+    html = (
+        "<b>Mailbot website is live</b>\n\n"
+        f"{_escape_html(url)}\n\n"
+        "Open it on your phone — Home, Tasks, Chat, and Schedule."
+    )
+    sent = await send_owner_update(ptb_app.bot, settings.telegram_owner_chat_id, html)
+    return {"ok": bool(sent)}
 
 
 @fastapi_app.get("/oauth/start")
