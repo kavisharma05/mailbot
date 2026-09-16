@@ -1,0 +1,16 @@
+.git
+.github
+.cursor
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.env
+.env.*
+!.env.example
+web/node_modules
+web/dist
+*.md
+!README.md

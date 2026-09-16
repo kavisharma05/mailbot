@@ -37,9 +37,14 @@ from services.formatting import (
     priority_prefix,
 )
 from services.schedule import (
+    apply_schedule_changes,
+    format_schedule_change_share,
     format_schedule_share,
+    is_official_faculty_sender,
     is_trusted_schedule_sender,
     looks_like_schedule,
+    looks_like_schedule_change,
+    parse_schedule_changes,
     parse_schedule_sessions,
     store_schedule_sessions,
 )
@@ -487,12 +492,121 @@ async def _process_message(
             return None
         return await _fail_delivery(error="mark_failed")
 
-    # Timetable / weekly schedule path
-    if is_trusted_schedule_sender(details.get("sender", "")) and looks_like_schedule(
+    # Faculty official-mail class changes (cancel / venue / extra / reschedule)
+    if is_official_faculty_sender(details.get("sender", "")) and looks_like_schedule_change(
         details["subject"],
         details["body"],
         attachment_text,
         result,
+    ):
+        sender_name, _sender_email = parse_sender(details.get("sender"))
+        changes = await asyncio.to_thread(
+            parse_schedule_changes,
+            subject=details["subject"],
+            body=details["body"],
+            attachment_text=attachment_text,
+            received_at=details.get("received_at_iso"),
+        )
+        stored_changes: list[dict[str, Any]] = []
+        if changes:
+            stored_changes = await asyncio.to_thread(
+                apply_schedule_changes,
+                changes,
+                gmail_message_id=message_id,
+                faculty=sender_name,
+            )
+        if stored_changes:
+            change_text = format_schedule_change_share(
+                stored_changes,
+                summary=summary,
+                sender=details.get("sender"),
+            )
+            if (
+                not suppress_alerts
+                and not delivered.get("owner")
+                and _should_owner_dm(
+                    settings,
+                    is_actionable=True,
+                    category="admin",
+                    task=result.get("task"),
+                    summary=summary,
+                )
+            ):
+                owner_sent = await send_owner_update(
+                    bot,
+                    settings.telegram_owner_chat_id,
+                    change_text,
+                    attachments=attachments if is_actionable else None,
+                    pin=False,
+                )
+                if owner_sent:
+                    await _note_sent("owner")
+                else:
+                    delivery_ok = False
+            if not suppress_alerts and not delivered.get("schedule"):
+                admin_chat = _category_group_chat_id("admin", settings)
+                if admin_chat:
+                    schedule_sent = await send_html(bot, admin_chat, change_text)
+                    attach_ok = await deliver_attachments(
+                        bot,
+                        admin_chat,
+                        attachments or [],
+                        caption_prefix=summary or "Class schedule update",
+                    )
+                    if schedule_sent and attach_ok:
+                        await _note_sent("schedule")
+                        alerts = 1
+                    else:
+                        delivery_ok = False
+                else:
+                    await _note_sent("schedule")
+            from services.websocket_manager import broadcast_fire_and_forget
+
+            broadcast_fire_and_forget(
+                "schedule_updated",
+                {
+                    "action": "faculty_change",
+                    "message_id": message_id,
+                    "changes": len(stored_changes),
+                },
+            )
+            if is_actionable and confidence in ("high", "medium"):
+                assignment = await asyncio.to_thread(
+                    insert_assignment,
+                    {
+                        **_assignment_payload(result, details, "admin", confidence),
+                        "course_or_topic": result.get("course_or_topic")
+                        or (changes[0].get("course_or_topic") if changes else None)
+                        or "Class schedule",
+                        "task": result.get("task") or "Class schedule updated",
+                    },
+                )
+                if assignment:
+                    assignment_id = assignment["id"]
+                elif not already_alerted and not any(delivered.values()):
+                    return await _fail_delivery(error="assignment_insert_failed")
+            if not delivery_ok:
+                return await _fail_delivery()
+            finalize = await _finalize_processed()
+            if finalize:
+                return finalize
+            return {"processed": 1, "alerts": alerts, "notifications": notifications}
+
+    # Timetable / weekly schedule path
+    if (
+        is_trusted_schedule_sender(details.get("sender", ""))
+        and looks_like_schedule(
+            details["subject"],
+            details["body"],
+            attachment_text,
+            result,
+        )
+        and not looks_like_schedule_change(
+            details["subject"],
+            details["body"],
+            attachment_text,
+            result,
+        )
     ):
         sessions = await asyncio.to_thread(
             parse_schedule_sessions,
@@ -554,6 +668,12 @@ async def _process_message(
                     assignment_id = assignment["id"]
                 elif not already_alerted and not any(delivered.values()):
                     return await _fail_delivery(error="assignment_insert_failed")
+            from services.websocket_manager import broadcast_fire_and_forget
+
+            broadcast_fire_and_forget(
+                "schedule_updated",
+                {"action": "timetable", "message_id": message_id},
+            )
             if not delivery_ok:
                 return await _fail_delivery()
             finalize = await _finalize_processed()
@@ -592,6 +712,13 @@ async def _process_message(
         if assignment:
             assignment_id = assignment["id"]
             await asyncio.to_thread(schedule_deadline_reminders, assignment)
+            from services.websocket_manager import broadcast_fire_and_forget
+
+            broadcast_fire_and_forget(
+                "task_updated",
+                {"action": "created", "id": str(assignment_id), "task": assignment.get("task")},
+            )
+            broadcast_fire_and_forget("new_email", {"assignment_id": str(assignment_id)})
         elif not already_alerted and not any(delivered.values()):
             return await _fail_delivery(error="assignment_insert_failed")
 

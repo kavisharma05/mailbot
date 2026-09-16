@@ -1,8 +1,47 @@
 """Tests for classification helpers, attachment intent, and formatting."""
 
-from ai.deadline import _boost_category_from_signals, normalize_classification
+from ai.deadline import (
+    _boost_category_from_signals,
+    correct_category_from_text,
+    normalize_classification,
+)
 from services.attachments import classify_attachment_intent
 from services.formatting import is_priority_item, normalize_category
+
+
+def test_class_presentation_is_not_certification():
+    result = _boost_category_from_signals(
+        "OB group presentation Wednesday",
+        "Deliver a 10-12 min class presentation. Rubric attached. Certificate of participation for attendees.",
+        "faculty@college.edu",
+        {
+            "category": "certification",
+            "task": "Deliver OB group presentation",
+            "summary": "10–12 min OB group presentation covering concepts and teamwork",
+            "is_actionable": True,
+            "confidence": "medium",
+        },
+    )
+    assert result["category"] == "deadline"
+
+
+def test_correct_category_from_text_presentation():
+    assert (
+        correct_category_from_text(
+            "certification",
+            "Deliver OB group presentation",
+            "Review rubric covering OB concepts",
+        )
+        == "deadline"
+    )
+    assert (
+        correct_category_from_text(
+            "certification",
+            "Complete Bloomberg certification",
+            "Bloomberg Market Concepts module",
+        )
+        == "certification"
+    )
 
 
 def test_certification_keyword_boost():
@@ -50,7 +89,18 @@ def test_normalize_category_includes_certification():
     assert normalize_category("bogus") == "other"
 
 
-def test_normalize_classification_preserves_certification():
+def test_normalize_classification_rewrites_presentation():
+    out = normalize_classification(
+        {
+            "is_actionable": True,
+            "category": "certification",
+            "task": "Deliver OB group presentation",
+            "summary": "10–12 min presentation on OB concepts",
+            "confidence": "high",
+        }
+    )
+    assert out["category"] == "deadline"
+    assert out["item_type"] == "assignment"
     out = normalize_classification(
         {
             "is_actionable": True,

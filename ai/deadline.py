@@ -1,8 +1,10 @@
 from datetime import datetime
 from typing import Any
+import re
 
 from ai.client import call_json
 from ai.prompts import DEADLINE_PROMPT, DEADLINE_REPAIR_PROMPT
+from services.schedule import looks_like_schedule_change
 from services.timeutil import (
     IST,
     _extract_time,
@@ -24,6 +26,88 @@ def _normalize_category(value: str | None) -> str:
     return "other"
 
 
+_ACADEMIC_SIGNALS = (
+    "presentation",
+    "group presentation",
+    "class presentation",
+    "assignment",
+    "case study",
+    "for class",
+    "for tomorrow",
+    "tomorrow's session",
+    "session prep",
+    "prepare chapter",
+    "quiz",
+    "midterm",
+    "mid-term",
+    "end-term",
+    "end term",
+    "viva",
+    "project report",
+    "group project",
+    "class prep",
+    "reading for",
+)
+
+_STRONG_CERT_SIGNALS = (
+    "nse certification",
+    "nse academy",
+    "bloomberg certification",
+    "bloomberg market concepts",
+    "coursera",
+    "linkedin learning",
+    "skill certification",
+    "professional certification",
+    "certification course",
+    "certificate course",
+    "complete your certification",
+    "mandatory certification",
+)
+
+_WEAK_CERT_SIGNALS = (
+    "certification",
+    "certificate",
+    "certified",
+)
+
+_PLACEMENT_SIGNALS = (
+    "shortlist",
+    "placement",
+    "recruit",
+    "interview slot",
+    "cv deadline",
+    "resume deadline",
+    "company ppt",
+    "job opening",
+)
+
+
+def _blob_has(blob: str, signals: tuple[str, ...]) -> bool:
+    for s in signals:
+        if " " in s:
+            if s in blob:
+                return True
+        elif re.search(rf"\b{re.escape(s)}\b", blob):
+            return True
+    return False
+
+
+def correct_category_from_text(
+    category: str | None,
+    *texts: str | None,
+) -> str:
+    """Fix certification false positives on academic coursework (presentations, cases)."""
+    cat = _normalize_category(category)
+    blob = "\n".join(t for t in texts if t).lower()
+    if not blob:
+        return cat
+    academic = _blob_has(blob, _ACADEMIC_SIGNALS)
+    strong_cert = _blob_has(blob, _STRONG_CERT_SIGNALS)
+    if cat == "certification" and academic and not strong_cert:
+        return "deadline"
+    return cat
+
+
 def _boost_category_from_signals(
     subject: str,
     body: str,
@@ -31,39 +115,38 @@ def _boost_category_from_signals(
     result: dict[str, Any],
 ) -> dict[str, Any]:
     """Lightweight keyword/sender corrections for common MBA mail types."""
-    blob = f"{subject}\n{body}\n{sender}".lower()
+    task_bits = f"{result.get('task') or ''}\n{result.get('summary') or ''}\n{result.get('course_or_topic') or ''}"
+    blob = f"{subject}\n{body}\n{sender}\n{task_bits}".lower()
     category = _normalize_category(result.get("category"))
+    academic = _blob_has(blob, _ACADEMIC_SIGNALS)
+    strong_cert = _blob_has(blob, _STRONG_CERT_SIGNALS)
+    weak_cert = _blob_has(blob, _WEAK_CERT_SIGNALS)
 
-    cert_signals = (
-        "certification",
-        "certificate",
-        "certified",
-        "nse",
-        "bloomberg",
-        "coursera",
-        "linkedin learning",
-        "skill certification",
-        "professional certification",
-    )
-    placement_signals = (
-        "shortlist",
-        "placement",
-        "recruit",
-        "interview slot",
-        "cv deadline",
-        "resume deadline",
-        "company ppt",
-        "job opening",
-    )
-
-    if any(s in blob for s in cert_signals):
+    # Class presentations / assignments are coursework, not professional certifications.
+    # Lone words like "certificate" or "certified" appear in academic mail too often.
+    if category == "certification" and academic and not strong_cert:
+        result["category"] = "deadline"
+    elif strong_cert and not academic:
         result["category"] = "certification"
         if result.get("is_actionable") is not False:
             result["is_actionable"] = True
         if result.get("confidence") == "low":
             result["confidence"] = "medium"
-    elif any(s in blob for s in placement_signals) and category in ("other", "admin"):
+    elif weak_cert and not academic and category in ("other", "admin"):
+        result["category"] = "certification"
+        if result.get("is_actionable") is not False:
+            result["is_actionable"] = True
+        if result.get("confidence") == "low":
+            result["confidence"] = "medium"
+    elif _blob_has(blob, _PLACEMENT_SIGNALS) and category in ("other", "admin"):
         result["category"] = "placement"
+        if result.get("confidence") == "low":
+            result["confidence"] = "medium"
+
+    # Faculty class cancel / venue / extra-class notices are admin schedule updates.
+    if looks_like_schedule_change(subject, body) and category in ("other", "deadline", "certification"):
+        result["category"] = "admin"
+        result["is_actionable"] = True
         if result.get("confidence") == "low":
             result["confidence"] = "medium"
 
@@ -128,6 +211,8 @@ def _infer_item_type(result: dict[str, Any]) -> str:
         return "fee"
     if any(w in blob for w in ("form", "registration", "register")):
         return "form"
+    if any(w in blob for w in ("presentation", "assignment", "case", "project", "viva")):
+        return "assignment"
     if category == "deadline":
         return "assignment"
     return "other"
@@ -203,12 +288,20 @@ def normalize_classification(
     body: str | None = None,
 ) -> dict[str, Any]:
     """Validate enums, resolve deadlines in IST, and ensure summary fallback."""
-    category = _normalize_category(result.get("category"))
-    confidence = _normalize_confidence(result.get("confidence"))
     task = result.get("task")
     course = result.get("course_or_topic")
     deadline_text = result.get("deadline_text")
     summary = (result.get("summary") or "").strip()
+    category = correct_category_from_text(
+        result.get("category"),
+        task,
+        summary,
+        course,
+        result.get("subject"),
+        body,
+    )
+    result = {**result, "category": category}
+    confidence = _normalize_confidence(result.get("confidence"))
     ref = _reference_now(received_at)
     enriched = _enrich_deadline_text(deadline_text, summary, body=body)
     resolved_date = resolve_deadline(result.get("deadline_date"), enriched, now=ref)

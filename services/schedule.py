@@ -10,17 +10,19 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from ai.client import call_json
-from ai.prompts import SCHEDULE_PROMPT
+from ai.prompts import SCHEDULE_CHANGE_PROMPT, SCHEDULE_PROMPT
 from gmail_api.client import get_message_details, search_message_ids
 from config import get_settings
+from services.contacts import parse_sender
 from services.db import (
     delete_class_sessions_for_message,
     get_class_sessions_for_message,
     get_classes_between,
+    get_classes_on,
     get_preferred_section,
     insert_class_sessions,
 )
-from services.timeutil import IST, today_ist
+from services.timeutil import IST, now_ist, today_ist
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +156,7 @@ def project_sessions_to_week(
 def load_template_sessions(info: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Load the weekly timetable template from cache, DB, or a refresh payload."""
     if info and info.get("sessions"):
-        return list(info["sessions"])
+        return _without_overlays(list(info["sessions"]))
     for message_id in find_latest_schedule_message_ids(max_candidates=3):
         try:
             stored = get_class_sessions_for_message(message_id)
@@ -162,12 +164,12 @@ def load_template_sessions(info: dict[str, Any] | None = None) -> list[dict[str,
             logger.warning("DB lookup for schedule message %s failed: %s", message_id, exc)
             stored = []
         if stored:
-            return stored
+            return _without_overlays(stored)
     try:
         anchor = today_ist()
         week_start = anchor - timedelta(days=anchor.weekday())
         week_end = week_start + timedelta(days=6)
-        return get_classes_between(week_start.isoformat(), week_end.isoformat())
+        return _without_overlays(get_classes_between(week_start.isoformat(), week_end.isoformat()))
     except Exception as exc:
         logger.warning("Fallback schedule template load failed: %s", exc)
         return []
@@ -179,9 +181,11 @@ def sessions_for_day(
     section: str | None = None,
     template: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return projected classes for a calendar day, optionally filtered by section."""
-    raw = template if template is not None else load_template_sessions()
-    return filter_by_section(project_sessions_to_day(raw, target_day), section)
+    """Return projected classes for a calendar day, with faculty-mail overlays applied."""
+    raw = _without_overlays(template if template is not None else load_template_sessions())
+    projected = filter_by_section(project_sessions_to_day(raw, target_day), section)
+    overlays = filter_by_section(overlays_for_day(target_day), section)
+    return merge_session_overlays(projected, overlays)
 
 
 # In-process cache: avoid re-calling the LLM for the same timetable mail
@@ -250,6 +254,552 @@ def looks_like_schedule(subject: str, body: str, attachment_text: str, result: d
         "session timings",
     )
     return any(k in blob for k in keywords)
+
+
+_CONSUMER_EMAIL_DOMAINS = frozenset(
+    {
+        "gmail.com",
+        "googlemail.com",
+        "yahoo.com",
+        "yahoo.co.in",
+        "outlook.com",
+        "hotmail.com",
+        "live.com",
+        "msn.com",
+        "icloud.com",
+        "me.com",
+        "proton.me",
+        "protonmail.com",
+        "aol.com",
+        "mail.com",
+        "rediffmail.com",
+        "ymail.com",
+    }
+)
+_OFFICIAL_DOMAIN_SUFFIXES = (".ac.in", ".edu.in", ".edu", ".ac.uk", ".edu.au")
+_OVERLAY_NOTE_RE = re.compile(
+    r"^\[(?P<kind>CANCELLED|VENUE|RESCHEDULE|ADDED)\]\s*",
+    re.IGNORECASE,
+)
+_SCHEDULE_CHANGE_PATTERNS = (
+    re.compile(r"\bcancell?ed?\b", re.I),
+    re.compile(r"\bwill not be held\b", re.I),
+    re.compile(r"\bwon'?t be held\b", re.I),
+    re.compile(r"\bvenue\b", re.I),
+    re.compile(r"\bshifted\b", re.I),
+    re.compile(r"\brelocat(?:e|ed|ion)\b", re.I),
+    re.compile(r"\breschedul", re.I),
+    re.compile(r"\bpostponed\b", re.I),
+    re.compile(r"\bpreponed\b", re.I),
+    re.compile(r"\bextra class", re.I),
+    re.compile(r"\badditional class", re.I),
+    re.compile(r"\bmake[- ]?up class", re.I),
+    re.compile(r"\bnew class\b", re.I),
+    re.compile(r"\broom (?:chang|shift)", re.I),
+    re.compile(r"\bchang(?:e|ed|ing) (?:of )?venue", re.I),
+    re.compile(r"\bchang(?:e|ed|ing) (?:the )?(?:timing|time|slot)", re.I),
+)
+_CLASS_CONTEXT_RE = re.compile(
+    r"\b(class(?:es)?|lecture|session|period|timetable|classroom)\b",
+    re.I,
+)
+
+
+def _sender_email(sender: str) -> str | None:
+    _, email = parse_sender(sender)
+    return (email or "").strip().lower() or None
+
+
+def is_official_faculty_sender(sender: str) -> bool:
+    """True for institutional faculty/admin mail, never personal Gmail/Yahoo/etc."""
+    settings = get_settings()
+    allowed = [s.strip().lower() for s in settings.admin_schedule_sender.split(",") if s.strip()]
+    sender_lower = (sender or "").lower()
+    if allowed and any(allowed_addr in sender_lower for allowed_addr in allowed):
+        return True
+    email = _sender_email(sender)
+    if not email or "@" not in email:
+        return False
+    domain = email.split("@", 1)[1]
+    if domain in _CONSUMER_EMAIL_DOMAINS:
+        return False
+    extra = [
+        d.strip().lower().lstrip("@")
+        for d in (settings.official_email_domains or "").split(",")
+        if d.strip()
+    ]
+    if any(domain == d or domain.endswith("." + d) for d in extra):
+        return True
+    return any(domain.endswith(suffix) for suffix in _OFFICIAL_DOMAIN_SUFFIXES)
+
+
+def looks_like_full_timetable(
+    subject: str, body: str, attachment_text: str, result: dict[str, Any] | None = None
+) -> bool:
+    """True for a weekly/term timetable, not a one-off cancel/venue mail."""
+    blob = f"{subject}\n{body}".lower()
+    att = (attachment_text or "").lower()
+    if result and result.get("is_schedule"):
+        return True
+    strong = ("timetable", "time table", "weekly schedule", "class timings", "session timings")
+    if any(k in blob or k in att for k in strong) and (
+        len(att) > 400 or "timetable" in blob or "time table" in blob
+    ):
+        return True
+    return False
+
+
+def looks_like_schedule_change(
+    subject: str,
+    body: str,
+    attachment_text: str = "",
+    result: dict[str, Any] | None = None,
+) -> bool:
+    """Detect cancel / venue / extra-class / reschedule mail (not a full timetable)."""
+    if looks_like_full_timetable(subject, body, attachment_text, result):
+        return False
+    blob = f"{subject}\n{body}"
+    if not _CLASS_CONTEXT_RE.search(blob):
+        return False
+    return any(pat.search(blob) for pat in _SCHEDULE_CHANGE_PATTERNS)
+
+
+def overlay_kind(notes: str | None) -> str | None:
+    m = _OVERLAY_NOTE_RE.match(notes or "")
+    if not m:
+        return None
+    return m.group("kind").lower()
+
+
+def public_session_notes(notes: str | None) -> str | None:
+    cleaned = _OVERLAY_NOTE_RE.sub("", notes or "").strip()
+    return cleaned or None
+
+
+def _without_overlays(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [s for s in sessions if overlay_kind(s.get("notes")) is None]
+
+
+def _hhmm(raw: Any) -> str | None:
+    if raw in (None, ""):
+        return None
+    text = str(raw).strip()
+    match = re.match(r"^(\d{1,2})[:.](\d{2})", text)
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    mer = ""
+    rest = text[match.end() :].strip().lower()
+    if rest.startswith("pm") or " pm" in f" {rest}":
+        mer = "pm"
+    elif rest.startswith("am") or " am" in f" {rest}":
+        mer = "am"
+    if mer == "pm" and hour < 12:
+        hour += 12
+    if mer == "am" and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _course_match(left: str | None, right: str | None) -> bool:
+    a = re.sub(r"\s+", " ", (left or "").lower()).strip()
+    b = re.sub(r"\s+", " ", (right or "").lower()).strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if re.search(rf"\b{re.escape(a)}\b", b) or re.search(rf"\b{re.escape(b)}\b", a):
+        return True
+    tokens_a = {t for t in re.split(r"[^a-z0-9]+", a) if len(t) > 2}
+    tokens_b = {t for t in re.split(r"[^a-z0-9]+", b) if len(t) > 2}
+    if tokens_a and tokens_b:
+        return bool(tokens_a & tokens_b)
+    return False
+
+
+def _same_slot(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if not _course_match(left.get("course_or_topic"), right.get("course_or_topic")):
+        return False
+    lt = str(left.get("start_time") or "")[:5]
+    rt = str(right.get("start_time") or "")[:5]
+    if lt and rt and lt not in {"00:00", "TBA"} and rt not in {"00:00", "TBA"}:
+        return lt == rt
+    return True
+
+
+def _match_template_sessions(
+    sessions: list[dict[str, Any]],
+    *,
+    course: str | None,
+    start_time: str | None,
+) -> list[dict[str, Any]]:
+    matched = [s for s in sessions if _course_match(s.get("course_or_topic"), course)]
+    if start_time:
+        timed = [s for s in matched if str(s.get("start_time") or "")[:5] == start_time]
+        if timed:
+            return timed
+    return matched
+
+
+def overlays_for_day(target_day: date) -> list[dict[str, Any]]:
+    try:
+        rows = get_classes_on(target_day.isoformat())
+    except Exception as exc:
+        logger.warning("Overlay lookup for %s failed: %s", target_day, exc)
+        return []
+    return [row for row in rows if overlay_kind(row.get("notes"))]
+
+
+def merge_session_overlays(
+    projected: list[dict[str, Any]],
+    overlays: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply cancel/venue/add patches onto projected timetable rows for one day."""
+    merged = [{**s, "cancelled": False, "change": None, "notes": public_session_notes(s.get("notes"))} for s in projected]
+    for overlay in overlays:
+        kind = overlay_kind(overlay.get("notes"))
+        if not kind:
+            continue
+        display_notes = public_session_notes(overlay.get("notes"))
+        patched = {
+            **overlay,
+            "cancelled": kind == "cancelled",
+            "change": kind,
+            "notes": display_notes,
+        }
+        if kind == "added":
+            if not any(_same_slot(row, overlay) and not row.get("cancelled") for row in merged):
+                merged.append(patched)
+            continue
+        replaced = False
+        for index, row in enumerate(merged):
+            if not _same_slot(row, overlay):
+                continue
+            kept_course = row.get("course_or_topic") or overlay.get("course_or_topic")
+            if kind == "cancelled":
+                merged[index] = {
+                    **row,
+                    **patched,
+                    "course_or_topic": kept_course,
+                    "cancelled": True,
+                    "change": "cancelled",
+                }
+            elif kind == "venue":
+                merged[index] = {
+                    **row,
+                    "course_or_topic": kept_course,
+                    "room": overlay.get("room") or row.get("room"),
+                    "notes": display_notes,
+                    "change": "venue",
+                    "cancelled": False,
+                }
+            elif kind == "reschedule":
+                merged[index] = {
+                    **row,
+                    **patched,
+                    "course_or_topic": kept_course,
+                    "cancelled": True,
+                    "change": "reschedule",
+                }
+            replaced = True
+            break
+        if not replaced:
+            merged.append(patched)
+    return sorted(merged, key=lambda x: x.get("start_time") or "")
+
+
+def _normalize_schedule_changes(parsed: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not parsed or not isinstance(parsed.get("changes"), list):
+        return []
+    valid = {"cancel", "venue", "reschedule", "add"}
+    out: list[dict[str, Any]] = []
+    for raw in parsed["changes"]:
+        if not isinstance(raw, dict):
+            continue
+        action = str(raw.get("action") or "").strip().lower()
+        if action not in valid:
+            continue
+        session_date = str(raw.get("session_date") or "")[:10] or None
+        new_session_date = str(raw.get("new_session_date") or "")[:10] or None
+        if session_date and len(session_date) < 10:
+            session_date = None
+        if new_session_date and len(new_session_date) < 10:
+            new_session_date = None
+        out.append(
+            {
+                "action": action,
+                "course_or_topic": (str(raw["course_or_topic"]).strip()[:200] if raw.get("course_or_topic") else None),
+                "session_date": session_date,
+                "start_time": _hhmm(raw.get("start_time")),
+                "end_time": _hhmm(raw.get("end_time")),
+                "room": (str(raw["room"]).strip()[:120] if raw.get("room") else None),
+                "new_session_date": new_session_date,
+                "new_start_time": _hhmm(raw.get("new_start_time")),
+                "new_end_time": _hhmm(raw.get("new_end_time")),
+                "new_room": (str(raw["new_room"]).strip()[:120] if raw.get("new_room") else None),
+                "notes": (str(raw["notes"]).strip()[:300] if raw.get("notes") else None),
+            }
+        )
+    return out
+
+
+def parse_schedule_changes(
+    *,
+    subject: str,
+    body: str,
+    attachment_text: str = "",
+    received_at: str | None = None,
+) -> list[dict[str, Any]]:
+    ref = now_ist()
+    if received_at:
+        try:
+            dt = datetime.fromisoformat(str(received_at).replace("Z", "+00:00"))
+            ref = dt.astimezone(IST)
+        except ValueError:
+            pass
+    system = SCHEDULE_CHANGE_PROMPT.format(today=ref.date().isoformat(), now=ref.strftime("%Y-%m-%d %H:%M IST"))
+    user = (
+        f"Subject: {subject}\n\n"
+        f"Email body:\n{(body or '')[:6000]}\n"
+    )
+    if attachment_text:
+        user += f"\nAttachment text:\n{attachment_text[:4000]}"
+    return _normalize_schedule_changes(call_json(system, user, max_tokens=1200))
+
+
+def _overlay_row(
+    *,
+    kind: str,
+    course: str,
+    session_date: str,
+    start_time: str,
+    end_time: str | None,
+    room: str | None,
+    faculty: str | None,
+    note: str | None,
+    gmail_message_id: str,
+    week_start: str | None = None,
+) -> dict[str, Any]:
+    tag = kind.upper()
+    detail = (note or "").strip()
+    notes = f"[{tag}] {detail}".strip()
+    return {
+        "course_or_topic": course[:200],
+        "session_date": session_date[:10],
+        "start_time": start_time[:5],
+        "end_time": (end_time[:5] if end_time else None),
+        "room": (room[:120] if room else None),
+        "faculty": (faculty[:120] if faculty else None),
+        "notes": notes[:300],
+        "week_start": (week_start[:10] if week_start else None),
+        "gmail_message_id": gmail_message_id,
+    }
+
+
+def apply_schedule_changes(
+    changes: list[dict[str, Any]],
+    *,
+    gmail_message_id: str,
+    faculty: str | None = None,
+    template: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Store overlay rows for faculty class changes. Timetable refreshes do not wipe these."""
+    if not changes or not gmail_message_id:
+        return []
+    raw = _without_overlays(template if template is not None else load_template_sessions())
+    overlays: list[dict[str, Any]] = []
+
+    for change in changes:
+        action = change.get("action")
+        course = change.get("course_or_topic") or "Class"
+        old_date = change.get("session_date")
+        new_date = change.get("new_session_date") or old_date
+        extra = change.get("notes")
+
+        if action in {"cancel", "venue", "reschedule"} and not old_date:
+            continue
+
+        day_sessions: list[dict[str, Any]] = []
+        if old_date:
+            try:
+                day_sessions = project_sessions_to_day(raw, date.fromisoformat(old_date))
+            except ValueError:
+                day_sessions = []
+        matches = _match_template_sessions(
+            day_sessions,
+            course=course,
+            start_time=change.get("start_time"),
+        )
+
+        if action == "cancel":
+            targets = matches or [
+                {
+                    "course_or_topic": course,
+                    "start_time": change.get("start_time") or "00:00",
+                    "end_time": change.get("end_time"),
+                    "room": change.get("room"),
+                    "faculty": faculty,
+                    "week_start": None,
+                }
+            ]
+            for session in targets:
+                overlays.append(
+                    _overlay_row(
+                        kind="cancelled",
+                        course=str(session.get("course_or_topic") or course),
+                        session_date=old_date,
+                        start_time=str(session.get("start_time") or change.get("start_time") or "00:00"),
+                        end_time=session.get("end_time") or change.get("end_time"),
+                        room=session.get("room") or change.get("room"),
+                        faculty=session.get("faculty") or faculty,
+                        note=extra or "Class cancelled",
+                        gmail_message_id=gmail_message_id,
+                        week_start=session.get("week_start"),
+                    )
+                )
+        elif action == "venue":
+            new_room = change.get("new_room") or change.get("room")
+            if not new_room:
+                continue
+            targets = matches or [
+                {
+                    "course_or_topic": course,
+                    "start_time": change.get("start_time") or "00:00",
+                    "end_time": change.get("end_time"),
+                    "faculty": faculty,
+                    "week_start": None,
+                }
+            ]
+            for session in targets:
+                overlays.append(
+                    _overlay_row(
+                        kind="venue",
+                        course=str(session.get("course_or_topic") or course),
+                        session_date=old_date,
+                        start_time=str(session.get("start_time") or change.get("start_time") or "00:00"),
+                        end_time=session.get("end_time") or change.get("end_time"),
+                        room=new_room,
+                        faculty=session.get("faculty") or faculty,
+                        note=extra or f"Moved to {new_room}",
+                        gmail_message_id=gmail_message_id,
+                        week_start=session.get("week_start"),
+                    )
+                )
+        elif action == "reschedule":
+            if old_date:
+                targets = matches or [
+                    {
+                        "course_or_topic": course,
+                        "start_time": change.get("start_time") or "00:00",
+                        "end_time": change.get("end_time"),
+                        "room": change.get("room"),
+                        "faculty": faculty,
+                        "week_start": None,
+                    }
+                ]
+                for session in targets:
+                    overlays.append(
+                        _overlay_row(
+                            kind="cancelled",
+                            course=str(session.get("course_or_topic") or course),
+                            session_date=old_date,
+                            start_time=str(session.get("start_time") or change.get("start_time") or "00:00"),
+                            end_time=session.get("end_time") or change.get("end_time"),
+                            room=session.get("room") or change.get("room"),
+                            faculty=session.get("faculty") or faculty,
+                            note=extra or "Rescheduled",
+                            gmail_message_id=gmail_message_id,
+                            week_start=session.get("week_start"),
+                        )
+                    )
+            add_date = new_date or old_date
+            add_start = change.get("new_start_time") or change.get("start_time")
+            if add_date and add_start:
+                overlays.append(
+                    _overlay_row(
+                        kind="added",
+                        course=course,
+                        session_date=add_date,
+                        start_time=add_start,
+                        end_time=change.get("new_end_time") or change.get("end_time"),
+                        room=change.get("new_room") or change.get("room"),
+                        faculty=faculty,
+                        note=extra or "Rescheduled class",
+                        gmail_message_id=gmail_message_id,
+                    )
+                )
+        elif action == "add":
+            add_date = new_date or old_date
+            add_start = change.get("new_start_time") or change.get("start_time")
+            if not add_date or not add_start:
+                continue
+            overlays.append(
+                _overlay_row(
+                    kind="added",
+                    course=course,
+                    session_date=add_date,
+                    start_time=add_start,
+                    end_time=change.get("new_end_time") or change.get("end_time"),
+                    room=change.get("new_room") or change.get("room"),
+                    faculty=faculty,
+                    note=extra or "Extra class",
+                    gmail_message_id=gmail_message_id,
+                )
+            )
+
+    if not overlays:
+        return []
+    try:
+        delete_class_sessions_for_message(gmail_message_id)
+    except Exception as exc:
+        logger.warning("Could not clear schedule-change overlays for %s: %s", gmail_message_id, exc)
+    try:
+        stored = insert_class_sessions(overlays)
+        return stored or overlays
+    except Exception as exc:
+        logger.warning("Could not store schedule-change overlays: %s", exc)
+        return overlays
+
+
+def format_schedule_change_share(
+    overlays: list[dict[str, Any]],
+    *,
+    summary: str | None = None,
+    sender: str | None = None,
+) -> str:
+    if not overlays:
+        return "No class schedule changes could be extracted."
+    lines = ["<b>📅 Class schedule update</b>", ""]
+    if sender:
+        lines.append(html.escape(str(sender)))
+        lines.append("")
+    labels = {
+        "cancelled": "Cancelled",
+        "venue": "Venue change",
+        "added": "Extra / new class",
+        "reschedule": "Rescheduled",
+    }
+    for row in overlays:
+        kind = overlay_kind(row.get("notes")) or row.get("change") or "updated"
+        course = html.escape(str(row.get("course_or_topic") or "Class"))
+        try:
+            day_label = date.fromisoformat(str(row["session_date"])[:10]).strftime("%a, %d %b")
+        except (TypeError, ValueError, KeyError):
+            day_label = str(row.get("session_date") or "")
+        start = html.escape(str(row.get("start_time") or "—"))
+        room = html.escape(str(row.get("room") or "Room TBA"))
+        detail = html.escape(public_session_notes(row.get("notes")) or "")
+        title = labels.get(kind, "Updated")
+        line = f"• <b>{html.escape(title)}</b> — {course}\n   {html.escape(day_label)} · {start} · {room}"
+        if detail:
+            line += f"\n   {detail}"
+        lines.append(line)
+        lines.append("")
+    if summary:
+        lines.append(f"<i>{html.escape(summary)}</i>")
+    return "\n".join(lines).strip()
 
 
 def _attachment_names_look_like_schedule(attachments: list[dict[str, Any]]) -> bool:
@@ -957,9 +1507,21 @@ def _format_session_block(sessions: list[dict[str, Any]], title: str) -> str:
             ) + " · "
         except (TypeError, ValueError):
             pass
-        line = f"• <b>{day_label}{time_bit}</b> — {course}\n   Room: {room}"
+        cancelled = bool(s.get("cancelled")) or overlay_kind(s.get("notes")) == "cancelled"
+        change = s.get("change") or overlay_kind(s.get("notes"))
+        display_notes = public_session_notes(s.get("notes")) if overlay_kind(s.get("notes")) else (s.get("notes") or None)
+        status = ""
+        if cancelled:
+            status = "Cancelled · "
+        elif change == "added":
+            status = "Extra · "
+        elif change == "venue":
+            status = "Venue update · "
+        line = f"• <b>{status}{day_label}{time_bit}</b> — {course}\n   Room: {room}"
         if faculty:
             line += f"\n   Faculty: {html.escape(str(faculty))}"
+        if display_notes:
+            line += f"\n   {html.escape(str(display_notes))}"
         lines.append(line)
         lines.append("")
     return "\n".join(lines).strip()
@@ -990,20 +1552,17 @@ def format_upcoming_classes(
     day = day or today_ist()
     end = day + timedelta(days=days)
     try:
-        raw = template if template is not None else load_template_sessions()
-        stored_dates = _template_date_set(raw)
-        # Dated multi-day timetables: show real upcoming calendar dates only
-        if len(stored_dates) > 1:
-            upcoming = [
-                s
-                for s in raw
-                if (_session_date_value(s) or day) >= day
-                and (_session_date_value(s) or end) <= end
-            ]
-            sessions = filter_by_section(upcoming, section)
-        else:
-            projected = project_sessions_to_week(raw, day, days=days + 1)
-            sessions = filter_by_section(projected, section)
+        raw = _without_overlays(template if template is not None else load_template_sessions())
+        sessions: list[dict[str, Any]] = []
+        for offset in range(days + 1):
+            sessions.extend(
+                sessions_for_day(day + timedelta(days=offset), section=section, template=raw)
+            )
+        sessions = [
+            s
+            for s in sessions
+            if (_session_date_value(s) or day) >= day and (_session_date_value(s) or end) <= end
+        ]
     except Exception as exc:
         logger.warning("Upcoming classes projection failed: %s", exc)
         return ""

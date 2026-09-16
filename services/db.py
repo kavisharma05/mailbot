@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from supabase import Client, create_client
 
 from config import get_settings
+from services.netdns import ensure_host_resolves
 from services.timeutil import item_effective_deadline_dt, now_ist, parse_iso_deadline, resolve_deadline
 
 logger = logging.getLogger(__name__)
@@ -34,8 +35,9 @@ _ASSIGNMENT_COLUMNS = (
 
 def get_db() -> Client:
     global _db_client
+    settings = get_settings()
+    ensure_host_resolves(settings.supabase_url)
     if _db_client is None:
-        settings = get_settings()
         _db_client = create_client(settings.supabase_url, settings.supabase_service_key)
     return _db_client
 

@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     # Comma-separated trusted senders for timetable mail (e.g. registrar@mycollege.ac.in)
     admin_schedule_sender: str = ""
 
+    # Extra institutional domains treated as official faculty mail (comma-separated)
+    official_email_domains: str = ""
+
     # Web OAuth redirect URI for one-tap Gmail reconnect (e.g. https://app.onrender.com/oauth/callback)
     gmail_oauth_redirect_uri: str = ""
 

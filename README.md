@@ -9,7 +9,7 @@ A Telegram bot that helps MBA/college students manage academic email: compose po
 - **Scheduled digests** — Morning 7:00 IST and evening 20:00 IST owner DMs, fired by an **in-app scheduler** (GitHub Actions cron remains as backup)
 - **Incoming mail alerts** — Owner DM after classification with sender, subject, content summary, and deadline when present; actionable items also go to category groups
 - **Attachments** — Downloads mail attachments, reads PDF/Excel/Word text for classification, and forwards files to category groups and owner DM for actionable mail
-- **Class timetable** — Parses weekly schedules from body or attachments; morning digest + `/classes` show today's courses, times, and rooms
+- **Class timetable** — Parses weekly schedules from body or attachments; morning digest + `/classes` show today's courses, times, and rooms. Faculty mail from official college addresses (`.ac.in` / `.edu`, not personal Gmail) that cancel, shift venue, or add a class updates the web app, `/classes`, Telegram, and WhatsApp.
 - **14-day backfill** — One-time scan of recent inbox mail via `POST /tasks/backfill`
 
 Email categories: `deadline`, `placement`, `certification`, `admin`, `other`.
@@ -29,6 +29,24 @@ Scaffolded for later: submission matcher (#3), manual reminder parser (#4).
 - **Supabase** Postgres for assignments, processed emails, watch state
 - **Gmail API** (OAuth2) for read + send
 - **Groq API** (free tier, Llama 3.3 70B) for structured JSON classification/composition
+
+## Mobile web app
+
+Vue 3 SPA in [`web/`](web/) with Material-style mobile UI (Home, Tasks, Chat, Schedule).
+
+**Local development**
+
+```bash
+# Terminal 1 — API + built-in watcher
+uvicorn app:app --reload --port 8000
+
+# Terminal 2 — Vite dev server (proxies /api and /ws to :8000)
+cd web && npm install && npm run dev
+```
+
+Open `http://localhost:5173`. Production: `cd web && npm run build` — FastAPI serves `web/dist` at `/` when that folder exists.
+
+REST: `/api/*` · WebSocket: `/ws` (task updates, sync status, new mail).
 
 ## Quick start (local dev)
 
@@ -114,22 +132,27 @@ uvicorn app:app --reload --port 8000
 
 For local Telegram testing, use polling mode or ngrok + `scripts/set_webhook.py`.
 
-## Deploy to Render (free)
+## Deploy to Render
 
-1. Push this repo to GitHub
-2. Create a **Web Service** on [render.com](https://render.com) (free tier)
-3. Build command: `pip install -r requirements.txt`
-4. Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-5. Add all env vars from `.env.example`
-6. After deploy, register the webhook:
+The Vue app is built inside Docker and FastAPI serves it at `/`. Telegram, WhatsApp, `/api`, and `/ws` stay on the same URL.
 
-```bash
-python scripts/set_webhook.py
-```
+1. Push this repo to GitHub (already `kavisharma05/mailbot`).
+2. On [render.com](https://render.com) → **New** → **Blueprint** and select this repo, or **New Web Service** → Docker, root `Dockerfile`.
+3. Copy every value from your local `.env` into Render → Environment (do not commit `.env`). Set `RENDER_URL` to the service URL Render assigns, e.g. `https://mailbot-xxxx.onrender.com`.
+4. After the first deploy is live:
+   - GitHub → Settings → Secrets and variables → Actions: `RENDER_URL` and `TASK_SECRET` (same as Render).
+   - Locally: `python scripts/set_webhook.py`
+   - GitHub → Actions → **Keep Render awake** → Run workflow (confirms the ping).
 
-7. Add GitHub repo secrets for the cron workflow:
-   - `RENDER_URL` — your Render app URL (e.g. `https://mailbot-abc.onrender.com`)
-   - `TASK_SECRET` — same value as in Render env
+Free Render sleeps after ~15 minutes with no HTTP traffic. These pingers keep it up:
+
+| Pinger | What it does |
+|--------|----------------|
+| **Keep Render awake** (every 5 min) | `GET /ping` — wakes a sleeping instance |
+| In-app self-ping (every 10 min) | Keeps an already-awake instance from sleeping |
+| Mailbot Scheduler (every 5 min) | Also hits `/tasks/watch-gmail` (needs `TASK_SECRET`) |
+
+GitHub cron can drift; if you still see cold starts, add a free [UptimeRobot](https://uptimerobot.com) HTTP monitor on `https://YOUR.onrender.com/ping` every 5 minutes.
 
 The `.github/workflows/scheduler.yml` workflow will:
 
@@ -211,6 +234,7 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 | `REMIND_AGAIN_HOURS` | Hours until REMIND AGAIN re-alerts (default: 4) |
 | `HEARTBEAT_URL` | healthchecks.io ping URL (optional; alerts if watcher stops) |
 | `ADMIN_SCHEDULE_SENDER` | Comma-separated trusted timetable sender(s), e.g. `registrar@mycollege.ac.in` |
+| `OFFICIAL_EMAIL_DOMAINS` | Extra institutional domains treated as faculty/admin mail for class-change updates (comma-separated) |
 | `GMAIL_OAUTH_REDIRECT_URI` | Web OAuth callback, e.g. `https://your-app.onrender.com/oauth/callback` |
 | `REQUIRE_TRUSTED_SCHEDULE_SENDER` | `true` (default) rejects timetable mail unless `ADMIN_SCHEDULE_SENDER` is set when `RENDER_URL` is configured |
 

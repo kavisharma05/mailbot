@@ -174,17 +174,21 @@ Today's date: {today}
 Current time: {now}
 
 Categories (pick exactly one):
-- "deadline" — assignments, projects, cases, quizzes, exams, submissions, class prep
+- "deadline" — assignments, projects, cases, quizzes, exams, submissions, class prep,
+  class presentations, group presentations, vivas, session readings
 - "placement" — shortlists, CV/resume deadlines, company PPTs, interview slots, internships
-- "certification" — professional/skill certifications, certificate courses, NSE/Bloomberg/Coursera
-  deadlines, mandatory certification registration or submission
+- "certification" — ONLY external professional/skill credentials (NSE, Bloomberg, Coursera,
+  LinkedIn Learning). Never use this for class presentations, assignments, or coursework
+  even if the mail mentions a participation certificate or "certified" copy.
 - "admin" — fees, registration, forms, ID/library/hostel, official notices, timetables
 - "other" — clubs, events, newsletters, FYI-only mail with no action required
 
 Rules:
 - You may receive email body PLUS extracted attachment text (PDF/Excel/Word). Use both.
-- Set "is_schedule" true when the mail/attachment is a class timetable / weekly schedule
-  (days, times, rooms, courses). Timetables are actionable; category usually "admin".
+If the mail is a class-timetable PDF, set is_schedule true (category admin).
+If a faculty member is cancelling a class, changing venue/room, shifting time, or
+adding an extra/make-up class, set is_actionable true and category "admin"
+(is_schedule false). Summarize the change in "task" and "summary".
 - Set "is_actionable" true when the student must do something: submit, register,
 attend, respond, pay, prepare/read for class, OR note a new timetable/schedule.
 Reading prep for "tomorrow's session" is actionable (category "deadline").
@@ -220,6 +224,9 @@ Email: "Submit Marketing case study by 20 July."
 
 Email: "Tomorrow's OB session at 9:45 AM — read Brady Training case."
 {{"is_actionable":true,"category":"deadline","course_or_topic":"Organisational Behaviour","task":"Read Brady Training case","deadline_text":"tomorrow 9:45 AM","deadline_date":"TOMORROW_0945","sender":null,"summary":"Read Brady case before tomorrow 9:45 AM OB session","confidence":"high"}}
+
+Email: "OB group presentation 10–12 min Wednesday. Rubric: concepts, analysis, teamwork. Certificate of participation for attendees."
+{{"is_actionable":true,"category":"deadline","item_type":"assignment","course_or_topic":"Organisational Behaviour","task":"Deliver OB group presentation","deadline_text":"Wednesday","deadline_date":"WEDNESDAY_2359","sender":null,"summary":"10–12 min OB group presentation covering concepts, analysis and teamwork","confidence":"high"}}
 
 Email: "Kindly do the following readings for tomorrow's session in OB. Prepare chapter on Values and case Is Anything Wrong at Wright & Fehr Investments?"
 {{"is_actionable":true,"category":"deadline","course_or_topic":"Organisational Behaviour","task":"Prepare Values chapter + Wright & Fehr Investments case","deadline_text":"tomorrow's session","deadline_date":"TOMORROW_2359","sender":null,"summary":"Prepare OB Values chapter and Wright & Fehr case for tomorrow","confidence":"high"}}
@@ -309,6 +316,44 @@ Rules:
 - Map day labels like "Mon 20.07.26" / "Tue 21.07.26" to session_date YYYY-MM-DD.
 - If the header shows a range like [20.07.2026 - 25.07.2026], cover that whole range.
 - If dates cannot be resolved, omit that session rather than inventing.
+"""
+
+SCHEDULE_CHANGE_PROMPT = """Extract class schedule CHANGES from a faculty/admin email.
+This is NOT a full weekly timetable. The mail cancels a class, changes venue/room,
+shifts timing, or adds an extra/make-up class.
+
+Timezone: Asia/Kolkata (IST).
+Today's date: {today}
+Email received: {now}
+
+Return ONLY strict JSON:
+{{
+"changes": [
+  {{
+    "action": "cancel|venue|reschedule|add",
+    "course_or_topic": "string or null",
+    "session_date": "YYYY-MM-DD or null",
+    "start_time": "HH:MM or null (24h IST)",
+    "end_time": "HH:MM or null",
+    "room": "string or null (current/old room if mentioned)",
+    "new_session_date": "YYYY-MM-DD or null (for reschedule)",
+    "new_start_time": "HH:MM or null",
+    "new_end_time": "HH:MM or null",
+    "new_room": "string or null",
+    "notes": "short reason or extra detail"
+  }}
+]
+}}
+
+Rules:
+- action "cancel" — class will not be held.
+- action "venue" — same date/time, different room (put the new room in new_room).
+- action "reschedule" — date and/or time moved (old slot in session_date/start_time, new in new_*).
+- action "add" — extra, additional, or make-up class.
+- Resolve "today", "tomorrow", "Monday" using Today: {today}.
+- Times like 9:45 am → 09:45. If no clock time, leave start_time null.
+- One email may contain several changes. Omit anything that is not a class change.
+- If nothing can be extracted, return {{"changes":[]}}.
 """
 
 SUBMISSION_MATCHER_PROMPT = """You match a file a student just uploaded to Telegram against a list of

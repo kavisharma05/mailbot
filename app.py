@@ -8,8 +8,13 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from pathlib import Path
+
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+from api.web_routes import router as web_api_router
 from google.auth.exceptions import RefreshError
 from telegram import Update
 
@@ -37,6 +42,7 @@ from services.watcher import (
     run_gmail_watcher,
     watcher_lock,
 )
+from services.websocket_manager import broadcast_fire_and_forget, connect, disconnect
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 # Avoid logging full Telegram API URLs (token in path) from PTB/httpx at INFO.
@@ -135,6 +141,7 @@ async def _background_watcher_loop() -> None:
                 result = await run_gmail_watcher(ptb_app.bot)
             watcher_ok = True
             logger.info("Background watcher result: %s", result)
+            broadcast_fire_and_forget("sync_status", {"watcher": result})
             await ping_heartbeat(ok=True)
             from services.db import update_watch_state
 
@@ -219,6 +226,21 @@ async def lifespan(app: FastAPI):
 
 
 fastapi_app = FastAPI(title="Mailbot", lifespan=lifespan)
+fastapi_app.include_router(web_api_router)
+
+WEB_DIST = Path(__file__).resolve().parent / "web" / "dist"
+
+
+@fastapi_app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await connect(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        await disconnect(ws)
+    except Exception:
+        await disconnect(ws)
 
 
 @fastapi_app.get("/healthz")
@@ -562,6 +584,42 @@ async def oauth_callback(
     return HTMLResponse(
         "<h1>Gmail reconnected</h1><p>You can close this tab and return to Telegram.</p>"
     )
+
+
+if WEB_DIST.is_dir():
+    assets_dir = WEB_DIST / "assets"
+    if assets_dir.is_dir():
+        fastapi_app.mount("/assets", StaticFiles(directory=assets_dir), name="web-assets")
+
+    @fastapi_app.get("/")
+    async def web_app_root():
+        return FileResponse(
+            WEB_DIST / "index.html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+
+    @fastapi_app.get("/{spa_path:path}")
+    async def web_app_spa(spa_path: str):
+        blocked_prefixes = (
+            "api/",
+            "telegram/",
+            "whatsapp/",
+            "tasks/",
+            "oauth/",
+            "healthz",
+            "ping",
+            "privacy",
+            "ws",
+        )
+        if spa_path.startswith(blocked_prefixes) or spa_path in blocked_prefixes:
+            raise HTTPException(status_code=404, detail="Not found")
+        file_path = WEB_DIST / spa_path
+        if file_path.is_file():
+            return FileResponse(file_path)
+        return FileResponse(
+            WEB_DIST / "index.html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
 
 app = InstantPingMiddleware(fastapi_app)

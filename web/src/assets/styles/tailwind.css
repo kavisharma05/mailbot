@@ -1,0 +1,144 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body {
+    width: 100%;
+    margin: 0;
+    padding: 0;
+  }
+  body {
+    overscroll-behavior-y: none;
+    background-color: #f5f5f7;
+    color: #1d1d1f;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .pt-safe {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@layer components {
+  /* Surfaces — hairline-bordered white groups on the gray canvas */
+  .card {
+    @apply bg-card rounded-card border border-hairline;
+  }
+  .group-list {
+    @apply card divide-y divide-hairline overflow-hidden;
+  }
+  .group-row {
+    @apply px-4 py-3;
+  }
+  .glass {
+    background-color: rgba(255, 255, 255, 0.72);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    backdrop-filter: blur(20px) saturate(180%);
+  }
+
+  /* Interaction — one curve, press feedback, visible focus */
+  .tappable {
+    @apply transition-all duration-200 ease-apple active:scale-[0.97] active:opacity-90
+      focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:ring-offset-1;
+  }
+
+  /* Buttons — one primary per screen; 44px+ targets */
+  .btn-primary {
+    @apply tappable h-12 px-5 rounded-card bg-accent text-white text-body font-semibold
+      flex items-center justify-center gap-2 hover:bg-accent-hover active:bg-accent-press;
+  }
+  .btn-secondary {
+    @apply tappable h-12 px-5 rounded-card bg-fill text-ink text-body font-semibold
+      flex items-center justify-center gap-2;
+  }
+  .btn-tertiary {
+    @apply tappable h-11 px-3 text-body font-normal text-accent flex items-center justify-center gap-1;
+  }
+
+  /* Inputs — quiet fill, clear focus */
+  .input {
+    @apply h-11 px-4 rounded-card bg-fill text-body text-ink placeholder:text-ink-3
+      border border-transparent transition-all duration-200 ease-apple
+      focus:outline-none focus:bg-card focus:border-accent/40 focus:ring-2 focus:ring-accent/25;
+  }
+}
+
+/* Animations */
+@keyframes slide-up {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.3s cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.animate-fade-in {
+  animation: fade-in 0.2s ease-out;
+}
+
+.animate-pulse-soft {
+  animation: pulse-soft 2s ease-in-out infinite;
+}
+
+/* Sheet transition */
+.sheet-enter-active {
+  transition: opacity 0.2s ease-out;
+}
+.sheet-leave-active {
+  transition: opacity 0.15s ease-in;
+}
+.sheet-enter-from,
+.sheet-leave-to {
+  opacity: 0;
+}
+
+/* Skeleton loading */
+.skeleton {
+  @apply bg-fill animate-pulse rounded;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
