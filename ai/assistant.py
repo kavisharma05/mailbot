@@ -456,6 +456,16 @@ _PERSON_STOP = {
     "sir",
     "ma'am",
     "maam",
+    "my",
+    "this",
+    "that",
+    "check",
+    "see",
+    "show",
+    "list",
+    "get",
+    "find",
+    "open",
 }
 
 
@@ -573,6 +583,26 @@ def _extract_person_query(question: str) -> str | None:
     if m:
         return m.group(1).strip()
 
+    m = re.search(
+        r"\b(?:check|see|show|list|get|find|open)\s+([A-Za-z][A-Za-z.'-]{2,})(?:'s)?\s+(?:mail|email|mails|emails|inbox)\b",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        name = m.group(1).strip()
+        if name.lower() not in _PERSON_STOP:
+            return name
+
+    m = re.search(
+        r"\b([A-Za-z][A-Za-z.'-]{2,})(?:'s)?\s+(?:mails?|emails?)\b",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        name = m.group(1).strip()
+        if name.lower() not in _PERSON_STOP:
+            return name
+
     return None
 
 
@@ -679,7 +709,8 @@ def _build_mailbox_queries(question: str, convo: dict[str, Any] | None = None) -
             queries.append(f"from:{email} newer_than:90d")
         else:
             queries.append(f"from:({person.split()[-1]}) newer_than:90d")
-        keywords = _extract_keywords(question, max_words=4)
+        skip = {*(person.lower().split()), "check", "see", "show", "list", "get", "find", "open"}
+        keywords = [k for k in _extract_keywords(question, max_words=4) if k.lower() not in skip]
         if keywords and from_clause:
             queries.append(f'{from_clause} {" ".join(keywords)} newer_than:90d')
     else:
@@ -937,8 +968,11 @@ def _gather_mailbox_context(
             emails.append(mail)
             if len(emails) >= _MAX_MAILBOX_EMAILS:
                 break
-        if len(emails) >= _MAX_MAILBOX_EMAILS:
-            break
+            if len(emails) >= _MAX_MAILBOX_EMAILS:
+                break
+
+    if not wants_count:
+        stats["count"] = len(emails)
 
     # Sender breakdown for "from whom" / how many today
     senders: dict[str, int] = {}
@@ -979,7 +1013,7 @@ def _format_mailbox_fallback(stats: dict[str, Any], emails: list[dict[str, Any]]
     person = stats.get("person_filter")
     if stats.get("person_no_match") and person:
         return f"I couldn't find any mail from {person} in the searches I tried."
-    count = stats.get("count", 0)
+    count = stats.get("count", 0) or stats.get("listed") or len(emails)
     capped = stats.get("capped")
     lines = []
     if person:

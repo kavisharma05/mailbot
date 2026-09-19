@@ -228,7 +228,12 @@ def clean_person_phrase(raw: str | None) -> str | None:
         return None
     text = raw.strip(" .,?!:;\"'")
     text = re.sub(r"^(?:a|an|the|my|our|this|that)\s+", "", text, flags=re.I)
-    text = re.sub(r"^(?:send|write|draft|compose|mail|email|message|msg)\s+", "", text, flags=re.I)
+    text = re.sub(
+        r"^(?:send|write|draft|compose|mail|email|message|msg|check|see|show|list|get|find|open)\s+",
+        "",
+        text,
+        flags=re.I,
+    )
     text = re.split(
         r"\s+(?:saying|that|about|regarding|with|please|pls|asap|now|instead|"
         r"bhej(?:o|na)?|kar(?:o|na)?|do|dena|ke liye)\b",

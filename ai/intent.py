@@ -259,7 +259,12 @@ def _is_contact_lookup(text: str) -> tuple[bool, str | None]:
 
 def _is_retrieval_intent(text: str) -> bool:
     q = text.lower()
-    if any(m in q for m in _RETRIEVE_MARKERS):
+    if any(
+        re.search(rf"(?<![a-z]){re.escape(m)}", q)
+        if m.endswith(" ")
+        else re.search(rf"\b{re.escape(m)}\b", q)
+        for m in _RETRIEVE_MARKERS
+    ):
         return True
     if re.search(r"\b(?:mails?|emails?)\s+(?:from|by)\b", q):
         return True
@@ -275,6 +280,11 @@ def _is_retrieval_intent(text: str) -> bool:
         return True
     # "send all mails from X" is retrieval, not compose
     if "send" in q and re.search(r"\b(?:all\s+)?(?:mails?|emails?)\s+from\b", q):
+        return True
+    if re.search(
+        r"\b(?:check|see|show|find|open)\s+[A-Za-z].{0,40}\b(?:mails?|emails?|inbox)\b",
+        q,
+    ):
         return True
     return False
 
@@ -410,11 +420,16 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
             "confidence": "high",
         }
 
-    if _is_retrieval_intent(cleaned) and not is_compose:
+    from services.schedule import is_schedule_challenge
+
+    if _is_retrieval_intent(cleaned) and not is_compose and not is_schedule_challenge(cleaned):
+        from ai.assistant import _extract_person_query
+
         person = (
             _extract_person_after_preposition(cleaned, "from")
             or _extract_person_after_preposition(cleaned, "by")
             or _extract_hinglish_ki_person(cleaned)
+            or _extract_person_query(cleaned)
             or extract_person_reference(cleaned, convo)
         )
         return {

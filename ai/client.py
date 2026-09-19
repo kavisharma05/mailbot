@@ -541,7 +541,7 @@ def _claude_error(resp: Any, *, provider: str) -> None:
     if resp.status_code == 429 or _is_daily_limit_text(body):
         _cooldown(provider, daily=_is_daily_limit_text(body), seconds=180)
     elif resp.status_code in (401, 403):
-        _cooldown(provider, seconds=3600)
+        _cooldown(provider, seconds=90)
     elif resp.status_code == 402:
         _cooldown(provider, seconds=3600)
 
@@ -652,7 +652,7 @@ def _call_claude_session(
             base,
             headers=_claude_headers(settings, accept="application/json"),
             json={"uuid": None, "name": "", "model": settings.claude_model},
-            timeout=8,
+            timeout=12,
         )
         if created.status_code >= 400:
             _claude_error(created, provider=provider)
@@ -677,7 +677,7 @@ def _call_claude_session(
                 "attachments": [],
                 "files": [],
             },
-            timeout=15,
+            timeout=45,
         )
         if completion.status_code >= 400:
             _claude_error(completion, provider=provider)
@@ -703,8 +703,8 @@ ProviderFn = Callable[..., str | None]
 
 
 def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
-    """Fast providers first. Claude session is last — it is a multi-request
-    browser scrape and currently stalls replies when the session is invalid.
+    """Groq first for speed; Claude session next so it is actually tried
+    when the free APIs fail instead of sitting unused at the end.
     """
     settings = get_settings()
     chain: list[tuple[str, ProviderFn]] = []
@@ -769,11 +769,11 @@ def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
 
     add_groq()
     add_gemini()
+    add_claude_session()
     add_cerebras()
     add_nemotron()
     add_openrouter()
     add_github_models()
-    add_claude_session()
     return chain
 
 

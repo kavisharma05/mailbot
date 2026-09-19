@@ -22,7 +22,7 @@ from services.db import (
     get_preferred_section,
     insert_class_sessions,
 )
-from services.timeutil import IST, now_ist, today_ist
+from services.timeutil import IST, now_ist, parse_day_window, today_ist
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +173,59 @@ def load_template_sessions(info: dict[str, Any] | None = None) -> list[dict[str,
     except Exception as exc:
         logger.warning("Fallback schedule template load failed: %s", exc)
         return []
+
+
+_SCHEDULE_REUSE_RE = re.compile(
+    r"\b(?:that day|same day|those classes|that date|same date)\b",
+    re.IGNORECASE,
+)
+_SCHEDULE_CHALLENGE_RE = re.compile(
+    r"\bwhy are you showing\b|"
+    r"\bwrong (?:date|day)\b|"
+    r"\bthat(?:'s| is) not (?:today|right|correct)\b|"
+    r"\bwhy\b.+\b(?:class|showing|date)\b",
+    re.IGNORECASE,
+)
+
+
+def is_schedule_challenge(question: str) -> bool:
+    """True when the user is objecting to the day that was just shown."""
+    return bool(_SCHEDULE_CHALLENGE_RE.search(question or ""))
+
+
+def resolve_schedule_day(question: str, *, fallback_iso: str | None = None) -> date:
+    """Pick the calendar day for a classes/schedule question.
+
+    Bare "classes" is always today. A leftover last-viewed day is only reused
+    for "that day" / "those classes". Date complaints ("why 16 Sep") snap to today.
+    """
+    if is_schedule_challenge(question):
+        return today_ist()
+    window = parse_day_window(question)
+    if window is not None:
+        return window.start
+    if fallback_iso and _SCHEDULE_REUSE_RE.search(question or ""):
+        try:
+            return date.fromisoformat(fallback_iso)
+        except ValueError:
+            pass
+    return today_ist()
+
+
+def next_sessions_after(
+    day: date,
+    *,
+    section: str | None = None,
+    template: list[dict[str, Any]] | None = None,
+) -> tuple[date | None, list[dict[str, Any]]]:
+    """First later day (within a week) that has classes for this section."""
+    raw = _without_overlays(template if template is not None else load_template_sessions())
+    for offset in range(1, 8):
+        candidate = day + timedelta(days=offset)
+        found = sessions_for_day(candidate, section=section, template=raw)
+        if found:
+            return candidate, found
+    return None, []
 
 
 def sessions_for_day(

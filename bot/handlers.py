@@ -48,6 +48,7 @@ from services.contacts import (
     parse_sender,
     resolve_email_robust,
     canonical_person_name,
+    upsert_contact_from_sender,
 )
 from services.media_ai import analyze_image, transcribe_audio
 from services.watcher import watcher_lock
@@ -98,8 +99,11 @@ from services.schedule import (
     _session_section,
     classes_command_text,
     load_template_sessions,
+    is_schedule_challenge,
+    next_sessions_after,
     project_sessions_to_day,
     refresh_schedule_from_gmail,
+    resolve_schedule_day,
     sessions_for_day,
 )
 from services.telegram_util import reply_long, safe_user_error_message
@@ -555,19 +559,49 @@ async def _available_sections() -> list[str]:
     return sorted(found)
 
 
+_BARE_EMAIL_RE = re.compile(
+    r"^\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*$"
+)
+_LLM_STATUS_RE = re.compile(
+    r"\b(?:claude|groq|nemotron|provider|ai provider)\b",
+    re.IGNORECASE,
+)
+_LLM_STATUS_ASK_RE = re.compile(
+    r"\b(?:why|reach|use|try|not working|down|fail|instead)\b",
+    re.IGNORECASE,
+)
+
+
+def _bare_email(text: str) -> str | None:
+    match = _BARE_EMAIL_RE.match(text or "")
+    return match.group(1).lower() if match else None
+
+
+def _is_llm_status_question(text: str) -> bool:
+    q = text or ""
+    return bool(_LLM_STATUS_RE.search(q) and _LLM_STATUS_ASK_RE.search(q))
+
+
+def _llm_status_reply() -> str:
+    from ai.client import get_llm_status
+
+    status = get_llm_status()
+    configured = status.get("providers_configured") or []
+    cooled = status.get("cooldowns_seconds") or {}
+    last_ok = status.get("last_ok_provider") or "none recently"
+    order = ", ".join(configured) if configured else "none configured"
+    parts = [f"I try providers in this order: {order}."]
+    parts.append(f"Last one that worked: {last_ok}.")
+    if cooled:
+        bits = [f"{name} ({seconds}s left)" for name, seconds in cooled.items()]
+        parts.append("On cooldown: " + ", ".join(bits) + ".")
+    else:
+        parts.append("None are on cooldown — if a reply just failed I will try Claude next.")
+    return " ".join(parts)
+
+
 def _resolve_target_day(question: str, *, fallback_iso: str | None = None):
-    from datetime import date as date_cls
-
-    window = parse_day_window(question)
-    if window is not None:
-        return window.start
-
-    if fallback_iso:
-        try:
-            return date_cls.fromisoformat(fallback_iso)
-        except ValueError:
-            pass
-    return today_ist()
+    return resolve_schedule_day(question, fallback_iso=fallback_iso)
 
 
 def _wants_schedule_refresh(question: str) -> bool:
@@ -624,6 +658,25 @@ async def _reply_schedule_for_question(
     context.user_data["last_schedule_day"] = target_day.isoformat()
 
     if not sessions:
+        next_day, next_sessions = next_sessions_after(
+            target_day, section=section, template=template
+        )
+        if next_day and next_sessions:
+            label = target_day.strftime("%a, %d %b")
+            if is_schedule_challenge(question):
+                preface = (
+                    f"Sorry — I reused an old day. Today is {label} and there are no classes. "
+                    "Next sessions:"
+                )
+            else:
+                preface = f"No classes on {label}. Next sessions:"
+            next_label = next_day.strftime("%a, %d %b %Y")
+            title = f"<b>📚 Next classes — {next_label}</b>"
+            if section:
+                title = f"<b>📚 Next classes — {next_label} (Sec. {section})</b>"
+            text = f"{preface}\n\n{_format_session_block(next_sessions, title)}"
+            await reply_long(update.message, text, parse_mode="HTML")
+            return
         raw = project_sessions_to_day(template, target_day) if template else []
         label = target_day.strftime("%a, %d %b")
         if raw and section:
@@ -645,6 +698,8 @@ async def _reply_schedule_for_question(
     if section:
         title = f"<b>📚 Classes — {label} (Sec. {section})</b>"
     text = _format_session_block(sessions, title)
+    if is_schedule_challenge(question):
+        text = f"That was the last day I had stored. Today is {label}.\n\n{text}"
     await reply_long(update.message, text, parse_mode="HTML")
 
 
@@ -1929,6 +1984,30 @@ async def chat_message(
         reply = "Hey — ask me about deadlines, mail, /send to compose, or /classes."
         await update.message.reply_text(reply)
         remember_turn(context.user_data, user_text=question, bot_text=reply, intent=intent)
+        return
+
+    if _is_llm_status_question(question):
+        reply = _llm_status_reply()
+        await update.message.reply_text(reply)
+        remember_turn(context.user_data, user_text=question, bot_text=reply, intent="smalltalk")
+        return
+
+    bare = _bare_email(question)
+    if bare:
+        person = convo.get("last_person")
+        if person:
+            await asyncio.to_thread(upsert_contact_from_sender, f"{person} <{bare}>")
+        last_intent = convo.get("last_intent")
+        if last_intent in {INTENT_COMPOSE, INTENT_CONTACT_LOOKUP} or _get_compose(context.user_data):
+            await _begin_compose_flow(update, context, recipient=bare)
+            return
+        await _answer_chat_question(
+            update,
+            context,
+            f"mails from {bare}",
+            person_hint=person or bare,
+            intent=INTENT_MAILBOX_QA,
+        )
         return
 
     if intent == INTENT_COMPOSE:

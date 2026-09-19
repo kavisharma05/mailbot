@@ -66,6 +66,25 @@ def test_web_chat_due_list_skips_llm():
     assert r.json()["reply"]
 
 
+def test_web_chat_schedule_challenge_uses_today():
+    from services.timeutil import today_ist
+
+    clear_web_convo()
+    with (
+        patch("api.web_routes.answer_question") as mock_qa,
+        patch("api.web_routes.get_preferred_section", return_value="C"),
+        patch("api.web_routes.sessions_for_day", return_value=[]) as mock_day,
+        patch("api.web_routes.next_sessions_after", return_value=(None, [])),
+    ):
+        r = client.post(
+            "/api/chat/message",
+            json={"message": "Why are you showing classes for date 16th sep"},
+        )
+    mock_qa.assert_not_called()
+    assert r.status_code == 200
+    assert mock_day.call_args.args[0] == today_ist()
+
+
 def test_web_chat_schedule_skips_llm():
     clear_web_convo()
     with (

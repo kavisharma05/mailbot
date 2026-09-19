@@ -39,6 +39,7 @@ from services.contacts import (
     looks_like_recipient_switch,
     resolve_contact_email,
     resolve_email_robust,
+    upsert_contact_from_sender,
 )
 from services.db import (
     create_manual_assignment,
@@ -60,7 +61,10 @@ from services.db import (
     update_assignment,
 )
 from services.schedule import (
+    is_schedule_challenge,
+    next_sessions_after,
     refresh_schedule_from_gmail,
+    resolve_schedule_day,
     schedule_cache_is_fresh,
     sessions_for_day,
 )
@@ -276,10 +280,24 @@ def _web_local_list_reply(intent: str, text: str) -> str | None:
     """DB-only answers for due / classes / missed / undated — skip Gmail + LLM."""
     now = now_ist()
     if intent == INTENT_SCHEDULE:
-        window = parse_day_window(text)
-        day = window.start if window else today_ist()
+        day = resolve_schedule_day(text)
         section = get_preferred_section()
-        return _web_format_sessions(sessions_for_day(day, section=section), day)
+        sessions = sessions_for_day(day, section=section)
+        if sessions:
+            reply = _web_format_sessions(sessions, day)
+            if is_schedule_challenge(text):
+                return f"That was the last day I had stored. Today is {day.strftime('%A, %d %b')}.\n\n{reply}"
+            return reply
+        next_day, next_sessions = next_sessions_after(day, section=section)
+        if next_day:
+            preface = f"No classes on {day.strftime('%A, %d %b')}. Next sessions:"
+            if is_schedule_challenge(text):
+                preface = (
+                    f"Sorry — I reused an old day. Today is {day.strftime('%A, %d %b')} "
+                    "and there are no classes. Next sessions:"
+                )
+            return f"{preface}\n\n{_web_format_sessions(next_sessions, next_day)}"
+        return _web_format_sessions([], day)
     if intent == INTENT_DUE_LIST:
         window = parse_day_window(text)
         if window is not None:
@@ -813,6 +831,46 @@ async def chat_message(body: ChatMessageBody):
         return await _web_continue_compose(text, compose)
 
     classified = classify_message(text, convo=get_web_convo())
+    convo = get_web_convo()
+    if re.search(r"\b(?:claude|groq|nemotron|provider|ai provider)\b", text, re.I) and re.search(
+        r"\b(?:why|reach|use|try|not working|down|fail|instead)\b", text, re.I
+    ):
+        from ai.client import get_llm_status
+
+        status = get_llm_status()
+        configured = ", ".join(status.get("providers_configured") or []) or "none configured"
+        last_ok = status.get("last_ok_provider") or "none recently"
+        cooled = status.get("cooldowns_seconds") or {}
+        reply = f"I try providers in this order: {configured}. Last one that worked: {last_ok}."
+        if cooled:
+            bits = [f"{name} ({seconds}s left)" for name, seconds in cooled.items()]
+            reply += " On cooldown: " + ", ".join(bits) + "."
+        else:
+            reply += " None are on cooldown — if a reply just failed I will try Claude next."
+        remember_web_turn(bot_text=reply, intent="smalltalk")
+        return {"reply": reply, "draft": None}
+
+    bare = re.fullmatch(r"\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*", text)
+    if bare:
+        addr = bare.group(1).lower()
+        person = convo.get("last_person")
+        if person:
+            await asyncio.to_thread(upsert_contact_from_sender, f"{person} <{addr}>")
+        last_intent = convo.get("last_intent")
+        if last_intent in {INTENT_COMPOSE, INTENT_CONTACT_LOOKUP} or get_web_compose():
+            classified = {"intent": INTENT_COMPOSE, "recipient": addr, "content": None}
+            return await _web_begin_compose(text, classified)
+        reply = await asyncio.to_thread(
+            answer_question,
+            f"mails from {addr}",
+            get_assignments_for_qa(limit=40),
+            scan_gmail=True,
+            convo=convo,
+            person_hint=person or addr,
+        )
+        remember_web_turn(bot_text=reply, intent=INTENT_MAILBOX_QA, person=person, person_email=addr)
+        return {"reply": reply, "draft": None}
+
     if classified.get("intent") == INTENT_COMPOSE:
         return await _web_begin_compose(text, classified)
     if classified.get("intent") == INTENT_CONTACT_LOOKUP:
