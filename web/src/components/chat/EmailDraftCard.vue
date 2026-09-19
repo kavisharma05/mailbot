@@ -1,10 +1,19 @@
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useChatStore } from '../../stores/chat'
 import { useToast } from '../../composables/useToast'
 
 const props = defineProps({
   draft: { type: Object, required: true },
+})
+
+const toLine = computed(() => {
+  const name = (props.draft.to_display || '').trim()
+  const email = (props.draft.to || '').trim()
+  if (name && email && name.toLowerCase() !== email.toLowerCase()) {
+    return `${name} · ${email}`
+  }
+  return name || email
 })
 const expanded = ref(false)
 const sending = ref(false)
@@ -36,7 +45,7 @@ async function send() {
     <div class="px-4 pt-4 pb-3 flex flex-col gap-2 border-b border-hairline">
       <div class="flex items-baseline gap-3 text-body">
         <span class="text-caption text-ink-3 w-14 shrink-0">To</span>
-        <span class="text-ink truncate">{{ draft.to_display || draft.to }}</span>
+        <span class="text-ink truncate">{{ toLine }}</span>
       </div>
       <div class="flex items-baseline gap-3 text-body">
         <span class="text-caption text-ink-3 w-14 shrink-0">Subject</span>

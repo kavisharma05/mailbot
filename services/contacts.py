@@ -50,6 +50,21 @@ GENERIC_PERSON_WORDS = {
     "buddy",
     "pal",
     "recipient",
+    "you",
+    "me",
+    "us",
+    "myself",
+    "yourself",
+    "everyone",
+    "everybody",
+    "anyone",
+    "anybody",
+    "group",
+    "class",
+    "mail",
+    "email",
+    "message",
+    "msg",
     "the faculty",
     "a faculty",
     "the professor",
@@ -129,6 +144,210 @@ def canonical_person_name(name: str | None) -> str | None:
         return text.lower()
     key = normalize_name_key(text)
     return key or None
+
+
+_PRONOUN_REFERENCES = frozenset(
+    {
+        "her",
+        "him",
+        "them",
+        "she",
+        "he",
+        "they",
+        "same",
+        "same person",
+        "that person",
+        "the same",
+        "same one",
+        "the same person",
+        "the same one",
+        "unko",
+        "unki",
+        "unhe",
+        "usko",
+        "uski",
+        "usne",
+        "inko",
+        "inhe",
+    }
+)
+_HONORIFIC_ONLY = frozenset({"sir", "mam", "maam", "ma'am", "madam", "ma"})
+_EMAIL_IN_TEXT_RE = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+_FROM_PERSON_RE = re.compile(
+    r"\b(?:mails?|emails?)\s+from\s+(.+)$",
+    re.IGNORECASE,
+)
+_TO_FOR_SPLIT_RE = re.compile(r"\b(?:to|for)\s+", re.IGNORECASE)
+_SKIP_TO_FOR_TAIL = re.compile(
+    r"^(?:the\s+)?(?:class|assignment|deadline|mail|email|report|test|exam|students?)\b",
+    re.IGNORECASE,
+)
+_PRONOUN_IN_TEXT_RE = re.compile(
+    r"\b(?:her|him|them|she|he|they|unko|unki|unhe|usko|uski|inko|inhe)\b",
+    re.IGNORECASE,
+)
+_SAME_PERSON_RE = re.compile(
+    r"\b(?:the\s+)?same(?:\s+(?:person|one|people))?\b|\bthat person\b",
+    re.IGNORECASE,
+)
+_SEND_PERSON_A_MAIL_RE = re.compile(
+    r"\b(?:send|write|draft|drop|shoot|fire)\s+(.+?)\s+(?:a|an|the|that|this)\s+(?:mail|email)\b",
+    re.IGNORECASE,
+)
+_KO_MAIL_RE = re.compile(
+    r"(.+?)\s+ko\s+(?:ek\s+)?(?:mail|email|msg)\b",
+    re.IGNORECASE,
+)
+_COMMAND_LEFTOVER_RE = re.compile(
+    r"\b(?:send|write|draft|compose|reply|forward|saying|please|kindly|"
+    r"remind|deadline|class(?:es)?|want|need|can|could|would)\b",
+    re.IGNORECASE,
+)
+_PRONOUN_STRIP_RE = re.compile(
+    r"\b(?:send|write|draft|compose|reply|email|mail|forward|drop|shoot|please|kindly|"
+    r"can|you|could|want|wanna|need|have|to|a|an|the|it|this|that|one|saying|about|"
+    r"regarding|with|for|of|and|or|her|him|them|she|he|they|unko|unki|unhe|"
+    r"usko|uski|inko|inhe|same|person|one|ko|bhej|bhejo|bhejna|karo|kar|"
+    r"instead|actually|just|message|msg|from|received|got|we|i|do|dena)\b",
+    re.IGNORECASE,
+)
+_RECIPIENT_SWITCH_RE = re.compile(
+    r"\b(?:instead|not (?:her|him|them)|change (?:the )?(?:recipient|to)|"
+    r"wrong (?:person|recipient)|actually (?:send|mail|email) (?:it |this )?to)\b",
+    re.IGNORECASE,
+)
+_SHORT_SEND_TO_RE = re.compile(
+    r"\b(?:send|mail|email|forward|write)\b.+\bto\b|\b(?:mail|email)\s+[\w.'-]+",
+    re.IGNORECASE,
+)
+
+
+def clean_person_phrase(raw: str | None) -> str | None:
+    """Strip leftover command words so 'saleena mam please' becomes a usable name."""
+    if not raw:
+        return None
+    text = raw.strip(" .,?!:;\"'")
+    text = re.sub(r"^(?:a|an|the|my|our|this|that)\s+", "", text, flags=re.I)
+    text = re.sub(r"^(?:send|write|draft|compose|mail|email|message|msg)\s+", "", text, flags=re.I)
+    text = re.split(
+        r"\s+(?:saying|that|about|regarding|with|please|pls|asap|now|instead|"
+        r"bhej(?:o|na)?|kar(?:o|na)?|do|dena|ke liye)\b",
+        text,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    text = re.sub(r"\s+ko\s*$", "", text, flags=re.I)
+    text = re.sub(
+        r"\s+(?:a|an|the)?\s*(?:mail|email|message|msg)s?\s*$",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\s+", " ", text).strip(" .,?!:;")
+    if not text:
+        return None
+    if is_generic_person(text):
+        return None
+    return text
+
+
+def _last_person_if_pronoun(text: str | None, last_person: str | None) -> str | None:
+    """Map her/him/same person (alone or inside a command) to last_person."""
+    if not text or not last_person:
+        return None
+    lowered = text.lower().strip(" .,?!")
+    if lowered in _PRONOUN_REFERENCES or lowered in _HONORIFIC_ONLY:
+        return last_person
+    if _SAME_PERSON_RE.search(lowered):
+        leftover = _PRONOUN_STRIP_RE.sub(" ", lowered)
+        leftover = re.sub(r"\s+", " ", leftover).strip(" .,?!")
+        if not leftover or is_generic_person(leftover):
+            return last_person
+    if _PRONOUN_IN_TEXT_RE.search(lowered):
+        leftover = _PRONOUN_STRIP_RE.sub(" ", lowered)
+        leftover = re.sub(r"\s+", " ", leftover).strip(" .,?!")
+        if not leftover or is_generic_person(leftover):
+            return last_person
+    return None
+
+
+def looks_like_recipient_switch(text: str | None) -> bool:
+    """True when the user is changing or naming who the mail should go to."""
+    if not text or not str(text).strip():
+        return False
+    raw = str(text).strip()
+    if _RECIPIENT_SWITCH_RE.search(raw):
+        return True
+    if len(raw.split()) <= 6 and (
+        _SHORT_SEND_TO_RE.search(raw)
+        or re.search(r"\b(?:send|write|draft|mail|email)\b.+\b(?:mail|email)\b", raw, re.I)
+    ):
+        return True
+    return False
+
+
+def extract_person_reference(text: str | None, convo: dict[str, Any] | None = None) -> str | None:
+    """Pull the intended person out of a casual reply or compose sentence."""
+    if not text or not str(text).strip():
+        return None
+    raw = str(text).strip()
+    email_hit = _EMAIL_IN_TEXT_RE.search(raw)
+    if email_hit:
+        return email_hit.group(1).lower()
+
+    last_person = (convo or {}).get("last_person") if convo else None
+    lowered = raw.lower().strip(" .,?!")
+    if lowered in _PRONOUN_REFERENCES or lowered in _HONORIFIC_ONLY:
+        return last_person or None
+
+    from_match = _FROM_PERSON_RE.search(raw)
+    if from_match:
+        cleaned = clean_person_phrase(from_match.group(1))
+        return _last_person_if_pronoun(cleaned or from_match.group(1), last_person) or cleaned or last_person
+
+    ko_match = _KO_MAIL_RE.search(raw)
+    if ko_match:
+        cleaned = clean_person_phrase(ko_match.group(1))
+        pronoun = _last_person_if_pronoun(cleaned or ko_match.group(1), last_person)
+        if pronoun:
+            return pronoun
+        if cleaned and not _COMMAND_LEFTOVER_RE.search(cleaned):
+            return cleaned
+
+    send_match = _SEND_PERSON_A_MAIL_RE.search(raw)
+    if send_match:
+        cleaned = clean_person_phrase(send_match.group(1))
+        pronoun = _last_person_if_pronoun(cleaned or send_match.group(1), last_person)
+        if pronoun:
+            return pronoun
+        if cleaned and not _COMMAND_LEFTOVER_RE.search(cleaned):
+            return cleaned
+
+    for part in reversed(_TO_FOR_SPLIT_RE.split(raw)[1:]):
+        if _SKIP_TO_FOR_TAIL.match(part.strip()):
+            continue
+        cleaned = clean_person_phrase(part)
+        pronoun = _last_person_if_pronoun(cleaned or part, last_person)
+        if pronoun:
+            return pronoun
+        if cleaned and not _COMMAND_LEFTOVER_RE.search(cleaned):
+            return cleaned
+
+    pronoun = _last_person_if_pronoun(raw, last_person)
+    if pronoun:
+        return pronoun
+
+    tokens = raw.split()
+    if 1 <= len(tokens) <= 5:
+        if "?" in raw or re.search(
+            r"\b(?:what|when|who|how|why|which|where)'?s?\b|\b(?:due|deadline|today|tomorrow)\b",
+            lowered,
+        ):
+            return None
+        cleaned = clean_person_phrase(raw)
+        if cleaned and not _COMMAND_LEFTOVER_RE.search(cleaned):
+            return cleaned
+    return None
 
 
 def is_generic_person(name: str | None) -> bool:

@@ -46,6 +46,60 @@ def test_chat_empty_message():
     assert r.status_code == 400
 
 
+def test_web_chat_asks_who_for_send_a_mail():
+    from services.web_conversation import clear_web_convo
+
+    clear_web_convo()
+    with patch("api.web_routes.answer_question") as mock_qa:
+        r = client.post("/api/chat/message", json={"message": "send a mail"})
+    mock_qa.assert_not_called()
+    assert r.status_code == 200
+    assert "who" in r.json()["reply"].lower()
+    assert r.json().get("draft") is None
+
+
+def test_web_chat_resolves_named_recipient():
+    from services.web_conversation import clear_web_convo
+
+    clear_web_convo()
+    with patch("api.web_routes.resolve_email_robust", return_value=("skhan@imtnag.ac.in", [], None)):
+        r = client.post("/api/chat/message", json={"message": "send saleena a mail"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data.get("draft") is None
+    assert "skhan@imtnag.ac.in" in data["reply"]
+    assert "what should the email say" in data["reply"].lower()
+
+
+def test_web_chat_pronoun_after_qa_uses_last_person():
+    from services.web_conversation import clear_web_convo, remember_web_turn
+
+    clear_web_convo()
+    remember_web_turn(
+        user_text="mails from saleena",
+        bot_text="3 mails",
+        intent="qa",
+        person="saleena",
+        person_email="skhan@imtnag.ac.in",
+    )
+    with patch("api.web_routes.resolve_email_robust", return_value=("skhan@imtnag.ac.in", [], None)):
+        r = client.post("/api/chat/message", json={"message": "send her a mail"})
+    assert r.status_code == 200
+    data = r.json()
+    assert "skhan@imtnag.ac.in" in data["reply"]
+    assert "what should the email say" in data["reply"].lower()
+
+
+def test_web_chat_send_it_to_named_person():
+    from services.web_conversation import clear_web_convo
+
+    clear_web_convo()
+    with patch("api.web_routes.resolve_email_robust", return_value=("vinay@imtnag.ac.in", [], None)):
+        r = client.post("/api/chat/message", json={"message": "send it to vinay"})
+    assert r.status_code == 200
+    assert "vinay@imtnag.ac.in" in r.json()["reply"]
+
+
 def test_short_task_detail_and_presentation_recategorize():
     from api.web_routes import _serialize_task
 

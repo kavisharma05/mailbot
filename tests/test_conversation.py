@@ -38,6 +38,19 @@ def test_contact_lookup_intent():
     assert result.get("person")
 
 
+def test_contact_lookup_her_email_uses_last_person():
+    convo = {"last_person": "saleena"}
+    result = classify_message("what's her email", convo)
+    assert result["intent"] == INTENT_CONTACT_LOOKUP
+    assert result.get("person") == "saleena"
+
+
+def test_pls_mail_named_person():
+    result = classify_message("pls mail saleena")
+    assert result["intent"] == INTENT_COMPOSE
+    assert "saleena" in (result.get("recipient") or "").lower()
+
+
 def test_compose_with_content():
     result = classify_message(
         "send a mail to sharmakavish14@gmail.com saying ready to ship by end of the week"
@@ -70,20 +83,12 @@ def test_ambiguous_question_skips_llm_classify():
     assert result["intent"] == INTENT_MAILBOX_QA
 
 
-def test_ambiguous_compose_still_uses_llm():
-    with patch(
-        "ai.intent._llm_classify",
-        return_value={
-            "intent": INTENT_COMPOSE,
-            "recipient": None,
-            "person": None,
-            "content": None,
-            "confidence": "medium",
-        },
-    ) as mock_llm:
+def test_need_to_email_someone_is_compose_without_recipient():
+    with patch("ai.intent._llm_classify") as mock_llm:
         result = classify_message("I need to email someone about the assignment")
-    mock_llm.assert_called_once()
+    mock_llm.assert_not_called()
     assert result["intent"] == INTENT_COMPOSE
+    assert not result.get("recipient")
 
 
 def test_parse_sender_display_email():
@@ -241,6 +246,95 @@ def test_clear_convo():
     assert "compose" not in user_data
 
 
+def test_compose_intent_send_person_a_mail():
+    result = classify_message("send saleena a mail saying I will submit tomorrow")
+    assert result["intent"] == INTENT_COMPOSE
+    assert "saleena" in (result.get("recipient") or "").lower()
+    assert result.get("content")
+
+
+def test_compose_intent_mail_person_about():
+    result = classify_message("mail vinay about the CP test")
+    assert result["intent"] == INTENT_COMPOSE
+    assert "vinay" in (result.get("recipient") or "").lower()
+    assert "CP test" in (result.get("content") or "")
+
+
+def test_compose_intent_bare_email_name():
+    result = classify_message("email saleena mam")
+    assert result["intent"] == INTENT_COMPOSE
+    assert "saleena" in (result.get("recipient") or "").lower()
+
+
+def test_compose_intent_pronoun_uses_last_person():
+    convo = {"last_person": "saleena", "last_person_email": "skhan@imtnag.ac.in"}
+    result = classify_message("send her a mail saying I'll be late", convo)
+    assert result["intent"] == INTENT_COMPOSE
+    assert result.get("recipient") == "saleena"
+
+
+def test_compose_intent_send_it_to_her():
+    convo = {"last_person": "vinay"}
+    result = classify_message("send it to her", convo)
+    assert result["intent"] == INTENT_COMPOSE
+    assert result.get("recipient") == "vinay"
+
+
+def test_compose_intent_same_person():
+    convo = {"last_person": "saleena"}
+    result = classify_message("send a mail to the same person", convo)
+    assert result["intent"] == INTENT_COMPOSE
+    assert result.get("recipient") == "saleena"
+
+
+def test_extract_person_from_received_mail_phrase():
+    from services.contacts import extract_person_reference
+
+    assert extract_person_reference("We have received mail from saleena") == "saleena"
+    assert extract_person_reference("her", {"last_person": "saleena"}) == "saleena"
+    assert extract_person_reference("saleena mam") == "saleena mam"
+
+
+def test_hinglish_compose_intent():
+    result = classify_message("saleena ko mail bhejo")
+    assert result["intent"] == INTENT_COMPOSE
+    assert "saleena" in (result.get("recipient") or "").lower()
+
+    result = classify_message("mail bhejo vinay ko")
+    assert result["intent"] == INTENT_COMPOSE
+    assert "vinay" in (result.get("recipient") or "").lower()
+
+    convo = {"last_person": "saleena"}
+    result = classify_message("unko mail bhejo", convo)
+    assert result["intent"] == INTENT_COMPOSE
+    assert result.get("recipient") == "saleena"
+
+    result = classify_message("saleena ki mail dikhao")
+    assert result["intent"] == INTENT_MAILBOX_QA
+    assert "saleena" in (result.get("person") or "").lower()
+
+
+def test_reply_to_her_is_compose():
+    convo = {"last_person": "vinay"}
+    result = classify_message("reply to her saying I will submit tomorrow", convo)
+    assert result["intent"] == INTENT_COMPOSE
+    assert result.get("recipient") == "vinay"
+
+
+def test_extract_person_from_compose_sentences():
+    from services.contacts import extract_person_reference, looks_like_recipient_switch
+
+    convo = {"last_person": "saleena"}
+    assert extract_person_reference("send her a mail", convo) == "saleena"
+    assert extract_person_reference("send it to her", convo) == "saleena"
+    assert extract_person_reference("send a mail to the same person", convo) == "saleena"
+    assert extract_person_reference("send it to vinay instead") == "vinay"
+    assert extract_person_reference("I want to send a mail to saleena") == "saleena"
+    assert looks_like_recipient_switch("send it to vinay")
+    assert looks_like_recipient_switch("send to vinay instead")
+    assert not looks_like_recipient_switch("Please share notes from today's class")
+
+
 def test_compose_content_step_does_not_intercept_as_recipient():
     """When asked 'What do you want to say?', content containing 'from' or
     'class' must be treated as content, not as a recipient clarification.
@@ -263,3 +357,119 @@ def test_compose_content_step_does_not_intercept_as_recipient():
     # When step is need_recipient, recipient detection still works
     compose_recipient = {"step": COMPOSE_NEED_RECIPIENT, "recipient": None}
     assert _is_compose_recipient_reply("saleena@imtnag.ac.in", convo, compose_recipient)
+
+
+def test_chat_message_confirm_keeps_draft_instead_of_new_intent():
+    """Typed follow-ups after a draft must stay in compose (Telegram + WhatsApp)."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from bot.handlers import COMPOSE_CONFIRM, chat_message
+
+    user_data: dict = {
+        "compose": {
+            "step": COMPOSE_CONFIRM,
+            "recipient": "skhan@imtnag.ac.in",
+            "recipient_name": "saleena",
+            "instructions": "I'll be late",
+            "draft": {"subject": "Late", "body": "I will be late."},
+        },
+        "convo": {"last_person": "saleena", "last_person_email": "skhan@imtnag.ac.in"},
+    }
+    update = MagicMock()
+    update.effective_user = MagicMock(id=1)
+    update.effective_chat = MagicMock(id=1, type="private")
+    update.message.text = "send it to vinay instead"
+    update.message.reply_text = AsyncMock()
+    update.message.entities = None
+    context = MagicMock()
+    context.user_data = user_data
+    context.bot = MagicMock(id=2, username="mailbot")
+
+    async def _run():
+        with (
+            patch("bot.handlers._is_owner", return_value=True),
+            patch(
+                "bot.handlers._resolve_recipient_hint",
+                AsyncMock(return_value=("vinay@imtnag.ac.in", None)),
+            ),
+            patch("bot.handlers._draft_and_show_compose", AsyncMock()) as draft,
+        ):
+            await chat_message(update, context)
+        compose = user_data.get("compose")
+        assert compose is not None
+        assert compose["recipient"] == "vinay@imtnag.ac.in"
+        assert compose["recipient_name"] == "vinay"
+        draft.assert_awaited()
+
+    asyncio.run(_run())
+
+
+def test_chat_message_confirm_text_send_approves():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from bot.handlers import COMPOSE_CONFIRM, chat_message
+
+    user_data: dict = {
+        "compose": {
+            "step": COMPOSE_CONFIRM,
+            "recipient": "skhan@imtnag.ac.in",
+            "recipient_name": "saleena",
+            "draft": {"subject": "Hi", "body": "Hello"},
+        }
+    }
+    update = MagicMock()
+    update.effective_user = MagicMock(id=1)
+    update.effective_chat = MagicMock(id=1, type="private")
+    update.message.text = "send"
+    update.message.reply_text = AsyncMock()
+    update.message.entities = []
+    context = MagicMock()
+    context.user_data = user_data
+    context.bot = MagicMock(id=2, username="mailbot")
+
+    async def _run():
+        with (
+            patch("bot.handlers._is_owner", return_value=True),
+            patch("bot.handlers.send_email") as send,
+        ):
+            await chat_message(update, context)
+        send.assert_called_once()
+        assert user_data.get("compose") is None
+        assert "saleena" in update.message.reply_text.call_args.args[0].lower()
+
+    asyncio.run(_run())
+
+
+def test_send_command_uses_last_person_not_only_email():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from bot.handlers import send_command
+
+    user_data: dict = {
+        "convo": {"last_person": "saleena", "last_person_email": "skhan@imtnag.ac.in"}
+    }
+    update = MagicMock()
+    update.message.text = "/send"
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.user_data = user_data
+    context.args = []
+
+    async def _run():
+        with (
+            patch("bot.handlers._is_owner", return_value=True),
+            patch(
+                "bot.handlers._resolve_recipient_hint",
+                AsyncMock(return_value=("skhan@imtnag.ac.in", None)),
+            ),
+        ):
+            await send_command(update, context)
+        reply = update.message.reply_text.call_args.args[0]
+        assert "saleena" in reply.lower()
+        assert "skhan@imtnag.ac.in" in reply
+        assert user_data["compose"]["recipient"] == "skhan@imtnag.ac.in"
+
+    asyncio.run(_run())

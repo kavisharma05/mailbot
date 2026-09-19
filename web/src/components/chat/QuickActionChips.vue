@@ -3,7 +3,7 @@ const emit = defineEmits(['pick'])
 const suggestions = [
   { icon: 'schedule', label: "What's due this week?" },
   { icon: 'calendar_today', label: "Today's schedule" },
-  { icon: 'edit', label: 'Draft email to professor' },
+  { icon: 'edit', label: 'Send a mail' },
   { icon: 'help', label: 'Placement updates' },
 ]
 </script>

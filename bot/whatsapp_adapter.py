@@ -54,6 +54,7 @@ class WhatsAppMessage:
         self.from_user = WhatsAppUser(id=uid)
         self.chat = WhatsAppChat(id=uid, inbound_message_id=message_id)
         self.reply_to_message = None
+        self.entities = None
 
     async def reply_text(self, text: str, parse_mode: str | None = None, reply_markup: Any = None, **kwargs: Any):
         del kwargs

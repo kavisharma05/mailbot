@@ -25,6 +25,9 @@ Rules:
 - smalltalk: hi/hello with no real ask.
 - "send all mails from saleena" = mailbox_qa (retrieval), NOT compose.
 - Prefer compose only when the student is trying to outbound mail TO a recipient.
+- "send Saleena a mail", "mail saleena about X", "email vinay", "send it to her",
+  "saleena ko mail bhejo", "unko mail kar do", "can you write to SK" are all compose.
+  Resolve her/him/them/sir/mam/unko/usko from last_person.
 - If the recipient is only a role/placeholder (faculty, friend, someone, "name of friend"),
   set recipient to null so the bot can ask for the actual name or email.
 """
@@ -158,6 +161,8 @@ student. Rules:
 - Use a respectful, simple academic tone. No flowery language.
 - Always include a proper greeting and sign-off. Sign off as "{student_name}"
 if the student's name isn't given.
+- If the instructions include "To:" or "Recipient name:", greet THAT person
+  (Dear Professor Saleena, / Dear Vinay,). Never address a different person.
 - Never use placeholders such as "(name of the friend)" or "[recipient]" in the draft.
   If the recipient's name is unknown, use a neutral greeting like "Hello,".
 - Separate greeting, each paragraph, and sign-off with a blank line.

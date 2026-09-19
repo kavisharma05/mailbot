@@ -346,10 +346,9 @@ def test_compose_generic_friend_asks_for_recipient_first():
     asyncio.run(_run())
 
 
-def test_send_flow_content_then_ask_recipient_not_misrouted():
-    """End-to-end: /send with no args asks for content; user replies with
-    text containing 'from'/'class'; the content is captured and the bot
-    asks 'Who should I send it to?' instead of misrouting or clearing."""
+def test_send_flow_asks_who_first_then_keeps_content():
+    """/send with no args asks who first; later content with 'from'/'class'
+    is captured as the body, not treated as a new recipient."""
     from bot.handlers import (
         COMPOSE_NEED_CONTENT,
         COMPOSE_NEED_RECIPIENT,
@@ -366,22 +365,23 @@ def test_send_flow_content_then_ask_recipient_not_misrouted():
     context.user_data = user_data
 
     async def _run():
-        # Step 1: /send with no args -> asks for content
         await _begin_compose_flow(update, context, recipient=None, content=None)
         compose = _get_compose(user_data)
         assert compose is not None
-        assert compose["step"] == COMPOSE_NEED_CONTENT
-        assert compose["instructions"] is None
-
-        # Step 2: user provides content that previously triggered misroute
-        content_text = "Please share notes from today's class"
-        await _continue_compose_flow(update, context, content_text)
-        compose = _get_compose(user_data)
-        assert compose is not None
-        # Content was captured, not treated as recipient
-        assert compose["instructions"] == content_text
-        # No recipient yet -> now asking for recipient
         assert compose["step"] == COMPOSE_NEED_RECIPIENT
+        assert "Who should I send it to?" in update.message.reply_text.call_args.args[0]
+
+        with patch("bot.handlers._resolve_recipient_hint", AsyncMock(return_value=("skhan@imtnag.ac.in", None))):
+            await _continue_compose_flow(update, context, "saleena")
+        compose = _get_compose(user_data)
+        assert compose["recipient"] == "skhan@imtnag.ac.in"
+        assert compose["step"] == COMPOSE_NEED_CONTENT
+
+        content_text = "Please share notes from today's class"
+        with patch("bot.handlers._draft_and_show_compose", AsyncMock()):
+            await _continue_compose_flow(update, context, content_text)
+        compose = _get_compose(user_data)
+        assert compose["instructions"] == content_text
 
     asyncio.run(_run())
 

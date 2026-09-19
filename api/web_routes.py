@@ -11,12 +11,17 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from ai.assistant import answer_question
+from ai.assistant import _extract_person_query, answer_question, infer_person_email, lookup_contact_email
 from ai.composer import compose_email
-from ai.intent import INTENT_COMPOSE, classify_message
+from ai.intent import INTENT_COMPOSE, INTENT_CONTACT_LOOKUP, classify_message
 from config import get_settings
 from gmail_api.client import send_email
-from services.contacts import resolve_contact_email
+from services.contacts import (
+    extract_person_reference,
+    looks_like_recipient_switch,
+    resolve_contact_email,
+    resolve_email_robust,
+)
 from services.db import (
     check_db_health,
     create_manual_assignment,
@@ -471,20 +476,201 @@ class ChatMessageBody(BaseModel):
     verified: bool = False
 
 
-def _looks_like_compose(text: str) -> tuple[str | None, str | None]:
-    intent = classify_message(text, convo=get_web_convo())
-    if intent.get("intent") == INTENT_COMPOSE:
-        recipient = intent.get("recipient") or intent.get("person")
-        content = intent.get("content") or text
-        return recipient, content
-    m = re.search(
-        r"\b(?:send|write|draft|compose|reply|email|mail)\b.+\bto\b\s+(.+?)(?:\s+(?:saying|that)\s+(.+))?$",
-        text,
-        re.I | re.S,
+def _content_is_command_only(text: str, recipient: str | None) -> bool:
+    """True when the 'content' is just the send command, not what to write."""
+    q = (text or "").strip()
+    if not q:
+        return True
+    if re.search(r"\b(?:saying|that|about|regarding)\b", q, flags=re.I) and len(q.split()) >= 8:
+        return False
+    stripped = q.lower()
+    if recipient:
+        stripped = stripped.replace(str(recipient).lower(), " ")
+    stripped = re.sub(
+        r"\b(?:please|kindly|can you|could you|i want to|i wanna|need to|send|write|draft|compose|reply|a|an|the|mail|email|to|for)\b",
+        " ",
+        stripped,
+        flags=re.I,
     )
-    if m:
-        return m.group(1).strip(), (m.group(2) or text).strip()
-    return None, None
+    leftover = re.sub(r"\s+", " ", stripped).strip(" .,?!")
+    return len(leftover) < 4
+
+
+async def _web_make_draft(email: str, display: str, instructions: str) -> dict[str, Any] | None:
+    prompt = f"To: {email}\nRecipient name: {display}\n\n{instructions}"
+    draft = await asyncio.to_thread(compose_email, prompt)
+    if not draft or not draft.get("subject") or not draft.get("body"):
+        return None
+    payload = {
+        "to": email,
+        "to_display": display or email,
+        "subject": draft["subject"],
+        "body": draft["body"],
+    }
+    set_web_compose(
+        {
+            "step": "confirm",
+            "recipient": email,
+            "recipient_name": display,
+            "instructions": instructions,
+            "draft": payload,
+        }
+    )
+    return payload
+
+
+async def _web_begin_compose(text: str, classified: dict[str, Any]) -> dict[str, Any]:
+    convo = get_web_convo()
+    recipient = classified.get("recipient") or classified.get("person")
+    content = classified.get("content")
+    if content and _content_is_command_only(content, recipient):
+        content = None
+    if content and _content_is_command_only(text, recipient) and content.strip().lower() == text.strip().lower():
+        content = None
+
+    email = None
+    note = None
+    if recipient:
+        email, _matches, note = await asyncio.to_thread(resolve_email_robust, recipient, convo=convo)
+
+    if email and content:
+        draft = await _web_make_draft(email, recipient, content)
+        if draft:
+            reply = f"Draft ready for {draft['to_display']} ({email}). Review and send when ready."
+            remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=recipient, person_email=email)
+            return {"reply": reply, "draft": draft}
+        reply = "Couldn't draft that just now. Try again in a minute."
+        remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE)
+        return {"reply": reply, "draft": None}
+
+    if email and not content:
+        set_web_compose({"step": "need_content", "recipient": email, "recipient_name": recipient})
+        reply = f"Got it — I'll send to {recipient} ({email}). What should the email say?"
+        remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=recipient, person_email=email)
+        return {"reply": reply, "draft": None}
+
+    if content and not email:
+        set_web_compose({"step": "need_recipient", "instructions": content, "pending_recipient": recipient})
+        reply = note or "Who should I send it to? Give a name or email address."
+        remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=recipient)
+        return {"reply": reply, "draft": None}
+
+    if recipient and not email:
+        set_web_compose({"step": "need_recipient", "instructions": content, "pending_recipient": recipient})
+        reply = note or (
+            f"I don't have an email for {recipient} yet. "
+            "Paste their address, or say the name again after I've seen mail from them."
+        )
+        remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=recipient)
+        return {"reply": reply, "draft": None}
+
+    set_web_compose({"step": "need_recipient", "instructions": content})
+    reply = "Who should I send it to? Name or email address."
+    remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE)
+    return {"reply": reply, "draft": None}
+
+
+async def _web_continue_compose(text: str, compose: dict[str, Any]) -> dict[str, Any]:
+    convo = get_web_convo()
+    step = compose.get("step")
+    lower = text.strip().lower()
+    if lower in {"cancel", "stop", "discard", "abort"}:
+        set_web_compose(None)
+        reply = "Cancelled. Draft discarded."
+        remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE)
+        return {"reply": reply, "draft": None}
+
+    if step == "need_recipient":
+        mention = extract_person_reference(text, convo) or text.strip()
+        email, _matches, note = await asyncio.to_thread(resolve_email_robust, mention, convo=convo)
+        if not email:
+            reply = note or "I still don't have that email. Paste the address?"
+            remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=mention)
+            return {"reply": reply, "draft": None}
+        compose["recipient"] = email
+        compose["recipient_name"] = mention
+        compose.pop("pending_recipient", None)
+        if compose.get("instructions"):
+            draft = await _web_make_draft(email, mention, compose["instructions"])
+            if draft:
+                reply = f"Draft ready for {mention} ({email}). Review and send when ready."
+                remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=mention, person_email=email)
+                return {"reply": reply, "draft": draft}
+        compose["step"] = "need_content"
+        set_web_compose(compose)
+        reply = f"Got it — I'll send to {mention} ({email}). What should the email say?"
+        remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=mention, person_email=email)
+        return {"reply": reply, "draft": None}
+
+    if step == "need_content":
+        if looks_like_recipient_switch(text):
+            mention = extract_person_reference(text, convo)
+            if mention:
+                email, _matches, note = await asyncio.to_thread(resolve_email_robust, mention, convo=convo)
+                if email:
+                    compose["recipient"] = email
+                    compose["recipient_name"] = mention
+                    extra = classify_message(text, convo).get("content")
+                    if extra:
+                        compose["instructions"] = extra
+                    if compose.get("instructions"):
+                        draft = await _web_make_draft(email, mention, compose["instructions"])
+                        if draft:
+                            reply = f"Updated the recipient to {mention} ({email}). Draft is ready."
+                            remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=mention, person_email=email)
+                            return {"reply": reply, "draft": draft}
+                    compose["step"] = "need_content"
+                    set_web_compose(compose)
+                    reply = f"Got it — I'll send to {mention} ({email}). What should the email say?"
+                    remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=mention, person_email=email)
+                    return {"reply": reply, "draft": None}
+                reply = note or "I couldn't resolve that recipient. Paste their email?"
+                remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=mention)
+                return {"reply": reply, "draft": None}
+        compose["instructions"] = text.strip()
+        email = compose.get("recipient")
+        display = compose.get("recipient_name") or email
+        if email:
+            draft = await _web_make_draft(email, display, text.strip())
+            if draft:
+                reply = f"Draft ready for {display}. Review and send when ready."
+                remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=display, person_email=email)
+                return {"reply": reply, "draft": draft}
+        compose["step"] = "need_recipient"
+        set_web_compose(compose)
+        reply = "Who should I send it to? Name or email address."
+        remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE)
+        return {"reply": reply, "draft": None}
+
+    if step == "confirm" and re.search(
+        r"\b(?:instead|not (?:her|him|them)|change (?:the )?(?:to|recipient)|send (?:it |this |that )?to)\b",
+        lower,
+    ):
+        mention = extract_person_reference(text, convo)
+        if mention:
+            email, _matches, note = await asyncio.to_thread(resolve_email_robust, mention, convo=convo)
+            if email:
+                instructions = compose.get("instructions") or "Follow up politely."
+                draft = await _web_make_draft(email, mention, instructions)
+                if draft:
+                    reply = f"Updated the recipient to {mention} ({email}). Draft is ready."
+                    remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=mention, person_email=email)
+                    return {"reply": reply, "draft": draft}
+            reply = note or "I couldn't resolve that recipient. Paste their email?"
+            remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE, person=mention)
+            return {"reply": reply, "draft": None}
+
+    if step == "confirm" and any(w in lower for w in ("edit", "change", "revise", "redo")):
+        compose["step"] = "need_content"
+        set_web_compose(compose)
+        reply = "What should I change? Describe the new content."
+        remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE)
+        return {"reply": reply, "draft": None}
+
+    draft = compose.get("draft")
+    reply = "Draft is ready below. Send it, or say edit / cancel."
+    remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE)
+    return {"reply": reply, "draft": draft}
 
 
 @router.get("/chat/history")
@@ -499,39 +685,41 @@ async def chat_message(body: ChatMessageBody):
         raise HTTPException(status_code=400, detail="Empty message")
 
     remember_web_turn(user_text=text)
-    recipient_hint, compose_content = _looks_like_compose(text)
-    draft_payload: dict[str, Any] | None = None
+    compose = get_web_compose()
+    if compose and compose.get("step"):
+        return await _web_continue_compose(text, compose)
 
-    if recipient_hint and compose_content:
-        email = recipient_hint if "@" in recipient_hint else resolve_contact_email(recipient_hint)
-        instructions = f"To: {email or recipient_hint}\n\n{compose_content}"
-        draft = await asyncio.to_thread(compose_email, instructions)
-        if draft and draft.get("subject") and draft.get("body"):
-            draft_payload = {
-                "to": email or recipient_hint,
-                "to_display": recipient_hint,
-                "subject": draft["subject"],
-                "body": draft["body"],
-            }
-            set_web_compose({"draft": draft_payload, "instructions": instructions})
-            reply = (
-                "I've drafted an email following standard academic etiquette. "
-                "Review the preview below and send when ready."
-            )
-            remember_web_turn(bot_text=reply, intent=INTENT_COMPOSE)
-            return {"reply": reply, "draft": draft_payload}
+    classified = classify_message(text, convo=get_web_convo())
+    if classified.get("intent") == INTENT_COMPOSE:
+        return await _web_begin_compose(text, classified)
+    if classified.get("intent") == INTENT_CONTACT_LOOKUP:
+        convo = get_web_convo()
+        person = extract_person_reference(classified.get("person"), convo) or classified.get("person")
+        reply = await asyncio.to_thread(lookup_contact_email, person, convo=convo)
+        remember_web_turn(bot_text=reply, intent=INTENT_CONTACT_LOOKUP, person=person)
+        return {"reply": reply, "draft": None}
 
     items = get_assignments_for_qa(limit=40)
+    convo = get_web_convo()
+    person = (
+        classified.get("person")
+        or _extract_person_query(text)
+        or extract_person_reference(text, convo)
+    )
     reply = await asyncio.to_thread(
         answer_question,
         text,
         items,
         scan_gmail=True,
         verified=body.verified,
-        convo=get_web_convo(),
+        convo=convo,
+        person_hint=person,
     )
-    remember_web_turn(bot_text=reply, intent="qa")
-    return {"reply": reply, "draft": draft_payload}
+    person_email = None
+    if person:
+        person_email = await asyncio.to_thread(infer_person_email, person, convo=convo)
+    remember_web_turn(bot_text=reply, intent="qa", person=person, person_email=person_email)
+    return {"reply": reply, "draft": None}
 
 
 class ComposeDraftBody(BaseModel):
@@ -558,6 +746,13 @@ async def compose_send(body: ComposeSendBody):
     to = body.to.strip()
     if not to:
         raise HTTPException(status_code=400, detail="Missing recipient")
+    if "@" not in to:
+        email, _matches, note = await asyncio.to_thread(
+            resolve_email_robust, to, convo=get_web_convo()
+        )
+        if not email:
+            raise HTTPException(status_code=400, detail=note or "Could not resolve recipient email")
+        to = email
     try:
         await asyncio.to_thread(send_email, to, body.subject, body.body)
     except Exception as exc:

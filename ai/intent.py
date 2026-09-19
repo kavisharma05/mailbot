@@ -9,7 +9,12 @@ from typing import Any
 
 from ai.client import call_json
 from ai.prompts import INTENT_PROMPT
-from services.contacts import canonical_person_name, is_generic_person
+from services.contacts import (
+    canonical_person_name,
+    clean_person_phrase,
+    extract_person_reference,
+    is_generic_person,
+)
 from services.conversation import history_for_prompt, MAX_HISTORY
 
 logger = logging.getLogger(__name__)
@@ -118,6 +123,8 @@ def _extract_compose_content(text: str) -> str | None:
     patterns = [
         r"\bsaying\s+(.+)$",
         r"\bthat\s+(.+)$",
+        r"\babout\s+(.+)$",
+        r"\bregarding\s+(.+)$",
         r"\bcontent\s*[:\-]\s*(.+)$",
         r"\bmessage\s*[:\-]\s*(.+)$",
         r"\bbody\s*[:\-]\s*(.+)$",
@@ -126,65 +133,128 @@ def _extract_compose_content(text: str) -> str | None:
         m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
         if m:
             content = m.group(1).strip()
-            if len(content) >= 8:
+            if len(content) >= 4:
                 return content
     return None
+
+
+def _resolve_compose_recipient(raw: str | None, convo: dict[str, Any] | None, email: str | None) -> str | None:
+    if email and (not raw or "@" in (raw or "")):
+        return email
+    mention = extract_person_reference(raw, convo) if raw else None
+    cleaned = clean_person_phrase(mention or raw)
+    if cleaned:
+        pronoun = extract_person_reference(cleaned, convo)
+        if pronoun and pronoun != cleaned:
+            return pronoun
+        return cleaned
+    if raw:
+        return extract_person_reference(raw, convo)
+    return email
+
+
+def _is_compose_intent(
+    text: str, convo: dict[str, Any] | None = None
+) -> tuple[bool, str | None, str | None, str | None]:
+    q = text.lower().strip()
+    email = _extract_email(text)
+
+    # Retrieval that happens to contain "send"
+    if re.search(r"\b(?:all\s+)?(?:mails?|emails?)\s+from\b", q) and not re.search(
+        r"\b(?:send|write|draft|compose)\b.+\bto\b", q
+    ):
+        return False, None, None, email
+    if re.search(r"\b(?:mail|email)s?\s+(?:dikhao|batao|dikha|show|list)\b", q) and not re.search(
+        r"\b(?:bhej|send|write|draft)\b", q
+    ):
+        return False, None, None, email
+
+    patterns = (
+        # Hinglish: unko/usko mail bhejo
+        r"\b(?P<who>unko|unki|unhe|usko|uski|inko|inhe)\s+(?:ek\s+)?(?:mail|email|msg)\b(?:\s+(?:bhej(?:o|na| do)?|kar(?:o| do)?)?(?:\s+(?:ki|saying|that|about)\s+(?P<content>.+))?)?",
+        # Hinglish: saleena ko mail bhejo / saleena mam ko email kar do
+        r"\b(?P<who>[A-Za-z][\w.'-]{1,40}(?:\s+[A-Za-z][\w.'-]{1,30}){0,3})\s+ko\s+(?:ek\s+)?(?:mail|email|msg)\b(?:\s+(?:bhej(?:o|na| do| dena)?|kar(?:o| do| dena)?)?(?:\s+(?:ki|ke|bolke|saying|that|about)\s+(?P<content>.+))?)?",
+        # Hinglish: mail bhejo saleena ko
+        r"\b(?:mail|email)\s+(?:bhej(?:o|na| do)?|kar(?:o| do)?)\s+(?P<who>.+?)\s+ko\b(?:\s+(?:ki|saying|that|about)\s+(?P<content>.+))?",
+        # reply to her / reply saleena
+        r"^(?:please\s+|kindly\s+|pls\s+|plz\s+)?reply\s+(?:to\s+)?(?P<who>(?!the\s)[^?]+?)(?:\s+(?:saying|that|about|regarding)\s+(?P<content>.+))?$",
+        # send it/this/that/the mail to X
+        r"\b(?:send|forward|write|mail|email)\s+(?:it|this|that|one|(?:the\s+)?(?:mail|email))\s+to\s+(?P<who>.+?)(?:\s+(?:saying|that|with|about|regarding)\s+(?P<content>.+))?$",
+        # send Saleena a mail [saying ...]
+        r"\b(?:send|write|draft|drop|shoot|fire)\s+(?P<who>.+?)\s+(?:a|an|the|that|this)\s+(?:mail|email)\b(?:\s+(?:saying|that|about|regarding)\s+(?P<content>.+))?",
+        # send/mail/email to X [saying/about ...]
+        r"\b(?:send|write|draft|compose|reply|email|mail)\b(?:\s+(?:an?\s+)?(?:mail|email))?\s+to\s+(?P<who>.+?)(?:\s+(?:saying|that|with|about|regarding)\s+(?P<content>.+))?$",
+        # mail/email X about/saying
+        r"\b(?:mail|email|write(?:\s+to)?)\s+(?P<who>.+?)\s+(?:about|regarding|saying|that)\s+(?P<content>.+)$",
+        # drop/shoot a mail to X / forward this to X
+        r"\b(?:drop|shoot|fire|forward)\s+(?:an?\s+)?(?:mail|email|text|this|it)?\s+to\s+(?P<who>.+?)(?:\s+(?:saying|that|about|regarding)\s+(?P<content>.+))?$",
+        # I want to / can you / please mail X
+        r"\b(?:want to|wanna|need to|have to|gonna|going to|please|kindly|can you|could you)\s+(?:send|mail|email|write)\s+(?:an?\s+)?(?:mail|email)?\s*(?:to\s+)?(?P<who>.+?)(?:\s+(?:saying|that|about|regarding)\s+(?P<content>.+))?$",
+        # "send a mail to saleena" leftover / "email saleena mam"
+        r"^(?:please\s+|kindly\s+|pls\s+|plz\s+)?(?:send|write|draft|compose)\s+(?:an?\s+)?(?:mail|email)\s+(?:to\s+)?(?P<who>[A-Za-z][\w.'@-]{1,40}(?:\s+[A-Za-z][\w.'-]{1,30}){0,3})\s*$",
+        r"^(?:please\s+|kindly\s+|pls\s+|plz\s+)?(?:email|mail)\s+(?:to\s+)?(?P<who>[A-Za-z][\w.'@-]{1,40}(?:\s+[A-Za-z][\w.'-]{1,30}){0,3})\s*$",
+    )
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        who = (m.groupdict().get("who") or "").strip(" .,?!")
+        if who.lower() in {"mail", "email", "message", "msg", "someone", "somebody", "me", "us", "you"}:
+            who = ""
+            who = ""
+        content = (m.groupdict().get("content") or "").strip() or _extract_compose_content(text)
+        recipient = _resolve_compose_recipient(who, convo, email) if who else None
+        if recipient and is_generic_person(recipient):
+            recipient = None
+        return True, recipient or email, content or None, email
+
+    if email and any(v in q for v in _COMPOSE_VERBS):
+        return True, email, _extract_compose_content(text) or None, email
+
+    if re.search(r"\b(?:send|write|draft|compose)\b.+\b(?:mail|email)\b", q) and not re.search(
+        r"\bfrom\b", q
+    ):
+        return True, None, _extract_compose_content(text), email
+
+    if re.search(r"\b(?:mail|email)\s+(?:bhej|kar)", q) or re.search(r"\bko\s+(?:ek\s+)?(?:mail|email)\b", q):
+        mention = extract_person_reference(text, convo)
+        return True, mention or email, _extract_compose_content(text), email
+
+    return False, None, None, email
+
+
+def _extract_hinglish_ki_person(text: str) -> str | None:
+    m = re.search(
+        r"\b([A-Za-z][\w.'-]+(?:\s+[A-Za-z][\w.'-]+){0,2})\s+k[ie]\s+(?:mails?|emails?)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    person = clean_person_phrase(m.group(1))
+    if person and is_generic_person(person):
+        return None
+    return person
 
 
 def _is_contact_lookup(text: str) -> tuple[bool, str | None]:
     q = text.lower()
     patterns = [
         r"(?:what(?:'s| is)|tell me|give me|find|get)\s+(?:the\s+)?(?:email|mail(?:\s+id)?|address)\s+(?:of|for)\s+(.+?)[\?\.!]*$",
+        r"what(?:'s| is)\s+(her|his|their|unki|uski)\s+(?:email|mail(?:\s+id)?|address)[\?\.!]*$",
         r"(.+?)(?:'s|\s+)email(?:\s+address|\s+id)?[\?\.!]*$",
         r"(?:email|mail(?:\s+id)?)\s+(?:of|for)\s+(.+?)[\?\.!]*$",
+        r"(.+?)\s+k[ai]\s+(?:email|mail)\s+id[\?\.!]*$",
     ]
     for pat in patterns:
         m = re.search(pat, q, flags=re.IGNORECASE)
         if m:
             person = m.group(1).strip(" .,?!")
+            person = re.sub(r"^(?:what(?:'s| is)|tell me|give me|find|get)\s+", "", person, flags=re.I)
             person = re.sub(r"\b(mam|ma'am|maam|sir|dr|prof|professor)\b\.?", "", person, flags=re.I).strip()
             if person and len(person) >= 2:
                 return True, person
     return False, None
-
-
-def _is_compose_intent(text: str) -> tuple[bool, str | None, str | None, str | None]:
-    q = text.lower().strip()
-    email = _extract_email(text)
-
-    # "send ... to X" / "mail to X"
-    m = re.search(
-        r"\b(?:send|write|draft|compose|reply|email|mail)\b.+\bto\b\s+(.+?)(?:\s+(?:saying|that|with|about)\b|$)",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        recipient = m.group(1).strip(" .,?!")
-        content = _extract_compose_content(text)
-        if email and not recipient:
-            recipient = email
-        if recipient and is_generic_person(recipient):
-            recipient = None
-        return True, recipient or email, content, email
-
-    # "mail X saying ..."
-    m = re.search(
-        r"\b(?:send|write|draft|compose|reply|email|mail)\s+(?:a\s+)?(?:mail|email)?\s*(?:to\s+)?([^\n]+?)\s+(?:saying|that)\s+(.+)$",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if m:
-        recipient = m.group(1).strip(" .,?!")
-        content = m.group(2).strip()
-        if recipient and is_generic_person(recipient):
-            recipient = None
-        return True, recipient, content, email
-
-    # bare "/send-like" follow-up content after recipient was given
-    if email and any(v in q for v in _COMPOSE_VERBS):
-        return True, email, _extract_compose_content(text) or None, email
-
-    return False, None, None, email
 
 
 def _is_retrieval_intent(text: str) -> bool:
@@ -192,6 +262,10 @@ def _is_retrieval_intent(text: str) -> bool:
     if any(m in q for m in _RETRIEVE_MARKERS):
         return True
     if re.search(r"\b(?:mails?|emails?)\s+(?:from|by)\b", q):
+        return True
+    if re.search(r"\b\w+\s+k[ie]\s+(?:mails?|emails?)\b", q) and not re.search(
+        r"\b(?:bhej|send|write|draft|compose|karo|kar do)\b", q
+    ):
         return True
     if re.search(r"\b(?:from|by)\s+[A-Za-z][A-Za-z.'-]{2,}", q) and not re.search(
         r"\b(?:send|write|draft|compose|reply|email|mail)\b.+\bto\b", q, re.I
@@ -290,14 +364,17 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
     last_intent = (convo or {}).get("last_intent")
 
     # Active compose follow-ups are handled in handlers; still detect content-only turns
-    is_compose, recipient, content, email = _is_compose_intent(cleaned)
+    is_compose, recipient, content, email = _is_compose_intent(cleaned, convo)
     is_lookup, lookup_person = _is_contact_lookup(cleaned)
 
     if is_lookup and not is_compose:
+        person = lookup_person
+        if person:
+            person = extract_person_reference(person, convo) or person
         return {
             "intent": INTENT_CONTACT_LOOKUP,
             "recipient": None,
-            "person": lookup_person,
+            "person": person,
             "content": None,
             "confidence": "high",
         }
@@ -334,8 +411,11 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
         }
 
     if _is_retrieval_intent(cleaned) and not is_compose:
-        person = _extract_person_after_preposition(cleaned, "from") or _extract_person_after_preposition(
-            cleaned, "by"
+        person = (
+            _extract_person_after_preposition(cleaned, "from")
+            or _extract_person_after_preposition(cleaned, "by")
+            or _extract_hinglish_ki_person(cleaned)
+            or extract_person_reference(cleaned, convo)
         )
         return {
             "intent": INTENT_MAILBOX_QA,
@@ -421,6 +501,8 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
         }:
             intent = INTENT_MAILBOX_QA
         recipient = llm.get("recipient")
+        if recipient:
+            recipient = _resolve_compose_recipient(str(recipient), convo, None)
         if recipient and is_generic_person(str(recipient)):
             recipient = None
         return {

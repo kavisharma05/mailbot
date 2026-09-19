@@ -7,6 +7,7 @@ import asyncio
 import logging
 
 from bot import handlers
+from bot.handlers import _get_compose
 from bot.whatsapp_adapter import (
     WhatsAppContext,
     build_callback_update,
@@ -47,12 +48,25 @@ _COMMANDS: dict[str, object] = {
 # Commands that show the WhatsApp-native interactive menu instead of the
 # Telegram-oriented text (start/help share the same handler on Telegram).
 _MENU_COMMAND_STYLES = {"start": "welcome", "help": "help", "menu": "menu"}
+_SAFE_DURING_COMPOSE = {"cancel", "reset", "new", "send", "help", "menu", "start"}
+
+
+async def _remind_compose_in_progress(phone: str) -> None:
+    await get_whatsapp_client().send_text(
+        phone,
+        "You have an email in progress. Keep going, or type cancel to drop the draft.",
+        from_html=False,
+        template_fallback=False,
+    )
 
 
 async def _dispatch_callback(data: str, phone: str, user_data: dict) -> None:
     # Main-menu rows carry "cmd:<name>" — dispatch as if the user typed /<name>.
     if data.startswith(CMD_PREFIX):
         cmd = data[len(CMD_PREFIX):].strip().lower()
+        if _get_compose(user_data) and cmd not in _SAFE_DURING_COMPOSE:
+            await _remind_compose_in_progress(phone)
+            return
         handler = _COMMANDS.get(cmd)
         if handler:
             if cmd in _MENU_COMMAND_STYLES:
@@ -93,6 +107,9 @@ async def _dispatch_text(text: str, phone: str, message_id: str, user_data: dict
         parts = stripped.split()
         cmd = parts[0][1:].split("@")[0].lower()
         context.args = parts[1:]
+        if _get_compose(user_data) and cmd not in _SAFE_DURING_COMPOSE:
+            await _remind_compose_in_progress(phone)
+            return
         if cmd in _MENU_COMMAND_STYLES:
             await send_main_menu(phone, style=_MENU_COMMAND_STYLES[cmd])
             return
@@ -109,6 +126,9 @@ async def _dispatch_text(text: str, phone: str, message_id: str, user_data: dict
 
     # Quick-action labels (same as Telegram reply keyboard)
     if stripped in handlers.QUICK_ACTION_LABELS:
+        if _get_compose(user_data) and stripped != "✉️ Send":
+            await _remind_compose_in_progress(phone)
+            return
         update = build_text_update(phone, stripped, message_id)
         await handlers.quick_action_message(update, context)
         return
