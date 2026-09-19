@@ -11,9 +11,27 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from ai.assistant import _extract_person_query, answer_question, infer_person_email, lookup_contact_email
+from ai.assistant import (
+    _deterministic_deadline_answer,
+    _deterministic_undated_answer,
+    _extract_person_query,
+    _is_mailbox_question,
+    answer_question,
+    infer_person_email,
+    lookup_contact_email,
+)
 from ai.composer import compose_email
-from ai.intent import INTENT_COMPOSE, INTENT_CONTACT_LOOKUP, classify_message
+from ai.intent import (
+    INTENT_COMPOSE,
+    INTENT_CONTACT_LOOKUP,
+    INTENT_DUE_LIST,
+    INTENT_MAILBOX_QA,
+    INTENT_MISSED_LIST,
+    INTENT_SCHEDULE,
+    INTENT_UNDATED_LIST,
+    _is_specific_deadline_question,
+    classify_message,
+)
 from config import get_settings
 from gmail_api.client import send_email
 from services.contacts import (
@@ -23,12 +41,14 @@ from services.contacts import (
     resolve_email_robust,
 )
 from services.db import (
-    check_db_health,
     create_manual_assignment,
     dismiss_assignment,
     get_assignment_by_id,
     get_assignments_for_qa,
     get_db,
+    _filter_assignments_by_deadline,
+    get_assignments_due_between,
+    get_assignments_due_on,
     get_missed_assignments,
     get_open_assignments,
     get_preferred_section,
@@ -45,7 +65,14 @@ from services.schedule import (
     sessions_for_day,
 )
 from ai.deadline import correct_category_from_text
-from services.timeutil import IST, format_deadline_display, item_effective_deadline_dt, now_ist, today_ist
+from services.timeutil import (
+    IST,
+    format_deadline_display,
+    item_effective_deadline_dt,
+    now_ist,
+    parse_day_window,
+    today_ist,
+)
 from services.web_conversation import (
     chat_history_for_api,
     clear_web_convo,
@@ -195,24 +222,90 @@ def _sync_meta() -> dict[str, Any]:
     }
 
 
+def _partition_open_assignments(
+    category: str | None = None,
+    *,
+    now: datetime | None = None,
+    limit: int = 200,
+) -> dict[str, list[dict[str, Any]]]:
+    ref = now or now_ist()
+    pool = get_open_assignments(category=category, limit=limit)
+    upcoming = _filter_assignments_by_deadline(pool, upcoming=True, now=ref)
+    missed = _filter_assignments_by_deadline(pool, upcoming=False, now=ref)
+    undated = [item for item in pool if item_effective_deadline_dt(item) is None]
+    return {"all": pool, "upcoming": upcoming, "missed": missed, "undated": undated}
+
+
 def _quick_stats_payload(*, today_sessions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     now = now_ist()
-    upcoming = get_upcoming_assignments(limit=200, now=now)
+    buckets = _partition_open_assignments(now=now)
     due_week_end = now + timedelta(days=7)
     deadlines_due = sum(
         1
-        for a in upcoming
+        for a in buckets["upcoming"]
         if (dt := item_effective_deadline_dt(a)) is not None and dt <= due_week_end
     )
     if today_sessions is None:
         section = get_preferred_section()
         today_sessions = sessions_for_day(today_ist(), section=section)
-    placement = sum(1 for a in get_open_assignments(limit=200) if a.get("category") == "placement")
+    placement = sum(1 for a in buckets["all"] if a.get("category") == "placement")
     return {
         "deadlines_due": deadlines_due,
         "classes_today": sum(1 for s in today_sessions if not s.get("cancelled")),
         "placement": placement,
     }
+
+
+def _web_format_sessions(sessions: list[dict[str, Any]], day: date) -> str:
+    label = day.strftime("%A, %d %b")
+    if not sessions:
+        return f"No classes found for {label}."
+    lines = [f"Classes — {label}:", ""]
+    for session in sessions:
+        course = session.get("course_or_topic") or "Class"
+        start = session.get("start_time") or "—"
+        end = session.get("end_time")
+        time_bit = f"{start}–{end}" if end else str(start)
+        room = session.get("room") or "Room TBA"
+        note = " (cancelled)" if session.get("cancelled") else ""
+        lines.append(f"• {time_bit} {course} ({room}){note}")
+    return "\n".join(lines)
+
+
+def _web_local_list_reply(intent: str, text: str) -> str | None:
+    """DB-only answers for due / classes / missed / undated — skip Gmail + LLM."""
+    now = now_ist()
+    if intent == INTENT_SCHEDULE:
+        window = parse_day_window(text)
+        day = window.start if window else today_ist()
+        section = get_preferred_section()
+        return _web_format_sessions(sessions_for_day(day, section=section), day)
+    if intent == INTENT_DUE_LIST:
+        window = parse_day_window(text)
+        if window is not None:
+            if window.single:
+                items = get_assignments_due_on(window.start, IST)
+            else:
+                items = get_assignments_due_between(window.start, window.end, IST)
+        else:
+            items = get_upcoming_assignments(limit=40, now=now)
+        return _deterministic_deadline_answer(text, items, now=now) or (
+            "No upcoming deadlines with a set due date." if not items else None
+        )
+    if intent == INTENT_MISSED_LIST:
+        items = get_missed_assignments(limit=20, now=now)
+        if not items:
+            return "Nothing missed — you're caught up on tracked deadlines."
+        lines = [f"Missed deadlines ({len(items)}):", ""]
+        for index, item in enumerate(items[:15], start=1):
+            task = item.get("task") or item.get("summary") or "Untitled"
+            due = item.get("deadline_text") or "—"
+            lines.append(f"{index}. {task} — {due}")
+        return "\n".join(lines)
+    if intent == INTENT_UNDATED_LIST:
+        items = get_undated_assignments(limit=40, now=now)
+        return _deterministic_undated_answer(items)
+    return None
 
 
 @router.get("/stats/quick")
@@ -257,24 +350,52 @@ def _activity_items(limit: int = 10) -> list[dict[str, Any]]:
 @router.get("/dashboard")
 async def dashboard():
     now = now_ist()
-    section = get_preferred_section()
     settings = get_settings()
-    upcoming = get_upcoming_assignments(limit=20, now=now)
+
+    def _load_core() -> tuple[Any, ...]:
+        section = get_preferred_section()
+        buckets = _partition_open_assignments(now=now)
+        sessions = sessions_for_day(today_ist(), section=section)
+        activity = _activity_items(5)
+        sync = _sync_meta()
+        return section, buckets, sessions, activity, sync
+
+    try:
+        section, buckets, today_sessions, activity, sync = await asyncio.to_thread(_load_core)
+        db_ok = True
+    except Exception:
+        logger.exception("dashboard load failed")
+        section, buckets, today_sessions, activity, sync = "A", {
+            "all": [],
+            "upcoming": [],
+            "missed": [],
+            "undated": [],
+        }, [], [], _sync_meta()
+        db_ok = False
+
+    upcoming = buckets["upcoming"]
     urgent = upcoming[0] if upcoming else None
-    today_sessions = sessions_for_day(today_ist(), section=section)
-    stats = _quick_stats_payload(today_sessions=today_sessions)
-    db_health = check_db_health()
+    due_week_end = now + timedelta(days=7)
+    stats = {
+        "deadlines_due": sum(
+            1
+            for a in upcoming
+            if (dt := item_effective_deadline_dt(a)) is not None and dt <= due_week_end
+        ),
+        "classes_today": sum(1 for s in today_sessions if not s.get("cancelled")),
+        "placement": sum(1 for a in buckets["all"] if a.get("category") == "placement"),
+    }
     return {
         "greeting_name": _greeting_name(),
         "student_name": settings.student_name,
         "section": section,
-        "sync": _sync_meta(),
-        "db_ok": bool(db_health.get("ok")),
+        "sync": sync,
+        "db_ok": db_ok,
         "stats": stats,
         "urgent_task": _serialize_task(urgent, now=now) if urgent else None,
         "today_classes": [_serialize_class(s) for s in today_sessions],
         "upcoming_deadlines": [_serialize_task(a, now=now) for a in upcoming[:8]],
-        "activity": {"items": _activity_items(5)},
+        "activity": {"items": activity},
     }
 
 
@@ -292,14 +413,15 @@ async def list_tasks(
 ):
     now = now_ist()
     cat = None if not category or category == "all" else category
+    buckets = _partition_open_assignments(category=cat, now=now)
     if status == "missed":
-        raw = get_missed_assignments(category=cat, limit=limit, now=now)
+        raw = buckets["missed"][:limit]
     elif status == "undated":
-        raw = get_undated_assignments(category=cat, limit=limit, now=now)
+        raw = buckets["undated"][:limit]
     elif status == "due-soon":
-        raw = get_upcoming_assignments(category=cat, limit=limit, now=now)
+        raw = buckets["upcoming"][:limit]
     else:
-        raw = get_open_assignments(category=cat, limit=limit)
+        raw = buckets["all"][:limit]
         done = []
         try:
             db = get_db()
@@ -326,11 +448,12 @@ async def list_tasks(
             or needle in (t.get("sender") or "").lower()
             or needle in (t.get("category") or "").lower()
         ]
+    count_source = buckets if cat is None else _partition_open_assignments(now=now)
     counts = {
-        "all": len(get_open_assignments(limit=200)),
-        "due-soon": len(get_upcoming_assignments(limit=200, now=now)),
-        "missed": len(get_missed_assignments(limit=200, now=now)),
-        "undated": len(get_undated_assignments(limit=200, now=now)),
+        "all": len(count_source["all"]),
+        "due-soon": len(count_source["upcoming"]),
+        "missed": len(count_source["missed"]),
+        "undated": len(count_source["undated"]),
     }
     return {"tasks": tasks, "counts": counts}
 
@@ -699,6 +822,16 @@ async def chat_message(body: ChatMessageBody):
         remember_web_turn(bot_text=reply, intent=INTENT_CONTACT_LOOKUP, person=person)
         return {"reply": reply, "draft": None}
 
+    intent = classified.get("intent")
+    if (
+        intent in (INTENT_DUE_LIST, INTENT_SCHEDULE, INTENT_MISSED_LIST, INTENT_UNDATED_LIST)
+        and not _is_specific_deadline_question(text)
+    ):
+        reply = await asyncio.to_thread(_web_local_list_reply, intent, text)
+        if reply:
+            remember_web_turn(bot_text=reply, intent=intent)
+            return {"reply": reply, "draft": None}
+
     items = get_assignments_for_qa(limit=40)
     convo = get_web_convo()
     person = (
@@ -706,19 +839,26 @@ async def chat_message(body: ChatMessageBody):
         or _extract_person_query(text)
         or extract_person_reference(text, convo)
     )
+    scan_gmail = bool(
+        body.verified
+        or intent == INTENT_MAILBOX_QA
+        or _is_mailbox_question(text)
+    )
     reply = await asyncio.to_thread(
         answer_question,
         text,
         items,
-        scan_gmail=True,
+        scan_gmail=scan_gmail,
         verified=body.verified,
         convo=convo,
         person_hint=person,
     )
     person_email = None
     if person:
-        person_email = await asyncio.to_thread(infer_person_email, person, convo=convo)
-    remember_web_turn(bot_text=reply, intent="qa", person=person, person_email=person_email)
+        person_email = await asyncio.to_thread(
+            infer_person_email, person, convo=convo, live=False
+        )
+    remember_web_turn(bot_text=reply, intent=intent or "qa", person=person, person_email=person_email)
     return {"reply": reply, "draft": None}
 
 

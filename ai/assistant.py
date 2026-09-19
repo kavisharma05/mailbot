@@ -43,8 +43,8 @@ from services.timeutil import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_EMAILS = 8
-_MAX_MAILBOX_EMAILS = 25
+_MAX_EMAILS = 6
+_MAX_MAILBOX_EMAILS = 10
 _BODY_CHARS = 1500
 _MAILBOX_BODY_CHARS = 1800
 _ATTACHMENT_CHARS = 6000
@@ -284,6 +284,7 @@ def infer_person_email(
     stats: dict[str, Any] | None = None,
     emails: list[dict[str, Any]] | None = None,
     convo: dict[str, Any] | None = None,
+    live: bool = True,
 ) -> str | None:
     """Best-effort email for a person: contacts, mailbox context, memory, live Gmail."""
     if not person:
@@ -313,6 +314,8 @@ def infer_person_email(
             if req and (req in hay or hay in req or any(t in hay.split() for t in name_tokens(text))):
                 return last_email
 
+    if not live:
+        return None
     return resolve_person_email_live(text)
 
 
@@ -637,7 +640,7 @@ def _sanitize_gmail_query(query: str) -> str | None:
     return q
 
 
-def _finalize_gmail_queries(queries: list[str], *, limit: int = 4) -> list[str]:
+def _finalize_gmail_queries(queries: list[str], *, limit: int = 2) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for item in queries:
@@ -897,14 +900,18 @@ def _gather_mailbox_context(
     queries = _build_mailbox_queries(question, convo)
     primary = queries[0]
     person = _resolve_person_query(question, convo)
-    wants_bodies = force_bodies or _wants_mail_bodies(question) or "whom" in question.lower() or "who" in question.lower()
+    q_lower = question.lower()
+    wants_count = any(w in q_lower for w in ("how many", "count", "total"))
+    wants_bodies = force_bodies or _wants_mail_bodies(question)
     wants_attachments = force_bodies or _wants_attachment_text(question)
 
-    try:
-        stats = count_messages(primary, hard_cap=300)
-    except Exception as exc:
-        logger.warning("count_messages failed for %r: %s", primary, exc)
-        stats = {"query": primary, "count": 0, "capped": False, "error": str(exc)}
+    stats = {"query": primary, "count": 0, "capped": False}
+    if wants_count:
+        try:
+            stats = count_messages(primary, hard_cap=100)
+        except Exception as exc:
+            logger.warning("count_messages failed for %r: %s", primary, exc)
+            stats = {"query": primary, "count": 0, "capped": False, "error": str(exc)}
 
     emails: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -913,7 +920,7 @@ def _gather_mailbox_context(
             batch = list_message_summaries(
                 query,
                 max_results=_MAX_MAILBOX_EMAILS,
-                include_body=force_bodies or wants_bodies or "how many" not in question.lower(),
+                include_body=force_bodies or wants_bodies,
                 body_chars=_MAILBOX_BODY_CHARS if wants_bodies or force_bodies else 400,
                 load_attachments=False,
                 attachment_chars=_ATTACHMENT_CHARS_PER_EMAIL,
@@ -1524,47 +1531,32 @@ def _gather_context_for_question(
     pasted_email: str | None,
     convo: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    """Pull the richest useful Gmail context; heuristics only choose WHAT to fetch."""
+    """Fetch Gmail only when the question actually needs mailbox content."""
     if not scan_gmail:
         return None, []
-
-    q = question.lower()
-    stats: dict[str, Any] | None = None
-    emails: list[dict[str, Any]] = []
+    if _asks_undated_tasks(question):
+        return None, []
+    if _is_due_list_question(question) and not _is_mailbox_question(question):
+        return None, []
 
     wants_marks = _wants_attachment_text(question)
-    wants_mailbox = (
-        _is_mailbox_question(question)
-        or bool(_resolve_person_query(question, convo))
-        or wants_marks
-        or any(w in q for w in ("mail", "email", "inbox", "sender", "whom", "who sent", "said", "wrote"))
-    )
-    wants_due = _is_due_list_question(question) or any(
-        w in q for w in ("deadline", "due", "pending", "tomorrow", "today")
-    )
+    wants_mailbox = _is_mailbox_question(question) or wants_marks or bool(pasted_email)
+    if not wants_mailbox:
+        return None, []
 
-    if wants_mailbox:
-        try:
-            stats, emails = _gather_mailbox_context(question, convo=convo)
-        except Exception as exc:
-            logger.warning("Mailbox context failed: %s", exc)
-            stats, emails = {"count": 0, "error": str(exc)}, []
-    else:
+    stats: dict[str, Any] | None = None
+    emails: list[dict[str, Any]] = []
+    try:
+        stats, emails = _gather_mailbox_context(question, convo=convo)
+    except Exception as exc:
+        logger.warning("Mailbox context failed: %s", exc)
+        stats, emails = {"count": 0, "error": str(exc)}, []
+    if pasted_email and not emails:
         try:
             emails = _fetch_relevant_emails(question, pasted_email=pasted_email)
         except Exception as exc:
             logger.warning("Relevant email fetch failed: %s", exc)
-            emails = []
-
-    # For due/today questions, also attach a light today-mail count so the model has mailbox awareness
-    if wants_due and stats is None:
-        try:
-            day_q = _gmail_day_bounds_query()
-            stats = count_messages(day_q, hard_cap=100)
-            stats["note"] = "today_mail_count_for_context"
-        except Exception:
-            pass
-
+            emails = emails or []
     return stats, emails
 
 
@@ -1586,6 +1578,11 @@ def answer_question(
 
     if _is_date_time_question(question):
         return _deterministic_date_time_answer(question)
+
+    if not verified:
+        quick = _deterministic_deadline_answer(question, items)
+        if quick:
+            return quick
 
     if verified:
         system = VERIFIED_ASSISTANT_PROMPT.format(
@@ -1609,7 +1606,7 @@ def answer_question(
             convo=convo,
             resolved_contacts=resolved,
         )
-        answer = call_text(system, user, temperature=0.45, max_tokens=1100)
+        answer = call_text(system, user, temperature=0.45, max_tokens=700)
         if answer and not _llm_answer_is_useless(answer):
             sources = _format_sources_block(emails)
             if sources:
@@ -1641,7 +1638,7 @@ def answer_question(
     )
 
     # Primary path: let the LLM understand any natural wording
-    answer = call_text(system, user, temperature=0.55, max_tokens=1100)
+    answer = call_text(system, user, temperature=0.55, max_tokens=700)
     if answer and not _llm_answer_is_useless(answer):
         if _asks_undated_tasks(question) and _answer_looks_generic_due_dump(answer, question):
             return _deterministic_undated_answer(items)

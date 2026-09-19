@@ -22,7 +22,7 @@ from config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_MAX_ATTEMPTS = 3
+_MAX_ATTEMPTS = 2
 _RETRY_STATUS = {429, 500, 502, 503}
 
 _CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
@@ -37,7 +37,7 @@ _CLAUDE_USER_AGENT = (
 
 # Shared keep-alive client: a fresh httpx.post() does a TLS handshake per call
 # (~150-400ms). Fail over faster than 60s so a hung provider doesn't stall the user.
-_LLM_TIMEOUT = httpx.Timeout(25.0, connect=8.0)
+_LLM_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 _shared_http: httpx.Client | None = None
 _groq_clients: dict[str, Groq] = {}
 
@@ -55,7 +55,10 @@ def _http() -> httpx.Client:
 def _groq_client(api_key: str) -> Groq:
     client = _groq_clients.get(api_key)
     if client is None:
-        client = Groq(api_key=api_key)
+        try:
+            client = Groq(api_key=api_key, timeout=12.0)
+        except TypeError:
+            client = Groq(api_key=api_key)
         _groq_clients[api_key] = client
     return client
 
@@ -649,7 +652,7 @@ def _call_claude_session(
             base,
             headers=_claude_headers(settings, accept="application/json"),
             json={"uuid": None, "name": "", "model": settings.claude_model},
-            timeout=30,
+            timeout=8,
         )
         if created.status_code >= 400:
             _claude_error(created, provider=provider)
@@ -674,7 +677,7 @@ def _call_claude_session(
                 "attachments": [],
                 "files": [],
             },
-            timeout=90,
+            timeout=15,
         )
         if completion.status_code >= 400:
             _claude_error(completion, provider=provider)
@@ -700,12 +703,8 @@ ProviderFn = Callable[..., str | None]
 
 
 def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
-    """Provider order, tuned per mode.
-
-    Text mode ("brain"): Nemotron first — strongest reasoning for Q&A answers.
-    JSON mode (drafts, timetable parsing, classification): strict-formatting,
-    non-reasoning models first — reasoning models can burn the whole token
-    budget on hidden chain-of-thought and return no parseable JSON.
+    """Fast providers first. Claude session is last — it is a multi-request
+    browser scrape and currently stalls replies when the session is invalid.
     """
     settings = get_settings()
     chain: list[tuple[str, ProviderFn]] = []
@@ -768,24 +767,13 @@ def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
         if settings.github_models_token:
             chain.append(("github_models", _call_github_models))
 
-    if json_mode:
-        # Enabled Claude session is intentionally first so account 1 is actually used;
-        # existing providers remain as automatic fallbacks when Claude cools down/fails.
-        add_claude_session()
-        add_groq()
-        add_gemini()
-        add_cerebras()
-        add_nemotron()
-        add_openrouter()
-        add_github_models()
-    else:
-        add_claude_session()
-        add_nemotron()
-        add_groq()
-        add_gemini()
-        add_cerebras()
-        add_openrouter()
-        add_github_models()
+    add_groq()
+    add_gemini()
+    add_cerebras()
+    add_nemotron()
+    add_openrouter()
+    add_github_models()
+    add_claude_session()
     return chain
 
 
@@ -877,7 +865,7 @@ def call_json(
     user: str,
     model: str | None = None,
     *,
-    max_tokens: int = 1000,
+    max_tokens: int = 600,
 ) -> dict[str, Any] | None:
     """Call LLM and parse strict JSON from the response.
 
@@ -908,7 +896,7 @@ def call_text(
     model: str | None = None,
     *,
     temperature: float = 0.55,
-    max_tokens: int = 1000,
+    max_tokens: int = 600,
 ) -> str | None:
     """Call LLM and return plain text."""
     return _complete(

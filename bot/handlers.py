@@ -2125,6 +2125,7 @@ async def _answer_chat_question(
         infer_person_email,
         resolved_person,
         convo=convo,
+        live=False,
     )
     remember_turn(
         context.user_data,

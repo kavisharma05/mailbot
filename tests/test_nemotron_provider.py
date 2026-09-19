@@ -27,12 +27,11 @@ def test_provider_chain_ordering_per_mode():
     with patch("ai.client.get_settings", return_value=settings):
         text_names = [name for name, _ in _provider_chain(json_mode=False)]
         json_names = [name for name, _ in _provider_chain(json_mode=True)]
-    # Text mode: Nemotron brain leads for richer Q&A answers.
-    assert text_names[0] == "nemotron"
-    assert "groq" in text_names
-    # JSON mode: strict-formatting non-reasoning models lead for reliability.
+    assert text_names[0] == "groq"
+    assert "nemotron" in text_names
     assert json_names[0] == "groq"
     assert "nemotron" in json_names
+    assert text_names.index("groq") < text_names.index("nemotron")
     assert json_names.index("groq") < json_names.index("nemotron")
 
 

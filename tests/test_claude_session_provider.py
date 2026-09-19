@@ -47,7 +47,10 @@ def test_provider_chain_omits_claude_until_enabled():
     with patch("ai.client.get_settings", return_value=disabled):
         assert "claude_session" not in [name for name, _ in _provider_chain()]
     with patch("ai.client.get_settings", return_value=enabled):
-        assert [name for name, _ in _provider_chain()][0] == "claude_session"
+        names = [name for name, _ in _provider_chain()]
+        assert names[0] == "groq"
+        assert "claude_session" in names
+        assert names[-1] == "claude_session"
 
 
 def test_extract_claude_stream_text_reads_content_deltas():

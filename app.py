@@ -500,14 +500,19 @@ async def notify_owner_task(request: Request, x_task_secret: str = Header(..., a
         payload = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON") from exc
-    url = str((payload or {}).get("url") or (payload or {}).get("text") or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="url is required")
-    html = (
-        "<b>Mailbot website is live</b>\n\n"
-        f"{_escape_html(url)}\n\n"
-        "Open it on your phone — Home, Tasks, Chat, and Schedule."
-    )
+    payload = payload or {}
+    custom = str(payload.get("message") or "").strip()
+    url = str(payload.get("url") or payload.get("text") or "").strip()
+    if custom:
+        html = custom
+    elif url:
+        html = (
+            "<b>Mailbot website is live</b>\n\n"
+            f"{_escape_html(url)}\n\n"
+            "Open it on your phone — Home, Tasks, Chat, and Schedule."
+        )
+    else:
+        raise HTTPException(status_code=400, detail="message or url is required")
     sent = await send_owner_update(ptb_app.bot, settings.telegram_owner_chat_id, html)
     return {"ok": bool(sent)}
 

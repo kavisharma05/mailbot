@@ -15,6 +15,17 @@ export const useTasksStore = defineStore('tasks', {
     dueSoonBadge: (s) => s.counts['due-soon'] || 0,
   },
   actions: {
+    async fetchBadge() {
+      try {
+        const { data } = await api.get('/api/stats/quick')
+        this.counts = {
+          ...this.counts,
+          'due-soon': data.deadlines_due || 0,
+        }
+      } catch {
+        /* badge is optional — Tasks page still loads full counts */
+      }
+    },
     async fetchTasks() {
       this.loading = true
       try {

@@ -11,7 +11,7 @@ const tasks = useTasksStore()
 
 onMounted(() => {
   start()
-  tasks.fetchTasks()
+  tasks.fetchBadge()
 })
 </script>
 

@@ -227,6 +227,39 @@ def count_messages(query: str, *, hard_cap: int = 500) -> dict[str, Any]:
     }
 
 
+def _message_metadata_summary(message_id: str) -> dict[str, Any] | None:
+    """Headers-only Gmail fetch — much cheaper than full payload + body decode."""
+    service = get_gmail_service()
+    try:
+        msg = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=message_id,
+                format="metadata",
+                metadataHeaders=["From", "To", "Cc", "Subject", "Date"],
+            )
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Failed loading message metadata %s: %s", message_id, exc)
+        return None
+    headers = {
+        h["name"].lower(): h["value"]
+        for h in (msg.get("payload") or {}).get("headers", [])
+    }
+    return {
+        "message_id": message_id,
+        "thread_id": msg.get("threadId"),
+        "subject": headers.get("subject"),
+        "sender": headers.get("from"),
+        "to": headers.get("to"),
+        "cc": headers.get("cc"),
+        "received_at": headers.get("date"),
+    }
+
+
 def list_message_summaries(
     query: str,
     *,
@@ -238,6 +271,14 @@ def list_message_summaries(
 ) -> list[dict[str, Any]]:
     """List recent matching messages with sender/subject/time (optional body/attachments)."""
     ids = search_message_ids(query, max_results=max_results)
+    if not include_body and not load_attachments:
+        summaries = []
+        for message_id in ids:
+            item = _message_metadata_summary(message_id)
+            if item:
+                summaries.append(item)
+        return summaries
+
     summaries: list[dict[str, Any]] = []
     for message_id in ids:
         try:
