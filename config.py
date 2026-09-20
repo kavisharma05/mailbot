@@ -99,6 +99,15 @@ class Settings(BaseSettings):
     # When true and admin_schedule_sender is blank, reject untrusted timetable mail
     require_trusted_schedule_sender: bool = True
 
+    # IMT Nagpur MapMyAccess e-resources portal (daily library digest)
+    mapmyaccess_email: str = ""
+    mapmyaccess_password: str = ""
+    mapmyaccess_base_url: str = "https://imtnagpur.mapmyaccess.com"
+    imt_daily_enabled: bool = True
+    imt_epw_pdf_count: int = 2
+    imt_llm_summaries: bool = True
+    imt_headlines_per_source: int = 8
+
     def owner_user_id(self) -> str:
         return (self.telegram_owner_user_id or self.telegram_owner_chat_id).strip()
 

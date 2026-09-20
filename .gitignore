@@ -33,3 +33,7 @@ htmlcov/
 healthz_body.txt
 ping_follow.txt
 ping_response_body.txt
+
+# IMT Access local session cache + probe artifacts
+data/
+scripts/_*

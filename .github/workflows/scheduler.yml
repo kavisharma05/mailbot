@@ -3,6 +3,7 @@ on:
   schedule:
     - cron: '*/5 * * * *'    # watch-gmail — every 5 min (cold-start safety net)
     - cron: '30 1 * * *'     # morning digest — 07:00 IST
+    - cron: '20 1 * * *'     # IMT library daily briefing — 07:20 IST (backup; in-app scheduler is primary)
     - cron: '30 14 * * *'    # evening digest — 20:00 IST (8pm)
   workflow_dispatch:
 
@@ -58,6 +59,29 @@ jobs:
           fi
           BASE="${RENDER_URL%/}"
           curl -fsS -X POST "${BASE}/tasks/digest-morning" \
+            -H "x-task-secret: ${TASK_SECRET}"
+
+  imt_daily:
+    if: github.event.schedule == '20 1 * * *'
+    runs-on: ubuntu-latest
+    environment: mailbot
+    steps:
+      - name: IMT library daily briefing
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          TASK_SECRET: ${{ secrets.TASK_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RENDER_URL:-}" ]; then
+            echo "::error::GitHub secret RENDER_URL is missing or empty."
+            exit 1
+          fi
+          if [ -z "${TASK_SECRET:-}" ]; then
+            echo "::error::GitHub secret TASK_SECRET is missing or empty."
+            exit 1
+          fi
+          BASE="${RENDER_URL%/}"
+          curl -fsS -X POST "${BASE}/tasks/imt-daily" \
             -H "x-task-secret: ${TASK_SECRET}"
 
   evening_digest:

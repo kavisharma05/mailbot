@@ -965,3 +965,135 @@ async def compose_send(body: ComposeSendBody):
 async def chat_reset():
     clear_web_convo()
     return {"ok": True}
+
+
+# --- IMT library (e-resources) ---
+
+
+def _serialize_publication(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "kind": row.get("kind"),
+        "section": row.get("section"),
+        "title": row.get("title"),
+        "url": row.get("url"),
+        "publication_date": row.get("publication_date"),
+        "summary": row.get("summary"),
+        "fetched_at": row.get("fetched_at"),
+    }
+
+
+@router.get("/library/overview")
+async def library_overview():
+    from imt_access import store as imt_store
+    from imt_access.settings import get_imt_settings
+
+    def _load() -> dict[str, Any]:
+        state = imt_store.get_imt_state()
+        resources = imt_store.list_resources()
+        publications = imt_store.list_publications(limit=40)
+        report = imt_store.get_latest_report("catalog_analysis")
+        return {
+            "state": state,
+            "resources": resources,
+            "publications": publications,
+            "report": report,
+        }
+
+    data = await asyncio.to_thread(_load)
+    settings = get_imt_settings()
+    state = data["state"]
+    resources = data["resources"]
+    publications = data["publications"]
+
+    categories: dict[str, int] = {}
+    for res in resources:
+        cat = res.get("category") or "Other"
+        categories[cat] = categories.get(cat, 0) + 1
+
+    return {
+        "configured": settings.configured,
+        "daily_enabled": settings.imt_daily_enabled,
+        "last_catalog_sync_at": state.get("last_catalog_sync_at"),
+        "last_daily_run_on": state.get("last_daily_run_on"),
+        "last_error": state.get("last_error"),
+        "session_user": state.get("session_user"),
+        "resource_count": len(resources),
+        "categories": [{"name": k, "count": v} for k, v in sorted(categories.items())],
+        "latest_publications": [_serialize_publication(p) for p in publications[:12]],
+        "has_analysis": bool(data["report"]),
+        "analysis_updated_at": (data["report"] or {}).get("created_at"),
+    }
+
+
+@router.get("/library/resources")
+async def library_resources(q: str | None = None):
+    from imt_access import store as imt_store
+
+    resources = await asyncio.to_thread(imt_store.list_resources)
+    if q:
+        needle = q.lower().strip()
+        resources = [
+            r
+            for r in resources
+            if needle in (r.get("name") or "").lower()
+            or needle in (r.get("category") or "").lower()
+        ]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for res in resources:
+        grouped.setdefault(res.get("category") or "Other", []).append(
+            {
+                "portal_id": res.get("portal_id"),
+                "name": res.get("name"),
+                "url": res.get("url"),
+                "proxied": res.get("proxied"),
+                "first_seen_at": res.get("first_seen_at"),
+            }
+        )
+    return {
+        "total": len(resources),
+        "categories": [
+            {"name": name, "resources": items} for name, items in sorted(grouped.items())
+        ],
+    }
+
+
+@router.get("/library/publications")
+async def library_publications(
+    kind: Literal["epw", "ft", "et_prime"] | None = None,
+    limit: int = Query(default=60, ge=1, le=200),
+):
+    from imt_access import store as imt_store
+
+    rows = await asyncio.to_thread(imt_store.list_publications, limit=limit, kind=kind)
+    return {"items": [_serialize_publication(r) for r in rows]}
+
+
+@router.get("/library/analysis")
+async def library_analysis():
+    from imt_access import store as imt_store
+
+    report = await asyncio.to_thread(imt_store.get_latest_report, "catalog_analysis")
+    if not report:
+        return {"available": False, "content": None, "created_at": None}
+    return {
+        "available": True,
+        "content": report.get("content"),
+        "created_at": report.get("created_at"),
+    }
+
+
+@router.post("/library/refresh")
+async def library_refresh():
+    """Kick off a catalog sync in the background (owner's own app instance)."""
+    from imt_access.jobs import run_catalog_sync
+
+    async def _run() -> None:
+        try:
+            result = await run_catalog_sync(alert_new=False)
+            await broadcast("sync_status", {"library_sync": result})
+        except Exception as exc:
+            logger.warning("library refresh failed: %s", exc)
+
+    asyncio.create_task(_run())
+    return {"ok": True, "started": True}

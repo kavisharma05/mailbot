@@ -3,6 +3,7 @@ import HomeView from '../views/HomeView.vue'
 import TasksView from '../views/TasksView.vue'
 import ChatView from '../views/ChatView.vue'
 import ScheduleView from '../views/ScheduleView.vue'
+import LibraryView from '../views/LibraryView.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -11,6 +12,7 @@ const router = createRouter({
     { path: '/tasks', name: 'tasks', component: TasksView },
     { path: '/chat', name: 'chat', component: ChatView },
     { path: '/schedule', name: 'schedule', component: ScheduleView },
+    { path: '/library', name: 'library', component: LibraryView },
     { path: '/settings', name: 'settings', redirect: '/' },
   ],
 })

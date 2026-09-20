@@ -18,6 +18,7 @@ BOT_COMMANDS = [
     BotCommand("edit", "Edit a self-added task from the last list"),
     BotCommand("done", "Mark item #n from the last list"),
     BotCommand("classes", "Today's classes for your section"),
+    BotCommand("library", "Library e-resources: latest briefing and catalog"),
     BotCommand("section", "Change or check your class section"),
     BotCommand("ask", "Ask about deadlines, mail, senders, or content"),
     BotCommand("send", "Compose and send an email to faculty"),

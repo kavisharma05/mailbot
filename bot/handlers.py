@@ -87,6 +87,7 @@ from services.db import (
 from services.formatting import (
     CATEGORY_LABELS,
     VALID_CATEGORIES,
+    escape_html,
     format_dated_due_list,
     format_deadline,
     format_due_list,
@@ -1305,6 +1306,75 @@ async def section_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the latest library briefing: publications + catalog stats."""
+    if not _is_owner(update) or not update.message:
+        return
+
+    await update.message.chat.send_action("typing")
+    from imt_access import store as imt_store
+    from imt_access.settings import get_imt_settings
+
+    settings = get_imt_settings()
+    if not settings.configured:
+        await update.message.reply_text(
+            "Library integration isn't configured yet — set MAPMYACCESS_EMAIL and "
+            "MAPMYACCESS_PASSWORD on the server."
+        )
+        return
+
+    def _load() -> dict:
+        state = imt_store.get_imt_state()
+        pubs = imt_store.list_publications(limit=60)
+        resources = imt_store.list_resources()
+        return {"state": state, "pubs": pubs, "resources": resources}
+
+    try:
+        data = await asyncio.to_thread(_load)
+    except Exception as exc:
+        logger.exception("/library failed: %s", exc)
+        await update.message.reply_text("Couldn't load the library right now. Try again in a minute.")
+        return
+
+    state, pubs, resources = data["state"], data["pubs"], data["resources"]
+    lines: list[str] = ["<b>📖 Library — e-resources</b>", ""]
+
+    if resources:
+        cats: dict[str, int] = {}
+        for r in resources:
+            cats[r.get("category") or "Other"] = cats.get(r.get("category") or "Other", 0) + 1
+        lines.append(f"<b>{len(resources)} resources</b> in the catalog:")
+        lines.append(" · ".join(f"{escape_html(k)} ({v})" for k, v in sorted(cats.items())))
+        lines.append("")
+
+    if pubs:
+        latest_date = max(str(p.get("publication_date") or "") for p in pubs)
+        todays = [p for p in pubs if str(p.get("publication_date") or "") == latest_date]
+        if todays:
+            lines.append(f"<b>Latest briefing — {escape_html(latest_date)}</b>")
+            by_kind: dict[str, list[dict]] = {}
+            for p in todays:
+                by_kind.setdefault(p.get("kind") or "other", []).append(p)
+            kind_labels = {"epw": "EPW", "ft": "Financial Times", "et_prime": "ET Prime"}
+            for kind, items in by_kind.items():
+                lines.append(f"<u>{kind_labels.get(kind, kind)}</u>")
+                for p in items[:6]:
+                    title = escape_html(str(p.get("title") or ""))
+                    url = escape_html(str(p.get("url") or ""))
+                    lines.append(f'• <a href="{url}">{title}</a>')
+                if len(items) > 6:
+                    lines.append(f"  …and {len(items) - 6} more")
+            lines.append("")
+    else:
+        lines.append("No publications fetched yet — the daily briefing runs at 7:15 AM.")
+        lines.append("")
+
+    last_sync = state.get("last_catalog_sync_at") or "never"
+    lines.append(f"<i>Catalog synced: {escape_html(str(last_sync)[:16])}</i>")
+    lines.append("Full catalog + analysis: web app → Library tab.")
+    await reply_long(update.message, "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update) or not update.message:
         return
@@ -2378,6 +2448,7 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("edit", edit_command))
     application.add_handler(CommandHandler("done", done_command))
     application.add_handler(CommandHandler("classes", classes_command))
+    application.add_handler(CommandHandler("library", library_command))
     application.add_handler(CommandHandler("section", section_command))
     application.add_handler(CallbackQueryHandler(section_button, pattern=r"^section:"))
     application.add_handler(CallbackQueryHandler(clear_chat_button, pattern=f"^{CLEAR_CHAT_CB}$"))

@@ -64,9 +64,14 @@ MORNING_DIGEST_HOUR = 7
 MORNING_DIGEST_END_HOUR = 9
 EVENING_DIGEST_HOUR = 20
 EVENING_DIGEST_END_HOUR = 22
+# IMT library daily briefing: fires after the morning digest window opens.
+IMT_DAILY_START_HOUR = 7
+IMT_DAILY_START_MINUTE = 15
+IMT_DAILY_END_HOUR = 10
 PING_BODY = b"ok"
 
 digest_scheduler_lock = asyncio.Lock()
+imt_daily_lock = asyncio.Lock()
 
 
 class InstantPingMiddleware:
@@ -205,6 +210,31 @@ async def _digest_scheduler_loop() -> None:
         await asyncio.sleep(DIGEST_SCHEDULER_INTERVAL_SECONDS)
 
 
+async def _imt_daily_scheduler_loop() -> None:
+    """Fire the IMT library daily briefing (07:15-10:00 IST) while awake.
+
+    Idempotent per IST day via imt_state — the GitHub Actions cron backup can
+    hit /tasks/imt-daily on the same day without double-sending.
+    """
+    from imt_access.jobs import run_daily_job
+
+    while True:
+        try:
+            now = now_ist()
+            window_open = (now.hour, now.minute) >= (IMT_DAILY_START_HOUR, IMT_DAILY_START_MINUTE)
+            window_open = window_open and now.hour < IMT_DAILY_END_HOUR
+            if window_open:
+                async with imt_daily_lock:
+                    result = await run_daily_job(ptb_app.bot)
+                if result.get("ok") and not result.get("skipped"):
+                    logger.info("In-app IMT daily briefing: %s", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("IMT daily scheduler failed: %s", exc)
+        await asyncio.sleep(DIGEST_SCHEDULER_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await ptb_app.initialize()
@@ -214,8 +244,9 @@ async def lifespan(app: FastAPI):
     watcher_task = asyncio.create_task(_background_watcher_loop())
     keep_alive_task = asyncio.create_task(_keep_alive_loop())
     digest_task = asyncio.create_task(_digest_scheduler_loop())
+    imt_daily_task = asyncio.create_task(_imt_daily_scheduler_loop())
     yield
-    for task in (watcher_task, keep_alive_task, digest_task):
+    for task in (watcher_task, keep_alive_task, digest_task, imt_daily_task):
         task.cancel()
         try:
             await task
@@ -477,6 +508,41 @@ async def digest_evening(
         ptb_app.bot, dry_run=bool(dry_run), force=bool(force)
     )
     logger.info("Evening digest result: %s", result)
+    return result
+
+
+@fastapi_app.post("/tasks/imt-daily")
+async def imt_daily_task(
+    dry_run: int = 0,
+    force: int = 0,
+    x_task_secret: str = Header(..., alias="x-task-secret"),
+):
+    """IMT library daily briefing (EPW + FT + ET Prime) — Telegram/WhatsApp/web."""
+    settings = get_settings()
+    if not hmac.compare_digest(x_task_secret, settings.task_secret):
+        raise HTTPException(status_code=403, detail="Invalid task secret")
+
+    from imt_access.jobs import run_daily_job
+
+    async with imt_daily_lock:
+        result = await run_daily_job(
+            ptb_app.bot, dry_run=bool(dry_run), force=bool(force)
+        )
+    logger.info("IMT daily task result: %s", result)
+    return result
+
+
+@fastapi_app.post("/tasks/imt-sync-catalog")
+async def imt_sync_catalog_task(x_task_secret: str = Header(..., alias="x-task-secret")):
+    """Refresh the e-resources catalog from the MapMyAccess portal."""
+    settings = get_settings()
+    if not hmac.compare_digest(x_task_secret, settings.task_secret):
+        raise HTTPException(status_code=403, detail="Invalid task secret")
+
+    from imt_access.jobs import run_catalog_sync
+
+    result = await run_catalog_sync(bot=ptb_app.bot)
+    logger.info("IMT catalog sync result: %s", result)
     return result
 
 

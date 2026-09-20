@@ -12,6 +12,7 @@ const tabs = [
   { name: 'home', path: '/', icon: 'home', label: 'Home' },
   { name: 'tasks', path: '/tasks', icon: 'check_circle', label: 'Tasks', badge: true },
   { name: 'chat', path: '/chat', icon: 'chat_bubble', label: 'Chat' },
+  { name: 'library', path: '/library', icon: 'local_library', label: 'Library' },
   { name: 'schedule', path: '/schedule', icon: 'calendar_month', label: 'Schedule' },
 ]
 </script>
