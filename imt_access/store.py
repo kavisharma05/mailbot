@@ -13,6 +13,7 @@ rest of Mailbot is never broken by this feature.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, datetime, timezone
 from typing import Any
@@ -243,3 +244,38 @@ def get_latest_report(kind: str = "catalog_analysis") -> dict[str, Any] | None:
     except Exception as exc:
         _handle_error("imt_reports", "get_latest_report", exc)
         return None
+
+
+# --- portal config (credential fallback for deploys without env access) ---
+
+_PORTAL_CONFIG_KIND = "portal_config"
+
+
+def save_portal_config(config: dict[str, str]) -> bool:
+    """Persist portal credentials as an imt_reports row so a deployed instance
+    without MAPMYACCESS_* env vars can still authenticate. Never exposed via
+    the web API (report reads filter by kind)."""
+    if not _table_ok("imt_reports"):
+        return False
+    try:
+        db = get_db()
+        db.table("imt_reports").insert(
+            {"kind": _PORTAL_CONFIG_KIND, "content": json.dumps(config)}
+        ).execute()
+        return True
+    except Exception as exc:
+        _handle_error("imt_reports", "save_portal_config", exc)
+        return False
+
+
+def get_portal_config() -> dict[str, str]:
+    row = get_latest_report(_PORTAL_CONFIG_KIND)
+    if not row:
+        return {}
+    try:
+        data = json.loads(row.get("content") or "{}")
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if v}

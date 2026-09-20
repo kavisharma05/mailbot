@@ -8,12 +8,18 @@ whole FastAPI app.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 _ENV_LOADED = False
+
+# Short-lived cache for the Supabase-stored credential fallback so we don't
+# hit PostgREST on every settings read.
+_config_cache: tuple[float, dict[str, str]] | None = None
+_CONFIG_CACHE_TTL = 300.0
 
 
 def _ensure_env() -> None:
@@ -46,6 +52,26 @@ class IMTSettings:
         return bool(self.mapmyaccess_email and self.mapmyaccess_password)
 
 
+def _portal_config_fallback() -> dict[str, str]:
+    """Read portal credentials stored in Supabase (kind='portal_config').
+
+    Lets the deployed service run without MAPMYACCESS_* env vars — handy when
+    the hosting dashboard is not accessible. Env vars always win when set.
+    """
+    global _config_cache
+    now = time.time()
+    if _config_cache and now - _config_cache[0] < _CONFIG_CACHE_TTL:
+        return _config_cache[1]
+    try:
+        from imt_access import store
+
+        config = store.get_portal_config()
+    except Exception:
+        config = {}
+    _config_cache = (now, config)
+    return config
+
+
 def get_imt_settings() -> IMTSettings:
     _ensure_env()
 
@@ -61,9 +87,16 @@ def get_imt_settings() -> IMTSettings:
         except ValueError:
             return default
 
+    email = (os.environ.get("MAPMYACCESS_EMAIL") or "").strip()
+    password = os.environ.get("MAPMYACCESS_PASSWORD") or ""
+    if not email or not password:
+        fallback = _portal_config_fallback()
+        email = email or fallback.get("mapmyaccess_email", "")
+        password = password or fallback.get("mapmyaccess_password", "")
+
     return IMTSettings(
-        mapmyaccess_email=(os.environ.get("MAPMYACCESS_EMAIL") or "").strip(),
-        mapmyaccess_password=os.environ.get("MAPMYACCESS_PASSWORD") or "",
+        mapmyaccess_email=email,
+        mapmyaccess_password=password,
         mapmyaccess_base_url=(
             os.environ.get("MAPMYACCESS_BASE_URL") or "https://imtnagpur.mapmyaccess.com"
         ).strip().rstrip("/"),
