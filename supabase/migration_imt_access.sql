@@ -4,7 +4,7 @@
 create table if not exists imt_state (
     id int primary key default 1 check (id = 1),
     session_token text,
-    session_user text,
+    session_display_name text,
     session_saved_at timestamptz,
     last_catalog_sync_at timestamptz,
     last_daily_run_on date,

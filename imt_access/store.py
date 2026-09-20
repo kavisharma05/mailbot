@@ -1,4 +1,4 @@
-"""Supabase persistence for the IMT Access integration.
+﻿"""Supabase persistence for the IMT Access integration.
 
 Tables (see supabase/migration_imt_access.sql):
 - imt_state        — singleton row: session token, last sync/run markers
@@ -80,7 +80,7 @@ def get_session_token() -> str | None:
 def save_session_token(token: str, user_display: str | None = None) -> None:
     update_imt_state(
         session_token=token,
-        session_user=user_display,
+        session_display_name=user_display,
         session_saved_at=datetime.now(timezone.utc).isoformat(),
     )
 

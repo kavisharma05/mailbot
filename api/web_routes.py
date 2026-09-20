@@ -1017,7 +1017,7 @@ async def library_overview():
         "last_catalog_sync_at": state.get("last_catalog_sync_at"),
         "last_daily_run_on": state.get("last_daily_run_on"),
         "last_error": state.get("last_error"),
-        "session_user": state.get("session_user"),
+        "session_user": state.get("session_display_name"),
         "resource_count": len(resources),
         "categories": [{"name": k, "count": v} for k, v in sorted(categories.items())],
         "latest_publications": [_serialize_publication(p) for p in publications[:12]],
