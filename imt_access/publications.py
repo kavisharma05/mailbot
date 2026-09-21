@@ -184,6 +184,10 @@ def _curl_get(url: str) -> str | None:
 
 def fetch_ft_headlines(*, limit: int = 8) -> list[PublicationItem]:
     html = _curl_get(FT_HOME)
+    if html and "/content/" not in html:
+        # Bot-wall interstitial or markup drift — retry once before giving up.
+        logger.info("FT homepage returned no content links; retrying once")
+        html = _curl_get(FT_HOME)
     if not html:
         return []
     soup = BeautifulSoup(html, "lxml")

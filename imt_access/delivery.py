@@ -167,19 +167,19 @@ def _whatsapp_story_picker(items: list[PublicationItem]) -> dict[str, Any] | Non
     }
 
 
-async def _send_whatsapp_picker(items: list[PublicationItem]) -> bool:
+async def _send_whatsapp_picker(items: list[PublicationItem]) -> tuple[bool, str | None]:
     client = get_whatsapp_client()
     phone = _whatsapp_phone()
     picker = _whatsapp_story_picker(items)
     if not client.enabled or not phone or not picker:
-        return False
+        return False, "not_configured"
     try:
-        return await client.send_interactive(phone, picker)
+        return await client.send_interactive_detailed(phone, picker)
     except Exception as exc:
         # Outside the 24h window or list limits — the story text already tells
         # the user to reply with a number, so this is best-effort garnish.
         logger.info("WhatsApp story picker skipped: %s", exc)
-        return False
+        return False, str(exc)
 
 
 async def _send_telegram(bot, chat_id: str, text: str, reply_markup=None) -> bool:
@@ -229,7 +229,10 @@ async def deliver_daily_digest(
 
     ok_wa_intro = await _send_whatsapp(intro_text)
     ok_wa_stories = await _send_whatsapp(stories_text)
-    result["whatsapp_picker"] = await _send_whatsapp_picker(items)
+    picker_ok, picker_err = await _send_whatsapp_picker(items)
+    result["whatsapp_picker"] = picker_ok
+    if picker_err:
+        result["whatsapp_picker_error"] = picker_err
     if new_res_text:
         await _send_whatsapp(str(new_res_text))
     result["whatsapp"] = ok_wa_intro and ok_wa_stories

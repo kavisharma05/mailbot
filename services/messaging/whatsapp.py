@@ -255,13 +255,20 @@ class WhatsAppClient:
 
     async def send_interactive(self, to: str, interactive: dict[str, Any]) -> bool:
         """Send a raw interactive payload (reply buttons or list message)."""
+        ok, _detail = await self.send_interactive_detailed(to, interactive)
+        return ok
+
+    async def send_interactive_detailed(
+        self, to: str, interactive: dict[str, Any]
+    ) -> tuple[bool, str | None]:
+        """Like send_interactive, but returns Meta's error detail on failure."""
         if not self.can_send or not interactive:
-            return False
+            return False, "client_not_configured"
         resp = await self._post_message(to, {"type": "interactive", "interactive": interactive})
         if resp.status_code >= 400:
             logger.warning("WhatsApp interactive send failed %s: %s", resp.status_code, resp.text[:500])
-            return False
-        return True
+            return False, f"{resp.status_code}: {resp.text[:300]}"
+        return True, None
 
     async def send_document(
         self,
