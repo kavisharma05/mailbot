@@ -122,14 +122,14 @@ def test_oauth_state_roundtrip():
     with patch("services.oauth_state.get_settings") as mock_settings:
         mock_settings.return_value.task_secret = "test-secret"
         state = create_oauth_state()
-        assert verify_oauth_state(state)
+        assert verify_oauth_state(state)[0]
 
 
 def test_oauth_state_rejects_tampered():
     with patch("services.oauth_state.get_settings") as mock_settings:
         mock_settings.return_value.task_secret = "test-secret"
         state = create_oauth_state()
-        assert not verify_oauth_state(state + "x")
+        assert not verify_oauth_state(state + "x")[0]
 
 
 def test_sanitize_gmail_query_blocks_newlines_and_delete():

@@ -8,7 +8,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ai.assistant import (
@@ -33,8 +33,11 @@ from ai.intent import (
     classify_message,
 )
 from config import get_settings
+from api.deps import web_user
+from gmail_api.auth import reset_gmail_user_context, set_gmail_user_context
+from services.mailbox_user import reset as reset_mailbox_user
+from services.mailbox_user import set_user as set_mailbox_user
 from gmail_api.client import send_email
-from services.contacts import (
     extract_person_reference,
     looks_like_recipient_switch,
     resolve_contact_email,
@@ -208,7 +211,11 @@ def _serialize_class(session: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _greeting_name() -> str:
+def _greeting_name(user: dict[str, Any] | None = None) -> str:
+    if user and user.get("display_name"):
+        name = str(user["display_name"]).strip()
+        if not name.startswith("["):
+            return name.split()[0] if name else "there"
     settings = get_settings()
     name = (settings.student_name or "Student").strip()
     if name.startswith("["):
@@ -231,18 +238,21 @@ def _partition_open_assignments(
     *,
     now: datetime | None = None,
     limit: int = 200,
+    user_id: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     ref = now or now_ist()
-    pool = get_open_assignments(category=category, limit=limit)
+    pool = get_open_assignments(category=category, limit=limit, user_id=user_id)
     upcoming = _filter_assignments_by_deadline(pool, upcoming=True, now=ref)
     missed = _filter_assignments_by_deadline(pool, upcoming=False, now=ref)
     undated = [item for item in pool if item_effective_deadline_dt(item) is None]
     return {"all": pool, "upcoming": upcoming, "missed": missed, "undated": undated}
 
 
-def _quick_stats_payload(*, today_sessions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _quick_stats_payload(
+    *, today_sessions: list[dict[str, Any]] | None = None, user_id: str | None = None
+) -> dict[str, Any]:
     now = now_ist()
-    buckets = _partition_open_assignments(now=now)
+    buckets = _partition_open_assignments(now=now, user_id=user_id)
     due_week_end = now + timedelta(days=7)
     deadlines_due = sum(
         1
@@ -250,7 +260,7 @@ def _quick_stats_payload(*, today_sessions: list[dict[str, Any]] | None = None) 
         if (dt := item_effective_deadline_dt(a)) is not None and dt <= due_week_end
     )
     if today_sessions is None:
-        section = get_preferred_section()
+        section = get_preferred_section(user_id=user_id)
         today_sessions = sessions_for_day(today_ist(), section=section)
     placement = sum(1 for a in buckets["all"] if a.get("category") == "placement")
     return {
@@ -281,7 +291,7 @@ def _web_local_list_reply(intent: str, text: str) -> str | None:
     now = now_ist()
     if intent == INTENT_SCHEDULE:
         day = resolve_schedule_day(text)
-        section = get_preferred_section()
+        section = get_preferred_section(user_id=user_id)
         sessions = sessions_for_day(day, section=section)
         if sessions:
             reply = _web_format_sessions(sessions, day)
@@ -327,11 +337,11 @@ def _web_local_list_reply(intent: str, text: str) -> str | None:
 
 
 @router.get("/stats/quick")
-async def quick_stats():
-    return _quick_stats_payload()
+async def quick_stats(user: dict = Depends(web_user)):
+    return _quick_stats_payload(user_id=user["id"])
 
 
-def _activity_items(limit: int = 10) -> list[dict[str, Any]]:
+def _activity_items(limit: int = 10, user_id: str | None = None) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     since = datetime.now(timezone.utc) - timedelta(hours=48)
     try:
@@ -342,8 +352,13 @@ def _activity_items(limit: int = 10) -> list[dict[str, Any]]:
             .gte("created_at", since.isoformat())
             .order("created_at", desc=True)
             .limit(limit)
-            .execute()
         )
+        if user_id:
+            from services.db import multi_user_schema_ready, resolve_user_id
+
+            if multi_user_schema_ready():
+                result = result.eq("user_id", resolve_user_id(user_id))
+        result = result.execute()
         for row in result.data or []:
             items.append(
                 {
@@ -366,15 +381,16 @@ def _activity_items(limit: int = 10) -> list[dict[str, Any]]:
 
 
 @router.get("/dashboard")
-async def dashboard():
+async def dashboard(user: dict = Depends(web_user)):
     now = now_ist()
     settings = get_settings()
+    uid = user["id"]
 
     def _load_core() -> tuple[Any, ...]:
-        section = get_preferred_section()
-        buckets = _partition_open_assignments(now=now)
+        section = get_preferred_section(user_id=uid)
+        buckets = _partition_open_assignments(now=now, user_id=uid)
         sessions = sessions_for_day(today_ist(), section=section)
-        activity = _activity_items(5)
+        activity = _activity_items(5, user_id=uid)
         sync = _sync_meta()
         return section, buckets, sessions, activity, sync
 
@@ -403,13 +419,16 @@ async def dashboard():
         "classes_today": sum(1 for s in today_sessions if not s.get("cancelled")),
         "placement": sum(1 for a in buckets["all"] if a.get("category") == "placement"),
     }
+    gmail_connected = bool(user.get("gmail_address")) or user.get("role") == "owner"
     return {
-        "greeting_name": _greeting_name(),
-        "student_name": settings.student_name,
+        "greeting_name": _greeting_name(user),
+        "student_name": user.get("display_name") or settings.student_name,
         "section": section,
         "sync": sync,
         "db_ok": db_ok,
         "stats": stats,
+        "gmail_connected": gmail_connected,
+        "user": {"id": uid, "role": user.get("role"), "telegram_username": user.get("telegram_username")},
         "urgent_task": _serialize_task(urgent, now=now) if urgent else None,
         "today_classes": [_serialize_class(s) for s in today_sessions],
         "upcoming_deadlines": [_serialize_task(a, now=now) for a in upcoming[:8]],
@@ -428,10 +447,12 @@ async def list_tasks(
     category: str | None = None,
     q: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
+    user: dict = Depends(web_user),
 ):
     now = now_ist()
+    uid = user["id"]
     cat = None if not category or category == "all" else category
-    buckets = _partition_open_assignments(category=cat, now=now)
+    buckets = _partition_open_assignments(category=cat, now=now, user_id=uid)
     if status == "missed":
         raw = buckets["missed"][:limit]
     elif status == "undated":
@@ -466,7 +487,7 @@ async def list_tasks(
             or needle in (t.get("sender") or "").lower()
             or needle in (t.get("category") or "").lower()
         ]
-    count_source = buckets if cat is None else _partition_open_assignments(now=now)
+    count_source = buckets if cat is None else _partition_open_assignments(now=now, user_id=uid)
     counts = {
         "all": len(count_source["all"]),
         "due-soon": len(count_source["upcoming"]),
@@ -484,13 +505,14 @@ class TaskCreateBody(BaseModel):
 
 
 @router.post("/tasks")
-async def create_task(body: TaskCreateBody):
+async def create_task(body: TaskCreateBody, user: dict = Depends(web_user)):
     row = await asyncio.to_thread(
         create_manual_assignment,
         body.task,
         deadline_text=body.deadline_text,
         category=body.category,
         course_or_topic=body.course_or_topic,
+        user_id=user["id"],
     )
     if not row:
         raise HTTPException(status_code=400, detail="Could not create task")
@@ -711,7 +733,7 @@ async def _web_begin_compose(text: str, classified: dict[str, Any]) -> dict[str,
     return {"reply": reply, "draft": None}
 
 
-async def _web_continue_compose(text: str, compose: dict[str, Any]) -> dict[str, Any]:
+async def _web_continue_compose(text: str, compose: dict[str, Any], user_id: str | None = None) -> dict[str, Any]:
     convo = get_web_convo()
     step = compose.get("step")
     lower = text.strip().lower()
@@ -815,23 +837,24 @@ async def _web_continue_compose(text: str, compose: dict[str, Any]) -> dict[str,
 
 
 @router.get("/chat/history")
-async def chat_history():
-    return {"messages": chat_history_for_api()}
+async def chat_history(user: dict = Depends(web_user)):
+    return {"messages": chat_history_for_api(user_id=user["id"])}
 
 
 @router.post("/chat/message")
-async def chat_message(body: ChatMessageBody):
+async def chat_message(body: ChatMessageBody, user: dict = Depends(web_user)):
+    uid = user["id"]
     text = (body.message or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    remember_web_turn(user_text=text)
-    compose = get_web_compose()
+    remember_web_turn(user_text=text, user_id=uid)
+    compose = get_web_compose(uid)
     if compose and compose.get("step"):
-        return await _web_continue_compose(text, compose)
+        return await _web_continue_compose(text, compose, uid)
 
-    classified = classify_message(text, convo=get_web_convo())
-    convo = get_web_convo()
+    classified = classify_message(text, convo=get_web_convo(uid))
+    convo = get_web_convo(uid)
     if re.search(r"\b(?:claude|groq|nemotron|provider|ai provider)\b", text, re.I) and re.search(
         r"\b(?:why|reach|use|try|not working|down|fail|instead)\b", text, re.I
     ):
@@ -940,7 +963,7 @@ class ComposeSendBody(BaseModel):
 
 
 @router.post("/compose/send")
-async def compose_send(body: ComposeSendBody):
+async def compose_send(body: ComposeSendBody, user: dict = Depends(web_user)):
     to = body.to.strip()
     if not to:
         raise HTTPException(status_code=400, detail="Missing recipient")
@@ -951,19 +974,24 @@ async def compose_send(body: ComposeSendBody):
         if not email:
             raise HTTPException(status_code=400, detail=note or "Could not resolve recipient email")
         to = email
+    mb_t = set_mailbox_user(user)
+    g_t = set_gmail_user_context(user["id"])
     try:
         await asyncio.to_thread(send_email, to, body.subject, body.body)
     except Exception as exc:
         logger.exception("compose send failed: %s", exc)
         raise HTTPException(status_code=502, detail="Send failed") from exc
-    set_web_compose(None)
+    finally:
+        reset_gmail_user_context(g_t)
+        reset_mailbox_user(mb_t)
+    set_web_compose(None, user_id=user["id"])
     await broadcast("sync_status", {"email_sent": True, "to": to})
     return {"ok": True, "to": to}
 
 
 @router.post("/chat/reset")
-async def chat_reset():
-    clear_web_convo()
+async def chat_reset(user: dict = Depends(web_user)):
+    clear_web_convo(user_id=user["id"])
     return {"ok": True}
 
 

@@ -3,6 +3,7 @@ import html
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatType
@@ -174,21 +175,31 @@ def _extract_verify_tag(text: str) -> tuple[bool, str]:
     return True, cleaned
 
 
-def _is_owner(update: Update) -> bool:
-    settings = get_settings()
-    user = update.effective_user
-    if not user:
-        return False
-    uid = str(user.id)
-    if uid == str(settings.owner_user_id()):
-        return True
-    wa_phone = getattr(settings, "whatsapp_owner_phone", None) or ""
-    if wa_phone:
-        from services.messaging.phone import wa_phones_match
+def _resolve_user(update: Update) -> dict[str, Any] | None:
+    from services.users import ensure_owner_user, get_owner_user, get_user_by_telegram_id
 
-        if wa_phones_match(uid, wa_phone):
-            return True
-    return False
+    ensure_owner_user()
+    tg = update.effective_user
+    if not tg:
+        return None
+    row = get_user_by_telegram_id(tg.id)
+    if row:
+        return row
+    settings = get_settings()
+    if str(tg.id) == str(settings.owner_user_id()):
+        return get_owner_user()
+    return None
+
+
+def _require_user(update: Update) -> dict[str, Any] | None:
+    return _resolve_user(update)
+
+
+def _is_owner(update: Update) -> bool:
+    from services.users import is_owner_user
+
+    user = _resolve_user(update)
+    return is_owner_user(user)
 
 
 def _category_for_chat(chat_id: int | str | None) -> str | None:
@@ -708,7 +719,7 @@ async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     query = update.callback_query
     if not query or not query.data:
         return
-    if not _is_owner(update):
+    if not _require_user(update):
         await query.answer("Only the bot owner can use these actions.", show_alert=True)
         return
     parsed = parse_action_callback(query.data)
@@ -891,7 +902,7 @@ async def _clear_bot_messages(
 
 
 async def clear_chat_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update):
+    if not _require_user(update):
         return
     query = update.callback_query
     if not query or not query.message:
@@ -924,41 +935,90 @@ async def clear_chat_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update):
+    if not _require_user(update):
         return
     await start_command(update, context)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update):
+    from services.users import claim_invite, is_owner_user, link_telegram_to_user
+
+    tg = update.effective_user
+    chat = update.effective_chat
+    if not tg or not chat or not update.message:
         return
 
-    msg = await update.message.reply_text(
-        "Mailbot ready.\n\n"
-        "Morning digest (7:00 IST) and evening digest (20:00 IST) land here in your DM.\n"
-        "Free text works here too — ask about deadlines, mail, or senders.\n\n"
-        "Commands:\n"
-        "/due — upcoming deadlines & tasks (nearest first)\n"
-        "/missed — open items whose deadline has passed\n"
-        "/undated — open tasks with no due date\n"
-        "/add — add a task yourself (wizard or one-line shortcut)\n"
-        "/edit <n> — edit a task you added (from the last list)\n"
-        "/done <n> — mark item #n from the last list (/due, /missed, or /undated)\n"
-        "/classes — today's classes for your section (tap to set it first time)\n"
-        "/section — change or check your section\n"
-        "/ask <question> — ask about deadlines, mails, senders, or email content\n"
-        "Add #verify to any question for a fresh Gmail answer with cited sources\n"
-        "/send — compose and send an email\n"
-        "/cancel — cancel an in-progress draft or task wizard\n"
-        "/reset (or /new) — clear conversation context; discards any draft\n"
-        "/status — last check times and system health\n\n"
-        "Actionable alerts have Done / Snooze / Remind again buttons.\n"
-        "Marks in attachments show as text; readings are forwarded as files.\n\n"
-        "In groups: reply to my messages, or mention me:\n"
-        "@IMTAssistant_bot what's due this week?\n\n"
-        "Tip: In BotFather → /setprivacy → Disable, so I can see all group messages.",
-        reply_markup=_quick_action_keyboard(),
+    args = context.args or []
+    if args and str(args[0]).startswith("invite_"):
+        code = str(args[0])[len("invite_") :]
+        claimed = claim_invite(
+            code,
+            telegram_user_id=str(tg.id),
+            telegram_chat_id=str(chat.id),
+            telegram_username=tg.username,
+        )
+        if claimed:
+            await update.message.reply_text(
+                "You're registered. Open the web app and log in with your Telegram username.\n"
+                "Use /login anytime for a fresh web login code."
+            )
+        else:
+            await update.message.reply_text("That invite link is invalid or expired.")
+        return
+
+    user = _resolve_user(update)
+    if not user:
+        await update.message.reply_text(
+            "This bot is invite-only. Ask the owner for an invite, then open the link they send you."
+        )
+        return
+
+    link_telegram_to_user(
+        user["id"],
+        telegram_user_id=str(tg.id),
+        telegram_chat_id=str(chat.id),
+        telegram_username=tg.username,
     )
+
+    if is_owner_user(user):
+        msg = await update.message.reply_text(
+            "Mailbot ready.\n\n"
+            "Morning digest (7:00 IST) and evening digest (20:00 IST) land here in your DM.\n"
+            "Free text works here too — ask about deadlines, mail, or senders.\n\n"
+            "Owner: /invite @username — invite a student\n"
+            "/users — list registered users\n"
+            "/login — web app login code\n\n"
+            "Commands:\n"
+            "/due — upcoming deadlines & tasks (nearest first)\n"
+            "/missed — open items whose deadline has passed\n"
+            "/undated — open tasks with no due date\n"
+            "/add — add a task yourself (wizard or one-line shortcut)\n"
+            "/edit <n> — edit a task you added (from the last list)\n"
+            "/done <n> — mark item #n from the last list (/due, /missed, or /undated)\n"
+            "/classes — today's classes for your section (tap to set it first time)\n"
+            "/section — change or check your section\n"
+            "/ask <question> — ask about deadlines, mails, senders, or email content\n"
+            "Add #verify to any question for a fresh Gmail answer with cited sources\n"
+            "/send — compose and send an email\n"
+            "/cancel — cancel an in-progress draft or task wizard\n"
+            "/reset (or /new) — clear conversation context; discards any draft\n"
+            "/status — last check times and system health\n\n"
+            "Actionable alerts have Done / Snooze / Remind again buttons.\n"
+            "Marks in attachments show as text; readings are forwarded as files.\n\n"
+            "In groups: reply to my messages, or mention me:\n"
+            "@IMTAssistant_bot what's due this week?\n\n"
+            "Tip: In BotFather → /setprivacy → Disable, so I can see all group messages.",
+            reply_markup=_quick_action_keyboard(),
+        )
+    else:
+        msg = await update.message.reply_text(
+            "Welcome to Mailbot.\n\n"
+            "Connect Gmail in the web app, then you'll get deadline alerts here.\n"
+            "/login — get a code for the web app\n"
+            "/due /classes /ask /send — same as the owner bot.\n"
+            "/status — sync health",
+            reply_markup=_quick_action_keyboard(),
+        )
     _track_bot_message(context, msg.message_id)
     clear_row = await update.message.reply_text(
         "Quick actions are pinned above your keyboard.",
@@ -968,7 +1028,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     state, digest, pending, pending_emails, dead_letters = await asyncio.gather(
@@ -1037,7 +1097,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def quick_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message or not update.message.text:
+    if not _require_user(update) or not update.message or not update.message.text:
         return
     label = update.message.text.strip()
     if _get_compose(context.user_data) and label != "✉️ Send":
@@ -1064,7 +1124,7 @@ async def quick_action_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
@@ -1074,7 +1134,7 @@ async def due_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def missed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
@@ -1084,7 +1144,7 @@ async def missed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def undated_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
@@ -1094,7 +1154,7 @@ async def undated_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     args_text = " ".join(context.args).strip() if context.args else ""
@@ -1120,7 +1180,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     if not context.args:
@@ -1163,7 +1223,7 @@ async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def addtask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.callback_query:
+    if not _require_user(update) or not update.callback_query:
         return
     query = update.callback_query
     await query.answer()
@@ -1206,7 +1266,7 @@ async def addtask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def edittask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.callback_query:
+    if not _require_user(update) or not update.callback_query:
         return
     query = update.callback_query
     await query.answer()
@@ -1258,7 +1318,7 @@ async def edittask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     await update.message.chat.send_action("typing")
@@ -1286,7 +1346,7 @@ async def classes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def section_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
     current = await asyncio.to_thread(get_preferred_section)
     label = f"Current: Section {current}\n\n" if current else ""
@@ -1295,7 +1355,7 @@ async def section_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def section_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update):
+    if not _require_user(update):
         return
     query = update.callback_query
     await query.answer()
@@ -1308,7 +1368,7 @@ async def section_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the latest library briefing: publications + catalog stats."""
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     await update.message.chat.send_action("typing")
@@ -1376,7 +1436,7 @@ async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     category = _category_for_chat(update.effective_chat.id if update.effective_chat else None)
@@ -1428,7 +1488,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     question = " ".join(context.args).strip() if context.args else ""
@@ -1960,7 +2020,7 @@ async def chat_message(
     text_override: str | None = None,
 ) -> None:
     """Answer free-text questions in DMs, mentions, or replies to the bot."""
-    if not _is_owner(update) or not update.message or not (text_override or update.message.text):
+    if not _require_user(update) or not update.message or not (text_override or update.message.text):
         return
     input_text = text_override or update.message.text
 
@@ -2153,7 +2213,7 @@ async def chat_message(
 
 async def media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Process owner images and voice/audio messages, replying in text."""
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
     message = update.message
     try:
@@ -2288,7 +2348,7 @@ async def _answer_chat_question(
 
 
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
 
     existing = _get_compose(context.user_data)
@@ -2387,7 +2447,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
     cleared: list[str] = []
     if _get_compose(context.user_data):
@@ -2406,7 +2466,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not _require_user(update) or not update.message:
         return
     had_compose = bool(_get_compose(context.user_data))
     had_task_flow = bool(_get_add_task(context.user_data) or _get_edit_task(context.user_data))
@@ -2436,7 +2496,64 @@ async def backfill_contacts_command(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+    from services.users import create_invite
+
+    raw = " ".join(context.args or []).strip().lstrip("@")
+    if not raw:
+        await update.message.reply_text("Usage: /invite @telegram_username")
+        return
+    invite = create_invite(raw)
+    if not invite:
+        await update.message.reply_text("Could not create invite.")
+        return
+    settings = get_settings()
+    bot_name = (settings.render_url or "t.me").split("/")[-1]
+    link = f"https://t.me/{context.bot.username}?start=invite_{invite['invite_code']}"
+    await update.message.reply_text(
+        f"Invite for @{invite['username']} (expires {invite['expires_at'][:10]}):\n{link}"
+    )
+
+
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = _require_user(update)
+    if not user or not update.message:
+        return
+    from services.users import request_login_code
+
+    username = user.get("telegram_username") or (update.effective_user.username if update.effective_user else "")
+    if not username:
+        await update.message.reply_text("Set a Telegram @username in your profile, then try again.")
+        return
+    result = request_login_code(username)
+    code = result.pop("_code_for_bot", None)
+    if not result.get("ok") or not code:
+        await update.message.reply_text(result.get("message") or "Could not create code.")
+        return
+    await update.message.reply_text(
+        f"Web login code: {code}\n\nExpires in 10 minutes. Enter it on the Mailbot web login page."
+    )
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update) or not update.message:
+        return
+    from services.users import list_users
+
+    rows = list_users()
+    lines = ["Registered users:", ""]
+    for row in rows:
+        un = row.get("telegram_username") or "—"
+        lines.append(f"• {row.get('display_name')} (@{un}) — {row.get('role')}")
+    await update.message.reply_text("\n".join(lines) or "No users yet.")
+
+
 def register_handlers(application) -> None:
+    application.add_handler(CommandHandler("invite", invite_command))
+    application.add_handler(CommandHandler("login", login_command))
+    application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))

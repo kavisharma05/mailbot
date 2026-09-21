@@ -11,7 +11,9 @@ let started = false
 
 function wsUrl() {
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${proto}://${window.location.host}/ws`
+  const token = localStorage.getItem('mailbot_token')
+  const q = token ? `?token=${encodeURIComponent(token)}` : ''
+  return `${proto}://${window.location.host}/ws${q}`
 }
 
 function onMessage(msg) {

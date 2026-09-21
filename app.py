@@ -14,6 +14,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, We
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from api.auth_routes import router as auth_api_router
 from api.web_routes import router as web_api_router
 from google.auth.exceptions import RefreshError
 from telegram import Update
@@ -237,6 +238,9 @@ async def _imt_daily_scheduler_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from services.users import ensure_owner_user
+
+    ensure_owner_user()
     await ptb_app.initialize()
     await ptb_app.start()
     await register_bot_commands(ptb_app)
@@ -258,14 +262,19 @@ async def lifespan(app: FastAPI):
 
 
 fastapi_app = FastAPI(title="Mailbot", lifespan=lifespan)
+fastapi_app.include_router(auth_api_router)
 fastapi_app.include_router(web_api_router)
 
 WEB_DIST = Path(__file__).resolve().parent / "web" / "dist"
 
 
 @fastapi_app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await connect(ws)
+async def websocket_endpoint(ws: WebSocket, token: str | None = Query(default=None)):
+    from services.users import resolve_session_token
+
+    user = resolve_session_token(token) if token else None
+    user_id = user["id"] if user else None
+    await connect(ws, user_id=user_id)
     try:
         while True:
             await ws.receive_text()
@@ -584,12 +593,18 @@ async def notify_owner_task(request: Request, x_task_secret: str = Header(..., a
 
 
 @fastapi_app.get("/oauth/start")
-async def oauth_start(token: str | None = Query(default=None)):
-    """Redirect owner to Google consent screen for one-tap Gmail reconnect."""
+async def oauth_start(token: str | None = Query(default=None), s: str | None = Query(default=None)):
+    """Redirect owner or student to Google consent screen for Gmail connect."""
     settings = get_settings()
-    expected = hashlib.sha256(f"oauth:{settings.task_secret}".encode()).hexdigest()[:32]
-    if not token or not hmac.compare_digest(token, expected):
-        raise HTTPException(status_code=403, detail="Invalid OAuth start token")
+    user_id = None
+    if s:
+        ok, user_id = verify_oauth_state(s)
+        if not ok:
+            raise HTTPException(status_code=403, detail="Invalid OAuth state")
+    else:
+        expected = hashlib.sha256(f"oauth:{settings.task_secret}".encode()).hexdigest()[:32]
+        if not token or not hmac.compare_digest(token, expected):
+            raise HTTPException(status_code=403, detail="Invalid OAuth start token")
 
     redirect_uri = settings.gmail_oauth_redirect_uri
     if not redirect_uri:
@@ -597,7 +612,7 @@ async def oauth_start(token: str | None = Query(default=None)):
             status_code=503,
             detail="Set GMAIL_OAUTH_REDIRECT_URI to enable one-tap reconnect",
         )
-    state = create_oauth_state()
+    state = create_oauth_state(user_id)
     params = urlencode(
         {
             "client_id": settings.gmail_client_id,
@@ -634,7 +649,8 @@ async def oauth_callback(
             status_code=400,
         )
 
-    if not verify_oauth_state(state):
+    ok_state, oauth_user_id = verify_oauth_state(state)
+    if not ok_state:
         return HTMLResponse(
             "<h1>Gmail reconnect failed</h1><p>Invalid or expired OAuth state.</p>",
             status_code=403,
@@ -670,8 +686,28 @@ async def oauth_callback(
         )
 
     from gmail_api.auth import store_refresh_token
+    from gmail_api.client import get_gmail_service
 
-    store_refresh_token(refresh_token)
+    store_refresh_token(refresh_token, user_id=oauth_user_id)
+    from gmail_api.auth import reset_gmail_user_context, set_gmail_user_context
+    from services.mailbox_user import reset as reset_mb
+    from services.mailbox_user import set_user as set_mb_user
+    from services.users import get_user_by_id, update_user_fields
+
+    urow = get_user_by_id(oauth_user_id) if oauth_user_id else None
+    if urow:
+        mb = set_mb_user(urow)
+        gt = set_gmail_user_context(oauth_user_id)
+        try:
+            profile = get_gmail_service(oauth_user_id).users().getProfile(userId="me").execute()
+            email = profile.get("emailAddress")
+            if email:
+                update_user_fields(oauth_user_id, {"gmail_address": email})
+        except Exception as exc:
+            logger.warning("Could not fetch Gmail profile after connect: %s", exc)
+        finally:
+            reset_gmail_user_context(gt)
+            reset_mb(mb)
     backfill = await run_gmail_reconnect_backfill(ptb_app.bot)
     logger.info("Gmail reconnected; backfill: %s", backfill)
     return HTMLResponse(

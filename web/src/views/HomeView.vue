@@ -9,6 +9,9 @@ import UrgentAlertCard from '../components/home/UrgentAlertCard.vue'
 import TodayScheduleCard from '../components/home/TodayScheduleCard.vue'
 import ActivityFeed from '../components/home/ActivityFeed.vue'
 
+import { useAuthStore } from '../stores/auth'
+
+const auth = useAuthStore()
 const dashboard = useDashboardStore()
 const router = useRouter()
 const activityItems = computed(() => dashboard.data?.activity?.items || [])
@@ -35,6 +38,15 @@ async function refresh() {
     await dashboard.fetchDashboard()
   } finally {
     refreshing.value = false
+  }
+}
+
+async function connectGmail() {
+  try {
+    const url = await auth.gmailConnectUrl()
+    window.location.href = url
+  } catch {
+    /* dashboard may show error */
   }
 }
 </script>
@@ -64,6 +76,15 @@ async function refresh() {
     >
       <p class="text-caption text-ink-2">{{ dashboard.error }}</p>
       <button type="button" class="text-caption text-accent tappable shrink-0" @click="refresh">Retry</button>
+    </div>
+
+    <div
+      v-if="dashboard.data && dashboard.data.gmail_connected === false"
+      class="card px-4 py-4 flex flex-col gap-2"
+    >
+      <p class="text-body text-ink font-medium">Connect Gmail</p>
+      <p class="text-caption text-ink-2">Link your inbox to track deadlines and send mail from the app.</p>
+      <button type="button" class="btn-primary mt-1" @click="connectGmail">Connect Gmail</button>
     </div>
 
     <!-- Loading skeleton -->

@@ -50,6 +50,8 @@ from services.schedule import (
 )
 from services.reminders import run_scheduled_reminders, schedule_deadline_reminders
 from services.telegram_util import send_html
+from services.mailbox_user import telegram_dm_chat_id as _owner_dm_chat
+from services import mailbox_user
 from services.timeutil import IST, now_ist, parse_iso_deadline
 
 logger = logging.getLogger(__name__)
@@ -204,6 +206,8 @@ async def send_category_alert(
     attachments: list[dict[str, Any]] | None = None,
 ) -> bool:
     settings = get_settings()
+    if not mailbox_user.use_category_groups():
+        return True
     chat_id = _category_group_chat_id(category, settings)
     if not chat_id:
         return True
@@ -325,7 +329,7 @@ def _is_own_sent_mail(details: dict[str, Any], settings: Settings) -> bool:
     if "SENT" in label_ids:
         return True
     _, sender_email = parse_sender(details.get("sender"))
-    owner = (settings.gmail_user or "").strip().lower()
+    owner = mailbox_user.gmail_address(settings).lower()
     return bool(owner and sender_email and sender_email.lower() == owner)
 
 
@@ -534,7 +538,7 @@ async def _process_message(
             ):
                 owner_sent = await send_owner_update(
                     bot,
-                    settings.telegram_owner_chat_id,
+                    _owner_dm_chat(settings),
                     change_text,
                     attachments=attachments if is_actionable else None,
                     pin=False,
@@ -634,7 +638,7 @@ async def _process_message(
             ):
                 owner_sent = await send_owner_update(
                     bot,
-                    settings.telegram_owner_chat_id,
+                    _owner_dm_chat(settings),
                     owner_text,
                     attachments=attachments if is_actionable else None,
                     pin=False,
@@ -695,7 +699,7 @@ async def _process_message(
     ):
         owner_sent = await send_owner_update(
             bot,
-            settings.telegram_owner_chat_id,
+            _owner_dm_chat(settings),
             owner_text,
             pin=False,
         )
@@ -736,7 +740,7 @@ async def _process_message(
         ):
             owner_sent = await send_owner_update(
                 bot,
-                settings.telegram_owner_chat_id,
+                _owner_dm_chat(settings),
                 owner_text,
                 assignment_id=str(assignment_id),
                 attachments=attachments,
@@ -814,7 +818,9 @@ async def _collect_message_ids(
     if not state or not state.get("last_history_id"):
         history_id = await asyncio.to_thread(get_profile_history_id)
         catchup_ids = await asyncio.to_thread(_recent_unprocessed_message_ids)
-        pending = await asyncio.to_thread(list_pending_email_ids)
+        pending = await asyncio.to_thread(
+            list_pending_email_ids, limit=100, user_id=mailbox_user.user_id()
+        )
         merged = list(dict.fromkeys(pending + catchup_ids))
         return merged, history_id, False
 
@@ -831,7 +837,9 @@ async def _collect_message_ids(
             if mid not in seen:
                 message_ids.append(mid)
                 seen.add(mid)
-    for mid in await asyncio.to_thread(list_pending_email_ids):
+    for mid in await asyncio.to_thread(
+        list_pending_email_ids, limit=100, user_id=mailbox_user.user_id()
+    ):
         if mid not in seen:
             message_ids.append(mid)
             seen.add(mid)
@@ -842,21 +850,52 @@ async def _collect_message_ids(
 async def run_gmail_watcher(bot) -> dict:
     """Poll Gmail for new emails, classify, route alerts by category."""
     from google.auth.exceptions import RefreshError
+    from gmail_api.auth import reset_gmail_user_context, set_gmail_user_context
+    from services.users import ensure_owner_user, list_watcher_targets
 
-    try:
-        return await _run_gmail_watcher_inner(bot)
-    except RefreshError as exc:
-        logger.exception("Gmail auth failed during watcher: %s", exc)
-        await notify_gmail_auth_failure(bot)
-        raise
+    ensure_owner_user()
+    targets = list_watcher_targets()
+    if not targets:
+        try:
+            return await _run_gmail_watcher_inner(bot)
+        except RefreshError as exc:
+            logger.exception("Gmail auth failed during watcher: %s", exc)
+            await notify_gmail_auth_failure(bot)
+            raise
+
+    results: list[dict[str, Any]] = []
+    totals = {"processed": 0, "alerts": 0, "notifications": 0}
+    for user in targets:
+        mb_token = mailbox_user.set_user(user)
+        gmail_token = set_gmail_user_context(user["id"])
+        try:
+            try:
+                one = await _run_gmail_watcher_inner(bot)
+            except RefreshError as exc:
+                logger.exception("Gmail auth failed for user %s: %s", user.get("id"), exc)
+                await notify_gmail_auth_failure(bot, user)
+                one = {"status": "auth_failed", "user_id": user["id"]}
+            one = {**one, "user_id": user["id"]}
+            results.append(one)
+            totals["processed"] += int(one.get("processed") or 0)
+            totals["alerts"] += int(one.get("alerts") or 0)
+            totals["notifications"] += int(one.get("notifications") or 0)
+        finally:
+            reset_gmail_user_context(gmail_token)
+            mailbox_user.reset(mb_token)
+
+    if len(results) == 1:
+        return results[0]
+    return {"status": "multi", "users": results, **totals}
 
 
 async def _processed_lookup(message_id: str) -> bool | None:
-    return await asyncio.to_thread(is_email_processed_cached, message_id)
+    uid = mailbox_user.user_id()
+    return await asyncio.to_thread(is_email_processed_cached, message_id, uid)
 
 
 async def _run_gmail_watcher_inner(bot) -> dict:
-    state = await asyncio.to_thread(get_watch_state)
+    state = await asyncio.to_thread(get_watch_state, mailbox_user.user_id())
     now = datetime.now(timezone.utc)
 
     message_ids, latest_or_init, history_failed = await _collect_message_ids(state)
@@ -905,10 +944,13 @@ async def _run_gmail_watcher_inner(bot) -> dict:
                 update_watch_state,
                 last_history_id=history_id,
                 last_checked_at=now,
+                user_id=mailbox_user.user_id(),
             )
             logger.info("Initialized watch state at historyId=%s", history_id)
         else:
-            await asyncio.to_thread(update_watch_state, last_checked_at=now)
+            await asyncio.to_thread(
+                update_watch_state, last_checked_at=now, user_id=mailbox_user.user_id()
+            )
             logger.warning(
                 "Deferred init history advance: %d failed, hit_cap=%s — will retry",
                 failed,
@@ -980,12 +1022,15 @@ async def _run_gmail_watcher_inner(bot) -> dict:
             update_watch_state,
             last_history_id=new_history_id,
             last_checked_at=now,
+            user_id=mailbox_user.user_id(),
         )
         if history_failed:
             logger.info("Re-anchored watch state to fresh historyId=%s after stale 404", new_history_id)
     else:
         new_history_id = start_id
-        await asyncio.to_thread(update_watch_state, last_checked_at=now)
+        await asyncio.to_thread(
+            update_watch_state, last_checked_at=now, user_id=mailbox_user.user_id()
+        )
         if history_failed:
             logger.warning(
                 "Deferred history advance: Gmail history API failed; catch-up will retry next tick"
@@ -1072,10 +1117,10 @@ async def run_due_reminders(bot) -> dict:
             header="⏰ <b>Reminder</b>",
         )
         sent_id = None
-        if settings.telegram_owner_chat_id:
+        if _owner_dm_chat(settings):
             sent_id = await send_actionable_alert(
                 bot,
-                settings.telegram_owner_chat_id,
+                _owner_dm_chat(settings),
                 text,
                 assignment_id=str(assignment_id),
                 pin=is_priority_item(
@@ -1093,10 +1138,10 @@ async def run_due_reminders(bot) -> dict:
     return {"status": "ok", "reminders_sent": sent}
 
 
-_gmail_auth_alert_sent = False
+_gmail_auth_alert_sent: set[str] = set()
 
 
-def _oauth_start_url() -> str | None:
+def _oauth_start_url(user_id: str | None = None) -> str | None:
     settings = get_settings()
     base = (settings.render_url or settings.gmail_oauth_redirect_uri or "").rstrip("/")
     if not base or "your-app" in base:
@@ -1107,53 +1152,70 @@ def _oauth_start_url() -> str | None:
         parsed = urlparse(settings.gmail_oauth_redirect_uri)
         if parsed.scheme and parsed.netloc:
             base = f"{parsed.scheme}://{parsed.netloc}"
+    from services.oauth_state import create_oauth_state
+    from services.user_ids import OWNER_SEED_USER_ID
+
+    if user_id and user_id != OWNER_SEED_USER_ID:
+        state = create_oauth_state(user_id)
+        return f"{base}/oauth/start?s={state}"
     import hashlib
 
     token = hashlib.sha256(f"oauth:{settings.task_secret}".encode()).hexdigest()[:32]
     return f"{base}/oauth/start?token={token}"
 
 
-async def notify_gmail_auth_failure(bot) -> None:
-    """Alert owner once when Gmail refresh token is revoked/expired."""
+async def notify_gmail_auth_failure(bot, user: dict[str, Any] | None = None) -> None:
+    """Alert user once when Gmail refresh token is revoked/expired."""
     global _gmail_auth_alert_sent
-    if _gmail_auth_alert_sent:
-        return
-    settings = get_settings()
-    owner = settings.telegram_owner_chat_id
-    if not owner:
-        return
-
-    now = datetime.now(timezone.utc)
-    await asyncio.to_thread(update_watch_state, gmail_disconnected_at=now)
-
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    text = (
-        "⚠️ <b>Gmail access lost</b>\n\n"
-        "Your refresh token expired or was revoked. Mail watching is paused until you reconnect."
-    )
-    oauth_url = _oauth_start_url()
-    markup = None
-    if oauth_url:
-        markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔗 Reconnect Gmail", url=oauth_url)]]
-        )
-
+    if user:
+        mb_token = mailbox_user.set_user(user)
+    else:
+        mb_token = None
     try:
-        await bot.send_message(
-            chat_id=owner,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=markup,
+        uid = mailbox_user.user_id()
+        if uid in _gmail_auth_alert_sent:
+            return
+        settings = get_settings()
+        chat = _owner_dm_chat(settings)
+        if not chat:
+            return
+
+        now = datetime.now(timezone.utc)
+        await asyncio.to_thread(
+            update_watch_state, gmail_disconnected_at=now, user_id=uid
         )
-        _gmail_auth_alert_sent = True
-    except Exception as exc:
-        logger.warning("Failed to send Gmail auth failure alert: %s", exc)
+
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        text = (
+            "⚠️ <b>Gmail access lost</b>\n\n"
+            "Your refresh token expired or was revoked. Mail watching is paused until you reconnect."
+        )
+        oauth_url = _oauth_start_url(uid)
+        markup = None
+        if oauth_url:
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔗 Reconnect Gmail", url=oauth_url)]]
+            )
+
+        try:
+            await bot.send_message(
+                chat_id=chat,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+            _gmail_auth_alert_sent.add(uid)
+        except Exception as exc:
+            logger.warning("Failed to send Gmail auth failure alert: %s", exc)
+    finally:
+        if mb_token is not None:
+            mailbox_user.reset(mb_token)
 
 
 async def run_gmail_reconnect_backfill(bot) -> dict:
     """After reconnect, scan outage window and alert on missed + future deadlines."""
-    state = await asyncio.to_thread(get_watch_state)
+    state = await asyncio.to_thread(get_watch_state, mailbox_user.user_id())
     if not state or not state.get("gmail_disconnected_at"):
         return {"status": "skipped", "reason": "no_outage"}
 
@@ -1187,7 +1249,7 @@ async def run_gmail_reconnect_backfill(bot) -> dict:
             missed.append(item)
 
     settings = get_settings()
-    if missed and settings.telegram_owner_chat_id:
+    if missed and _owner_dm_chat(settings):
         lines = [
             "⚠️ <b>While Gmail was disconnected, you may have missed:</b>",
             "",
@@ -1199,15 +1261,16 @@ async def run_gmail_reconnect_backfill(bot) -> dict:
             lines.append(f"   Due: {due}")
         if len(missed) > 15:
             lines.append(f"\n…and {len(missed) - 15} more.")
-        await send_html(bot, settings.telegram_owner_chat_id, "\n".join(lines))
+        await send_html(bot, _owner_dm_chat(settings), "\n".join(lines))
 
     await asyncio.to_thread(
         update_watch_state,
         gmail_reconnected_at=datetime.now(timezone.utc),
         clear_gmail_disconnected=True,
+        user_id=mailbox_user.user_id(),
     )
     global _gmail_auth_alert_sent
-    _gmail_auth_alert_sent = False
+    _gmail_auth_alert_sent.discard(mailbox_user.user_id())
     result["missed_deadlines"] = len(missed)
     result["status"] = "reconnected"
     return result

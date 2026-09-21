@@ -1,4 +1,4 @@
-"""Broadcast real-time events to connected web clients."""
+"""Broadcast real-time events to connected web clients (scoped per user when known)."""
 
 from __future__ import annotations
 
@@ -11,26 +11,38 @@ from fastapi import WebSocket
 
 logger = logging.getLogger(__name__)
 
-_connections: set[WebSocket] = set()
+_connections: dict[str, set[WebSocket]] = {}
+_ws_user: dict[WebSocket, str] = {}
 _lock = asyncio.Lock()
 
 
-async def connect(ws: WebSocket) -> None:
+async def connect(ws: WebSocket, user_id: str | None = None) -> None:
     await ws.accept()
+    uid = user_id or "_anonymous"
     async with _lock:
-        _connections.add(ws)
-    await broadcast("sync_status", {"status": "connected"})
+        _connections.setdefault(uid, set()).add(ws)
+        _ws_user[ws] = uid
+    await broadcast("sync_status", {"status": "connected"}, user_id=user_id)
 
 
 async def disconnect(ws: WebSocket) -> None:
     async with _lock:
-        _connections.discard(ws)
+        uid = _ws_user.pop(ws, None)
+        if uid and uid in _connections:
+            _connections[uid].discard(ws)
+            if not _connections[uid]:
+                del _connections[uid]
 
 
-async def broadcast(event: str, payload: dict[str, Any] | None = None) -> None:
+async def broadcast(
+    event: str, payload: dict[str, Any] | None = None, *, user_id: str | None = None
+) -> None:
     message = json.dumps({"event": event, "data": payload or {}})
     async with _lock:
-        targets = list(_connections)
+        if user_id:
+            targets = list(_connections.get(user_id, []))
+        else:
+            targets = [ws for bucket in _connections.values() for ws in bucket]
     if not targets:
         return
     dead: list[WebSocket] = []
@@ -43,13 +55,15 @@ async def broadcast(event: str, payload: dict[str, Any] | None = None) -> None:
     if dead:
         async with _lock:
             for ws in dead:
-                _connections.discard(ws)
+                await disconnect(ws)
 
 
-def broadcast_fire_and_forget(event: str, payload: dict[str, Any] | None = None) -> None:
+def broadcast_fire_and_forget(
+    event: str, payload: dict[str, Any] | None = None, *, user_id: str | None = None
+) -> None:
     """Schedule a broadcast from sync code (e.g. watcher thread)."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(broadcast(event, payload))
+    loop.create_task(broadcast(event, payload, user_id=user_id))

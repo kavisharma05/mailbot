@@ -185,6 +185,18 @@ curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.co
 curl.exe -X POST -H "x-task-secret: <TASK_SECRET>" "https://your-app.onrender.com/tasks/digest-evening?dry_run=1"
 ```
 
+Run `supabase/migration_multi_user.sql` once when enabling multiple students (invite-only accounts, per-user Gmail, web OTP login).
+
+## Multi-user (students)
+
+After `migration_multi_user.sql`:
+
+1. **Invite** — Owner sends `/invite @telegram_username` in Telegram; share the `t.me/...?start=invite_...` link.
+2. **Register** — Student opens the link and taps **Start** in Telegram (creates their account).
+3. **Web login** — Open the web app → enter Telegram username → enter the 6-digit code from Telegram (or use `/login` in the bot).
+4. **Gmail** — In the web app, tap **Connect Gmail** (each student must be added as a Google OAuth **test user** while the consent screen is in Testing mode).
+5. **Alerts** — Students receive actionable mail in their **Telegram DM** only; the owner keeps category groups, WhatsApp, and IMT library features unchanged.
+
 ## Environment variables
 
 | Variable | Description |

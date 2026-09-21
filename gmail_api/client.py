@@ -9,24 +9,26 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from gmail_api.auth import get_credentials
+from gmail_api.auth import active_gmail_user_id, get_credentials
 
 logger = logging.getLogger(__name__)
 
-_gmail_service = None
+_gmail_services: dict[str, Any] = {}
 
 
-def clear_gmail_service_cache() -> None:
-    global _gmail_service
-    _gmail_service = None
+def clear_gmail_service_cache(user_id: str | None = None) -> None:
+    if user_id:
+        _gmail_services.pop(user_id, None)
+    else:
+        _gmail_services.clear()
 
 
-def get_gmail_service():
-    global _gmail_service
-    if _gmail_service is None:
-        creds = get_credentials()
-        _gmail_service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-    return _gmail_service
+def get_gmail_service(user_id: str | None = None):
+    uid = user_id or active_gmail_user_id()
+    if uid not in _gmail_services:
+        creds = get_credentials(uid)
+        _gmail_services[uid] = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return _gmail_services[uid]
 
 
 def get_profile_history_id() -> str:

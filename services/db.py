@@ -10,6 +10,7 @@ from supabase import Client, create_client
 from config import get_settings
 from services.netdns import ensure_host_resolves
 from services.timeutil import item_effective_deadline_dt, now_ist, parse_iso_deadline, resolve_deadline
+from services.user_ids import OWNER_SEED_USER_ID
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,30 @@ DIGEST_LEASE_SECONDS = 900
 T = TypeVar("T")
 
 _db_client: Client | None = None
+_multi_user_schema: bool | None = None
+
+
+def multi_user_schema_ready() -> bool:
+    global _multi_user_schema
+    if _multi_user_schema is not None:
+        return _multi_user_schema
+    try:
+        get_db().table("assignments").select("user_id").limit(1).execute()
+        _multi_user_schema = True
+    except Exception:
+        _multi_user_schema = False
+    return _multi_user_schema
+
+
+def resolve_user_id(user_id: str | None) -> str:
+    return user_id or OWNER_SEED_USER_ID
+
+
+def _eq_user(query, user_id: str | None):
+    if multi_user_schema_ready():
+        return query.eq("user_id", resolve_user_id(user_id))
+    return query
+
 
 _ASSIGNMENT_COLUMNS = (
     "id, source, category, item_type, priority, course_or_topic, task, deadline_text, deadline_date, "
@@ -46,7 +71,10 @@ def check_db_health() -> dict[str, Any]:
     """Lightweight ping for /healthz — does not raise."""
     try:
         db = get_db()
-        result = db.table("watch_state").select("id").eq("id", 1).limit(1).execute()
+        if multi_user_schema_ready():
+            result = db.table("watch_state").select("user_id").limit(1).execute()
+        else:
+            result = db.table("watch_state").select("id").eq("id", 1).limit(1).execute()
         if result.data is None:
             return {"ok": False, "error": "empty response"}
         return {"ok": True}
@@ -83,8 +111,18 @@ def _safe_write(fn: Callable[..., T]) -> Callable[..., T | None]:
 
 
 @_safe_read(None)
-def get_watch_state() -> dict[str, Any] | None:
+def get_watch_state(user_id: str | None = None) -> dict[str, Any] | None:
     db = get_db()
+    uid = resolve_user_id(user_id)
+    if multi_user_schema_ready():
+        result = db.table("watch_state").select("*").eq("user_id", uid).limit(1).execute()
+        rows = result.data or []
+        if rows:
+            return rows[0]
+        db.table("watch_state").insert({"user_id": uid, "id": 1}).execute()
+        result = db.table("watch_state").select("*").eq("user_id", uid).limit(1).execute()
+        rows = result.data or []
+        return rows[0] if rows else None
     result = db.table("watch_state").select("*").eq("id", 1).limit(1).execute()
     rows = result.data or []
     return rows[0] if rows else None
@@ -99,8 +137,10 @@ def update_watch_state(
     gmail_reconnected_at: datetime | None = None,
     last_heartbeat_at: datetime | None = None,
     clear_gmail_disconnected: bool = False,
+    user_id: str | None = None,
 ) -> None:
     db = get_db()
+    uid = resolve_user_id(user_id)
     payload: dict[str, Any] = {}
     if last_history_id is not None:
         payload["last_history_id"] = last_history_id
@@ -114,24 +154,31 @@ def update_watch_state(
         payload["last_heartbeat_at"] = last_heartbeat_at.isoformat()
     if clear_gmail_disconnected:
         payload["gmail_disconnected_at"] = None
-    if payload:
+    if not payload:
+        return
+    if multi_user_schema_ready():
+        existing = db.table("watch_state").select("user_id").eq("user_id", uid).limit(1).execute()
+        if not (existing.data or []):
+            db.table("watch_state").insert({"user_id": uid, "id": 1, **payload}).execute()
+        else:
+            db.table("watch_state").update(payload).eq("user_id", uid).execute()
+    else:
         db.table("watch_state").update(payload).eq("id", 1).execute()
 
 
-def _is_email_processed_db(message_id: str) -> bool:
-    # Intentionally NOT wrapped in _safe_read: callers must be able to tell a
-    # genuine "not processed" (False) apart from a DB read failure (raises ->
-    # is_email_processed returns None). Swallowing errors to False here causes
-    # already-alerted mail to be treated as new and re-alerted every tick.
+def _is_email_processed_db(message_id: str, user_id: str | None = None) -> bool:
     db = get_db()
-    result = db.table("processed_emails").select("message_id").eq("message_id", message_id).limit(1).execute()
+    query = db.table("processed_emails").select("message_id").eq("message_id", message_id)
+    if multi_user_schema_ready():
+        query = query.eq("user_id", resolve_user_id(user_id))
+    result = query.limit(1).execute()
     return bool(result.data)
 
 
-def is_email_processed(message_id: str) -> bool | None:
+def is_email_processed(message_id: str, user_id: str | None = None) -> bool | None:
     """Return True/False when known; None when DB lookup failed (unknown)."""
     try:
-        return _is_email_processed_db(message_id)
+        return _is_email_processed_db(message_id, user_id=user_id)
     except Exception as exc:
         logger.exception("is_email_processed failed for %s: %s", message_id, exc)
         return None
@@ -155,29 +202,31 @@ def _prune_processed_cache(now: float | None = None) -> None:
         _processed_cache.pop(next(iter(_processed_cache)))
 
 
-def is_email_processed_cached(message_id: str) -> bool | None:
+def is_email_processed_cached(message_id: str, user_id: str | None = None) -> bool | None:
     import time
 
     now = time.time()
+    cache_key = f"{resolve_user_id(user_id)}:{message_id}"
     _prune_processed_cache(now)
-    cached = _processed_cache.get(message_id)
+    cached = _processed_cache.get(cache_key)
     if cached and cached > now:
         return True
-    db_result = is_email_processed(message_id)
+    db_result = is_email_processed(message_id, user_id=user_id)
     if db_result is None:
         return None
     if db_result:
-        _processed_cache[message_id] = now + _PROCESSED_CACHE_TTL
+        _processed_cache[cache_key] = now + _PROCESSED_CACHE_TTL
         _prune_processed_cache(now)
         return True
     return False
 
 
-def cache_email_processed(message_id: str) -> None:
+def cache_email_processed(message_id: str, user_id: str | None = None) -> None:
     import time
 
     now = time.time()
-    _processed_cache[message_id] = now + _PROCESSED_CACHE_TTL
+    cache_key = f"{resolve_user_id(user_id)}:{message_id}"
+    _processed_cache[cache_key] = now + _PROCESSED_CACHE_TTL
     _prune_processed_cache(now)
 
 
@@ -188,20 +237,21 @@ def mark_email_processed(
     assignment_id: str | None = None,
     *,
     delivery_failed: bool = False,
+    user_id: str | None = None,
 ) -> bool:
     try:
         db = get_db()
-        db.table("processed_emails").upsert(
-            {
-                "message_id": message_id,
-                "is_actionable": is_actionable,
-                "confidence": "delivery_failed" if delivery_failed else confidence,
-                "assignment_id": assignment_id,
-                "processed_at": datetime.now(timezone.utc).isoformat(),
-            },
-            on_conflict="message_id",
-        ).execute()
-        cache_email_processed(message_id)
+        row: dict[str, Any] = {
+            "message_id": message_id,
+            "is_actionable": is_actionable,
+            "confidence": "delivery_failed" if delivery_failed else confidence,
+            "assignment_id": assignment_id,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if multi_user_schema_ready():
+            row["user_id"] = resolve_user_id(user_id)
+        db.table("processed_emails").upsert(row, on_conflict="message_id").execute()
+        cache_email_processed(message_id, user_id=user_id)
         return True
     except Exception as exc:
         logger.exception("mark_email_processed failed for %s: %s", message_id, exc)
@@ -209,24 +259,27 @@ def mark_email_processed(
 
 
 @_safe_read(None)
-def find_open_assignment_for_message(message_id: str) -> dict[str, Any] | None:
+def find_open_assignment_for_message(message_id: str, user_id: str | None = None) -> dict[str, Any] | None:
     db = get_db()
-    result = (
+    query = (
         db.table("assignments")
         .select(_ASSIGNMENT_COLUMNS)
         .eq("gmail_message_id", message_id)
         .eq("status", "open")
-        .limit(1)
-        .execute()
     )
+    query = _eq_user(query, user_id)
+    result = query.limit(1).execute()
     rows = result.data or []
     return rows[0] if rows else None
 
 
-def insert_assignment(data: dict[str, Any]) -> dict[str, Any] | None:
+def insert_assignment(data: dict[str, Any], user_id: str | None = None) -> dict[str, Any] | None:
     message_id = data.get("gmail_message_id")
+    uid = resolve_user_id(user_id)
+    if multi_user_schema_ready() and "user_id" not in data:
+        data = {**data, "user_id": uid}
     if message_id:
-        existing = find_open_assignment_for_message(str(message_id))
+        existing = find_open_assignment_for_message(str(message_id), user_id=uid)
         if existing:
             logger.info("Deduped assignment for message %s -> %s", message_id, existing["id"])
             return existing
@@ -259,7 +312,9 @@ def insert_assignment(data: dict[str, Any]) -> dict[str, Any] | None:
 
 
 @_safe_read([])
-def get_open_assignments(category: str | None = None, limit: int = 40) -> list[dict[str, Any]]:
+def get_open_assignments(
+    category: str | None = None, limit: int = 40, user_id: str | None = None
+) -> list[dict[str, Any]]:
     db = get_db()
     query = (
         db.table("assignments")
@@ -268,6 +323,7 @@ def get_open_assignments(category: str | None = None, limit: int = 40) -> list[d
         .order("deadline_date")
         .limit(limit)
     )
+    query = _eq_user(query, user_id)
     if category:
         query = query.eq("category", category)
     result = query.execute()
@@ -301,9 +357,10 @@ def get_upcoming_assignments(
     limit: int = 40,
     *,
     now: datetime | None = None,
+    user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Open assignments whose effective deadline is now or later."""
-    items = get_open_assignments(category=category, limit=200)
+    items = get_open_assignments(category=category, limit=200, user_id=user_id)
     return _filter_assignments_by_deadline(items, upcoming=True, now=now)[:limit]
 
 
@@ -313,9 +370,10 @@ def get_missed_assignments(
     limit: int = 40,
     *,
     now: datetime | None = None,
+    user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Open assignments whose effective deadline has passed."""
-    items = get_open_assignments(category=category, limit=200)
+    items = get_open_assignments(category=category, limit=200, user_id=user_id)
     return _filter_assignments_by_deadline(items, upcoming=False, now=now)[:limit]
 
 
@@ -325,9 +383,10 @@ def get_undated_assignments(
     limit: int = 40,
     *,
     now: datetime | None = None,
+    user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Open assignments with no resolvable effective deadline."""
-    items = get_open_assignments(category=category, limit=200)
+    items = get_open_assignments(category=category, limit=200, user_id=user_id)
     matched = [i for i in items if item_effective_deadline_dt(i) is None]
     matched.sort(key=lambda i: str(i.get("created_at") or ""), reverse=True)
     return matched[:limit]
@@ -340,6 +399,7 @@ def create_manual_assignment(
     deadline_text: str | None = None,
     category: str = "other",
     course_or_topic: str | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Insert a self-created open assignment (source=manual)."""
     from services.formatting import normalize_category
@@ -366,7 +426,7 @@ def create_manual_assignment(
         "deadline_text": deadline_raw or None,
         "deadline_date": deadline_iso,
     }
-    return insert_assignment(data)
+    return insert_assignment(data, user_id=user_id)
 
 
 @_safe_write
@@ -408,7 +468,9 @@ def update_assignment(assignment_id: str, fields: dict[str, Any]) -> dict[str, A
 
 
 @_safe_read([])
-def get_assignments_for_qa(category: str | None = None, limit: int = 60) -> list[dict[str, Any]]:
+def get_assignments_for_qa(
+    category: str | None = None, limit: int = 60, user_id: str | None = None
+) -> list[dict[str, Any]]:
     """Recent tracked items for Q&A — open first, includes recently created items."""
     db = get_db()
     query = (
@@ -417,6 +479,7 @@ def get_assignments_for_qa(category: str | None = None, limit: int = 60) -> list
         .order("deadline_date")
         .limit(limit)
     )
+    query = _eq_user(query, user_id)
     if category:
         query = query.eq("category", category)
     result = query.execute()
@@ -436,9 +499,11 @@ def _deadline_on_local_day(item: dict[str, Any], day: date, tz) -> bool:
 
 
 @_safe_read([])
-def get_assignments_due_on(day: date, tz, category: str | None = None) -> list[dict[str, Any]]:
+def get_assignments_due_on(
+    day: date, tz, category: str | None = None, user_id: str | None = None
+) -> list[dict[str, Any]]:
     """Open assignments whose deadline_date falls on the given local calendar day."""
-    items = get_open_assignments(category=category, limit=200)
+    items = get_open_assignments(category=category, limit=200, user_id=user_id)
     return [i for i in items if _deadline_on_local_day(i, day, tz)]
 
 
@@ -448,9 +513,10 @@ def get_assignments_due_between(
     end_day: date,
     tz,
     category: str | None = None,
+    user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Open assignments with deadline_date on any day from start_day through end_day (inclusive)."""
-    items = get_open_assignments(category=category, limit=200)
+    items = get_open_assignments(category=category, limit=200, user_id=user_id)
     matched: list[dict[str, Any]] = []
     for item in items:
         dt = item_effective_deadline_dt(item)
@@ -463,7 +529,9 @@ def get_assignments_due_between(
 
 
 @_safe_read([])
-def get_recent_assignments(since: datetime, category: str | None = None) -> list[dict[str, Any]]:
+def get_recent_assignments(
+    since: datetime, category: str | None = None, user_id: str | None = None
+) -> list[dict[str, Any]]:
     """Assignments created since `since` (typically last 18h for morning digest)."""
     db = get_db()
     query = (
@@ -473,6 +541,7 @@ def get_recent_assignments(since: datetime, category: str | None = None) -> list
         .order("created_at", desc=True)
         .limit(50)
     )
+    query = _eq_user(query, user_id)
     if category:
         query = query.eq("category", category)
     result = query.execute()
@@ -526,10 +595,12 @@ def schedule_assignment_reminder(assignment_id: str, remind_at: datetime) -> dic
 
 
 @_safe_read([])
-def get_assignments_due_reminder(before: datetime | None = None, limit: int = 20) -> list[dict[str, Any]]:
+def get_assignments_due_reminder(
+    before: datetime | None = None, limit: int = 20, user_id: str | None = None
+) -> list[dict[str, Any]]:
     db = get_db()
     cutoff = (before or datetime.now(timezone.utc)).isoformat()
-    result = (
+    query = (
         db.table("assignments")
         .select(_ASSIGNMENT_COLUMNS)
         .eq("status", "open")
@@ -537,8 +608,9 @@ def get_assignments_due_reminder(before: datetime | None = None, limit: int = 20
         .lte("remind_at", cutoff)
         .order("remind_at")
         .limit(limit)
-        .execute()
     )
+    query = _eq_user(query, user_id)
+    result = query.execute()
     return result.data or []
 
 
@@ -611,16 +683,18 @@ def enqueue_pending_email(
     classified_result: dict[str, Any] | None = None,
     already_alerted: bool = False,
     delivered_channels: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> None:
+    uid = resolve_user_id(user_id)
+
     def _enqueue() -> None:
         db = get_db()
-        existing = (
-            db.table("pending_emails")
-            .select(_pending_email_select_columns())
-            .eq("message_id", message_id)
-            .limit(1)
-            .execute()
+        query = db.table("pending_emails").select(_pending_email_select_columns()).eq(
+            "message_id", message_id
         )
+        if multi_user_schema_ready():
+            query = query.eq("user_id", uid)
+        existing = query.limit(1).execute()
         rows = existing.data or []
         if rows and rows[0].get("dead_letter"):
             logger.warning("Skipping enqueue for dead-letter pending email %s", message_id)
@@ -652,7 +726,10 @@ def enqueue_pending_email(
                     message_id,
                     MAX_PENDING_EMAIL_ATTEMPTS,
                 )
-            db.table("pending_emails").update(payload).eq("message_id", message_id).execute()
+            upd = db.table("pending_emails").update(payload).eq("message_id", message_id)
+            if multi_user_schema_ready():
+                upd = upd.eq("user_id", uid)
+            upd.execute()
         else:
             insert_payload: dict[str, Any] = {
                 "message_id": message_id,
@@ -660,6 +737,8 @@ def enqueue_pending_email(
                 "last_error": error,
                 "dead_letter": False,
             }
+            if multi_user_schema_ready():
+                insert_payload["user_id"] = uid
             if can_classified:
                 insert_payload["classified_result"] = classified_result
             if can_already:
@@ -683,16 +762,17 @@ def dequeue_pending_email(message_id: str) -> None:
 
 
 @_safe_read([])
-def list_pending_email_ids(limit: int = 100) -> list[str]:
+def list_pending_email_ids(limit: int = 100, user_id: str | None = None) -> list[str]:
     db = get_db()
-    result = (
+    query = (
         db.table("pending_emails")
         .select("message_id, attempts, dead_letter")
         .eq("dead_letter", False)
         .order("updated_at")
         .limit(limit)
-        .execute()
     )
+    query = _eq_user(query, user_id)
+    result = query.execute()
     out: list[str] = []
     for row in result.data or []:
         mid = row.get("message_id")
@@ -858,7 +938,12 @@ def get_class_sessions_for_message(gmail_message_id: str) -> list[dict[str, Any]
 
 
 @_safe_read(None)
-def get_preferred_section() -> str | None:
+def get_preferred_section(user_id: str | None = None) -> str | None:
+    uid = resolve_user_id(user_id)
+    if multi_user_schema_ready():
+        result = get_db().table("users").select("preferred_section").eq("id", uid).execute()
+        if result.data:
+            return result.data[0].get("preferred_section")
     result = get_db().table("user_prefs").select("preferred_section").eq("id", 1).execute()
     if result.data:
         return result.data[0].get("preferred_section")
@@ -866,21 +951,34 @@ def get_preferred_section() -> str | None:
 
 
 @_safe_write
-def set_preferred_section(section: str) -> None:
+def set_preferred_section(section: str, user_id: str | None = None) -> None:
+    sec = section.strip().upper()[:1]
+    uid = resolve_user_id(user_id)
+    now = datetime.now(timezone.utc).isoformat()
+    if multi_user_schema_ready():
+        get_db().table("users").update(
+            {"preferred_section": sec, "updated_at": now}
+        ).eq("id", uid).execute()
     get_db().table("user_prefs").upsert(
         {
             "id": 1,
-            "preferred_section": section.strip().upper()[:1],
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "preferred_section": sec,
+            "updated_at": now,
         }
     ).execute()
 
 
 @_safe_write
-def upsert_contact(email: str, display_name: str | None, name_key: str) -> None:
+def upsert_contact(
+    email: str, display_name: str | None, name_key: str, user_id: str | None = None
+) -> None:
     db = get_db()
+    uid = resolve_user_id(user_id)
     now = datetime.now(timezone.utc).isoformat()
-    existing = db.table("contacts").select("id, message_count").eq("email", email).limit(1).execute()
+    query = db.table("contacts").select("id, message_count").eq("email", email)
+    if multi_user_schema_ready():
+        query = query.eq("user_id", uid)
+    existing = query.limit(1).execute()
     rows = existing.data or []
     if rows:
         count = int(rows[0].get("message_count") or 0) + 1
@@ -900,12 +998,13 @@ def upsert_contact(email: str, display_name: str | None, name_key: str) -> None:
             "name_key": name_key or "",
             "message_count": 1,
             "last_seen_at": now,
+            **({"user_id": uid} if multi_user_schema_ready() else {}),
         }
     ).execute()
 
 
 @_safe_read([])
-def find_contacts_by_name(token: str, limit: int = 20) -> list[dict[str, Any]]:
+def find_contacts_by_name(token: str, limit: int = 20, user_id: str | None = None) -> list[dict[str, Any]]:
     """Find contacts whose name_key/display_name contains the token."""
     if not token or len(token) < 2:
         return []
@@ -917,8 +1016,10 @@ def find_contacts_by_name(token: str, limit: int = 20) -> list[dict[str, Any]]:
         .or_(f"name_key.ilike.%{needle}%,display_name.ilike.%{needle}%,email.ilike.%{needle}%")
         .order("message_count", desc=True)
         .limit(limit)
-        .execute()
     )
+    if multi_user_schema_ready():
+        result = result.eq("user_id", resolve_user_id(user_id))
+    result = result.execute()
     return result.data or []
 
 
@@ -934,16 +1035,25 @@ def _digest_column(kind: str) -> str:
     return "last_morning" if kind == "morning" else "last_evening"
 
 
-def _digest_claim_key(kind: str, day: date) -> str:
+def _digest_claim_key(kind: str, day: date, user_id: str | None = None) -> str:
+    uid = resolve_user_id(user_id)
+    if multi_user_schema_ready():
+        return f"digest:{uid}:{kind}:{day.isoformat()}"
     return f"digest:{kind}:{day.isoformat()}"
 
 
-def digest_already_sent_today(kind: str, today: date) -> bool:
-    state = get_digest_state() or {}
+def digest_already_sent_today(kind: str, today: date, user_id: str | None = None) -> bool:
+    state = get_digest_state(user_id=user_id) or {}
     return state.get(_digest_column(kind)) == today
 
 
-def acquire_digest_lease(kind: str, sent_on: date | None = None, *, ttl_seconds: int = DIGEST_LEASE_SECONDS) -> bool:
+def acquire_digest_lease(
+    kind: str,
+    sent_on: date | None = None,
+    *,
+    ttl_seconds: int = DIGEST_LEASE_SECONDS,
+    user_id: str | None = None,
+) -> bool:
     """Acquire a short-lived send lease; prevents double-send while allowing retry after failure."""
     global _delivery_claims_table_missing
     if kind not in ("morning", "evening"):
@@ -952,10 +1062,10 @@ def acquire_digest_lease(kind: str, sent_on: date | None = None, *, ttl_seconds:
     import time
 
     day = sent_on or datetime.now(ZoneInfo("Asia/Kolkata")).date()
-    if digest_already_sent_today(kind, day):
+    if digest_already_sent_today(kind, day, user_id=user_id):
         return False
 
-    claim_key = _digest_claim_key(kind, day)
+    claim_key = _digest_claim_key(kind, day, user_id=user_id)
     now_mono = time.monotonic()
     expires_mono = now_mono + ttl_seconds
     now_utc = datetime.now(timezone.utc)
@@ -1024,12 +1134,12 @@ def acquire_digest_lease(kind: str, sent_on: date | None = None, *, ttl_seconds:
         return False
 
 
-def release_digest_lease(kind: str, sent_on: date | None = None) -> None:
+def release_digest_lease(kind: str, sent_on: date | None = None, user_id: str | None = None) -> None:
     global _delivery_claims_table_missing
     if kind not in ("morning", "evening"):
         return
     day = sent_on or datetime.now(ZoneInfo("Asia/Kolkata")).date()
-    claim_key = _digest_claim_key(kind, day)
+    claim_key = _digest_claim_key(kind, day, user_id=user_id)
     _digest_leases_fallback.pop(claim_key, None)
     if _delivery_claims_table_missing:
         return
@@ -1044,24 +1154,34 @@ def release_digest_lease(kind: str, sent_on: date | None = None) -> None:
             logger.exception("release_digest_lease failed for %s: %s", kind, exc)
 
 
-def claim_digest(kind: str, sent_on: date | None = None) -> bool:
+def claim_digest(kind: str, sent_on: date | None = None, user_id: str | None = None) -> bool:
     """Backward-compatible alias for tests — prefer acquire_digest_lease()."""
-    return acquire_digest_lease(kind, sent_on)
+    return acquire_digest_lease(kind, sent_on, user_id=user_id)
 
 
-def get_digest_state() -> dict[str, date | None]:
+def get_digest_state(user_id: str | None = None) -> dict[str, date | None]:
     global _digest_state_table_missing
     if _digest_state_table_missing:
         return dict(_digest_state_fallback)
     try:
         db = get_db()
-        result = (
-            db.table("digest_state")
-            .select("last_morning, last_evening")
-            .eq("id", 1)
-            .limit(1)
-            .execute()
-        )
+        uid = resolve_user_id(user_id)
+        if multi_user_schema_ready():
+            result = (
+                db.table("digest_state")
+                .select("last_morning, last_evening")
+                .eq("user_id", uid)
+                .limit(1)
+                .execute()
+            )
+        else:
+            result = (
+                db.table("digest_state")
+                .select("last_morning, last_evening")
+                .eq("id", 1)
+                .limit(1)
+                .execute()
+            )
     except Exception as exc:
         err = str(exc).lower()
         if "digest_state" in err or "does not exist" in err or "42p01" in err:
@@ -1092,14 +1212,14 @@ def get_digest_state() -> dict[str, date | None]:
     }
 
 
-def mark_digest_sent(kind: str, sent_on: date | None = None) -> None:
+def mark_digest_sent(kind: str, sent_on: date | None = None, user_id: str | None = None) -> None:
     """Record that morning or evening digest was sent on sent_on (IST calendar day)."""
     global _digest_state_table_missing, _delivery_claims_table_missing
     if kind not in ("morning", "evening"):
         return
     day = sent_on or datetime.now(ZoneInfo("Asia/Kolkata")).date()
     column = _digest_column(kind)
-    claim_key = _digest_claim_key(kind, day)
+    claim_key = _digest_claim_key(kind, day, user_id=user_id)
     _digest_state_fallback[column] = day
     _digest_leases_fallback.pop(claim_key, None)
 
@@ -1120,9 +1240,18 @@ def mark_digest_sent(kind: str, sent_on: date | None = None) -> None:
         return
     try:
         db = get_db()
-        db.table("digest_state").update(
-            {column: day.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}
-        ).eq("id", 1).execute()
+        uid = resolve_user_id(user_id)
+        if multi_user_schema_ready():
+            existing = db.table("digest_state").select("user_id").eq("user_id", uid).limit(1).execute()
+            if not (existing.data or []):
+                db.table("digest_state").insert({"user_id": uid, "id": 1}).execute()
+            db.table("digest_state").update(
+                {column: day.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("user_id", uid).execute()
+        else:
+            db.table("digest_state").update(
+                {column: day.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("id", 1).execute()
     except Exception as exc:
         err = str(exc).lower()
         if "digest_state" in err or "does not exist" in err or "42p01" in err:
@@ -1370,20 +1499,31 @@ _oauth_tokens_table_missing = False
 
 
 @_safe_read(None)
-def get_stored_refresh_token(provider: str = "gmail") -> str | None:
+def get_stored_refresh_token(provider: str = "gmail", user_id: str | None = None) -> str | None:
     global _oauth_tokens_table_missing
     if _oauth_tokens_table_missing:
         return None
+    uid = resolve_user_id(user_id)
     try:
         db = get_db()
-        result = (
-            db.table("oauth_tokens")
-            .select("refresh_token")
-            .eq("id", 1)
-            .eq("provider", provider)
-            .limit(1)
-            .execute()
-        )
+        if multi_user_schema_ready():
+            result = (
+                db.table("oauth_tokens")
+                .select("refresh_token")
+                .eq("user_id", uid)
+                .eq("provider", provider)
+                .limit(1)
+                .execute()
+            )
+        else:
+            result = (
+                db.table("oauth_tokens")
+                .select("refresh_token")
+                .eq("id", 1)
+                .eq("provider", provider)
+                .limit(1)
+                .execute()
+            )
         rows = result.data or []
         if rows and rows[0].get("refresh_token"):
             return str(rows[0]["refresh_token"])
@@ -1399,21 +1539,27 @@ def get_stored_refresh_token(provider: str = "gmail") -> str | None:
 
 
 @_safe_write
-def persist_refresh_token(refresh_token: str, provider: str = "gmail") -> None:
+def persist_refresh_token(
+    refresh_token: str, provider: str = "gmail", user_id: str | None = None
+) -> None:
     global _oauth_tokens_table_missing
     if _oauth_tokens_table_missing:
         return
+    uid = resolve_user_id(user_id)
     try:
         db = get_db()
-        db.table("oauth_tokens").upsert(
-            {
-                "id": 1,
-                "provider": provider,
-                "refresh_token": refresh_token,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-            on_conflict="id",
-        ).execute()
+        row: dict[str, Any] = {
+            "provider": provider,
+            "refresh_token": refresh_token,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if multi_user_schema_ready():
+            row["user_id"] = uid
+            row["id"] = 1
+            db.table("oauth_tokens").upsert(row, on_conflict="user_id,provider").execute()
+        else:
+            row["id"] = 1
+            db.table("oauth_tokens").upsert(row, on_conflict="id").execute()
     except Exception as exc:
         err = str(exc).lower()
         if "oauth_tokens" in err or "does not exist" in err or "42p01" in err:
