@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -184,9 +185,12 @@ def _curl_get(url: str) -> str | None:
 
 def fetch_ft_headlines(*, limit: int = 8) -> list[PublicationItem]:
     html = _curl_get(FT_HOME)
-    if html and "/content/" not in html:
-        # Bot-wall interstitial or markup drift — retry once before giving up.
-        logger.info("FT homepage returned no content links; retrying once")
+    for attempt in range(2):
+        if html and "/content/" in html:
+            break
+        # Bot-wall interstitial, block page, or markup drift — retry briefly.
+        logger.info("FT homepage unusable (attempt %d); retrying", attempt + 1)
+        time.sleep(2)
         html = _curl_get(FT_HOME)
     if not html:
         return []
