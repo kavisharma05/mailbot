@@ -142,8 +142,7 @@ def daily(dry_run: bool, force: bool) -> None:
 
     console.print(
         f"[green][OK] Daily job done[/green] - EPW {result.get('epw_articles')} articles, "
-        f"FT {result.get('ft_headlines')}, ET Prime {result.get('et_prime_stories')}, "
-        f"PDFs {result.get('pdfs')}"
+        f"FT {result.get('ft_headlines')}, ET Prime {result.get('et_prime_stories')}"
     )
     if dry_run and result.get("preview"):
         console.print("\n[bold]Preview:[/bold]\n")

@@ -104,7 +104,6 @@ class Settings(BaseSettings):
     mapmyaccess_password: str = ""
     mapmyaccess_base_url: str = "https://imtnagpur.mapmyaccess.com"
     imt_daily_enabled: bool = True
-    imt_epw_pdf_count: int = 2
     imt_llm_summaries: bool = True
     imt_headlines_per_source: int = 8
 

@@ -71,13 +71,6 @@ class EpwIssue:
         return out
 
 
-@dataclass
-class PdfAttachment:
-    filename: str
-    data: bytes
-    caption: str
-
-
 def _parse_issue_date(label: str) -> date | None:
     match = _ISSUE_LABEL_RE.search(label)
     if not match:
@@ -173,57 +166,6 @@ def fetch_epw_current_issue(portal: PortalClient) -> EpwIssue | None:
         logger.warning("EPW issue page %s parsed with no articles", issue_path)
         return None
     return issue
-
-
-def find_epw_pdf_path(portal: PortalClient, article_url: str) -> str | None:
-    """Locate the 'Download PDF Version' link on an EPW article page."""
-    path = article_url[len(EPW_PROXY_BASE):] if article_url.startswith(EPW_PROXY_BASE) else article_url
-    resp = portal.epw_get(path)
-    if resp.status_code != 200:
-        return None
-    soup = BeautifulSoup(resp.text, "lxml")
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/system/files/pdf/" in href and href.lower().endswith(".pdf"):
-            return href
-    return None
-
-
-def download_epw_pdfs(
-    portal: PortalClient, issue: EpwIssue, *, max_pdfs: int
-) -> list[PdfAttachment]:
-    """Best-effort: grab PDFs for the first few articles of the issue."""
-    attachments: list[PdfAttachment] = []
-    if max_pdfs <= 0:
-        return attachments
-    # Prefer substantive sections over editorials for PDFs.
-    preferred_order = sorted(
-        issue.sections.items(),
-        key=lambda kv: 0 if kv[0].lower() in ("special articles", "insight") else 1,
-    )
-    candidates: list[PublicationItem] = []
-    for _section, items in preferred_order:
-        candidates.extend(items)
-
-    for item in candidates:
-        if len(attachments) >= max_pdfs:
-            break
-        try:
-            pdf_path = find_epw_pdf_path(portal, item.url)
-            if not pdf_path:
-                continue
-            data = portal.epw_download_pdf(pdf_path)
-            slug = pdf_path.rsplit("/", 1)[-1] or "epw-article.pdf"
-            attachments.append(
-                PdfAttachment(
-                    filename=slug,
-                    data=data,
-                    caption=item.title[:900],
-                )
-            )
-        except Exception as exc:
-            logger.info("EPW PDF attempt failed for %s: %s", item.url, exc)
-    return attachments
 
 
 def _curl_get(url: str) -> str | None:

@@ -38,8 +38,6 @@ class IMTSettings:
     mapmyaccess_password: str = ""
     mapmyaccess_base_url: str = "https://imtnagpur.mapmyaccess.com"
     imt_daily_enabled: bool = True
-    # Max EPW article PDFs to attach to the daily digest (0 = skip PDF attempt)
-    imt_epw_pdf_count: int = 2
     # Add a short LLM-written intro to the daily digest when a provider is up
     imt_llm_summaries: bool = True
     # Max headlines per source in the daily digest
@@ -101,7 +99,6 @@ def get_imt_settings() -> IMTSettings:
             os.environ.get("MAPMYACCESS_BASE_URL") or "https://imtnagpur.mapmyaccess.com"
         ).strip().rstrip("/"),
         imt_daily_enabled=_bool("IMT_DAILY_ENABLED", True),
-        imt_epw_pdf_count=_int("IMT_EPW_PDF_COUNT", 2),
         imt_llm_summaries=_bool("IMT_LLM_SUMMARIES", True),
         imt_headlines_per_source=_int("IMT_HEADLINES_PER_SOURCE", 8),
         imt_session_refresh_margin=_int("IMT_SESSION_REFRESH_MARGIN", 3600),

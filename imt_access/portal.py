@@ -322,18 +322,6 @@ class PortalClient:
             resp = self.get(url)
         return resp
 
-    def epw_download_pdf(self, path: str, *, max_bytes: int = 15 * 1024 * 1024) -> bytes:
-        resp = self.epw_get(path)
-        if resp.status_code != 200:
-            raise PortalError(f"EPW PDF {path} returned {resp.status_code}")
-        content = resp.content
-        if len(content) > max_bytes:
-            raise PortalError(f"EPW PDF {path} too large ({len(content)} bytes)")
-        if not content.startswith(b"%PDF"):
-            raise PortalError(f"EPW PDF {path} did not return a PDF document")
-        return content
-
-
 def health_check() -> dict[str, Any]:
     """Config + login + catalog reachability, for CLI `health` and /healthz."""
     settings = get_imt_settings()

@@ -5,7 +5,6 @@ No email is ever sent — Gmail is only used to READ OTP codes as a fallback.
 
 from __future__ import annotations
 
-import io
 import logging
 from datetime import date, datetime
 from typing import Any
@@ -17,7 +16,7 @@ from services.messaging.whatsapp import get_whatsapp_client
 from services.telegram_util import send_html_detailed
 
 from imt_access.catalog import Resource
-from imt_access.publications import EpwIssue, PdfAttachment, PublicationItem
+from imt_access.publications import EpwIssue, PublicationItem
 from imt_access.stories import KIND_LABELS
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -66,7 +65,7 @@ def build_digest_messages(
     if intro:
         intro_lines.append(f"<i>{escape_html(intro.strip())}</i>")
         intro_lines.append("")
-    intro_lines.append("Today's stories follow in the next message — reply with any number for the full brief.")
+    intro_lines.append("Today's stories follow — tap a number (or reply with it) for a detailed brief.")
 
     # --- message 2: numbered story list ---
     story_lines: list[str] = ["<b>🗞 Today's stories</b>", ""]
@@ -92,20 +91,7 @@ def build_digest_messages(
                 f'{n}. <a href="{escape_html(item.url)}">{escape_html(item.title)}</a>'
             )
         story_lines.append("")
-    story_lines.append("<i>Reply with a number (e.g. 7) or /story 7 for the full brief.</i>")
-
-    # --- featured picks: one-tap buttons for the day's most useful reads ---
-    featured: list[int] = []
-    if epw_issue and epw_issue.items:
-        special = next(
-            (it for it in epw_issue.items if it.section.lower() == "special articles"),
-            epw_issue.items[0],
-        )
-        featured.append(items.index(special) + 1)
-    if ft_items:
-        featured.append(items.index(ft_items[0]) + 1)
-    if et_items:
-        featured.append(items.index(et_items[0]) + 1)
+    story_lines.append("<i>Which one do you want to read? Tap a number below 👇</i>")
 
     # --- optional message 3: new resources ---
     new_res_text: str | None = None
@@ -117,7 +103,6 @@ def build_digest_messages(
         "stories": "\n".join(story_lines).strip(),
         "new_resources": new_res_text,
         "items": items,
-        "featured": featured,
     }
 
 
@@ -130,20 +115,71 @@ def format_new_resources_alert(new_resources: list[Resource]) -> str:
     return "\n".join(lines)
 
 
-def _featured_keyboard(featured: list[int], items: list[PublicationItem]):
-    """One-tap brief buttons for the day's featured stories (Telegram inline;
-    auto-converts to WhatsApp reply buttons in send_text)."""
-    if not featured:
+def _stories_keyboard(items: list[PublicationItem]):
+    """Compact number grid — tap any story number to get its detailed brief."""
+    if not items:
         return None
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    buttons = []
-    for n in featured[:3]:
-        item = items[n - 1] if 0 < n <= len(items) else None
-        kind = str(getattr(item, "kind", "") or "")
-        label = KIND_LABELS.get(kind, "Story")
-        buttons.append(InlineKeyboardButton(f"⭐ #{n} {label}", callback_data=f"story:{n}"))
-    return InlineKeyboardMarkup([buttons]) if buttons else None
+    buttons = [
+        InlineKeyboardButton(str(i), callback_data=f"story:{i}")
+        for i in range(1, len(items) + 1)
+    ]
+    rows = [buttons[i : i + 6] for i in range(0, len(buttons), 6)]
+    return InlineKeyboardMarkup(rows)
+
+
+def _whatsapp_story_picker(items: list[PublicationItem]) -> dict[str, Any] | None:
+    """Interactive 'Read a story' list message, sectioned by source.
+
+    Rows carry story:<n> ids, which the WhatsApp router already dispatches to
+    the story-brief handler. Kept separate from send_text because the markup
+    converter caps lists at a single 10-row section.
+    """
+    if not items:
+        return None
+
+    sections: list[dict[str, Any]] = []
+    current_kind: str | None = None
+    section: dict[str, Any] | None = None
+    chunk_start = 1
+    for i, item in enumerate(items, start=1):
+        kind = str(getattr(item, "kind", "") or "other")
+        if kind != current_kind or len(section["rows"]) >= 10:
+            if section:
+                sections.append(section)
+            current_kind = kind
+            chunk_start = i
+            section = {"title": KIND_LABELS.get(kind, kind)[:24], "rows": []}
+        title = f"{i}. {getattr(item, 'title', '')}"
+        section["rows"].append({"id": f"story:{i}", "title": title[:24]})
+        section["title"] = f"{KIND_LABELS.get(kind, kind)} {chunk_start}–{i}"[:24]
+    if section:
+        sections.append(section)
+
+    return {
+        "type": "list",
+        "body": {
+            "text": "Which story do you want to read in detail? "
+            "Pick one below — or reply with its number."
+        },
+        "action": {"button": "📖 Read a story", "sections": sections[:10]},
+    }
+
+
+async def _send_whatsapp_picker(items: list[PublicationItem]) -> bool:
+    client = get_whatsapp_client()
+    phone = _whatsapp_phone()
+    picker = _whatsapp_story_picker(items)
+    if not client.enabled or not phone or not picker:
+        return False
+    try:
+        return await client.send_interactive(phone, picker)
+    except Exception as exc:
+        # Outside the 24h window or list limits — the story text already tells
+        # the user to reply with a number, so this is best-effort garnish.
+        logger.info("WhatsApp story picker skipped: %s", exc)
+        return False
 
 
 async def _send_telegram(bot, chat_id: str, text: str, reply_markup=None) -> bool:
@@ -164,52 +200,23 @@ async def _send_whatsapp(text: str, reply_markup=None) -> bool:
     )
 
 
-async def _send_pdfs(bot, chat_id: str, pdfs: list[PdfAttachment]) -> dict[str, int]:
-    """Send PDF attachments on Telegram and WhatsApp."""
-    sent = {"telegram": 0, "whatsapp": 0}
-    client = get_whatsapp_client()
-    phone = _whatsapp_phone()
-    for pdf in pdfs:
-        try:
-            from telegram import InputFile
-
-            await bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(io.BytesIO(pdf.data), filename=pdf.filename),
-                caption=pdf.caption[:1000],
-            )
-            sent["telegram"] += 1
-        except Exception as exc:
-            logger.warning("Telegram PDF send failed (%s): %s", pdf.filename, exc)
-        if client.enabled and phone:
-            try:
-                if await client.send_document(
-                    phone, pdf.data, pdf.filename, caption=pdf.caption[:1000], mime_type="application/pdf"
-                ):
-                    sent["whatsapp"] += 1
-            except Exception as exc:
-                logger.warning("WhatsApp PDF send failed (%s): %s", pdf.filename, exc)
-    return sent
-
-
 async def deliver_daily_digest(
     bot,
     messages: dict[str, Any],
-    pdfs: list[PdfAttachment] | None = None,
 ) -> dict[str, Any]:
-    """Send the daily briefing as separate messages on Telegram + WhatsApp.
-
-    Order: intro -> numbered story list (with featured buttons) -> optional
-    new-resources alert -> PDF attachments.
+    """Send the daily briefing on Telegram + WhatsApp: intro message, then the
+    numbered story list with a tap-to-read picker (number grid on Telegram,
+    interactive list on WhatsApp). No PDFs — details are on demand only.
     """
     settings = get_settings()
     owner = settings.telegram_owner_chat_id
-    result: dict[str, Any] = {"telegram": False, "whatsapp": False, "pdfs": {}}
+    result: dict[str, Any] = {"telegram": False, "whatsapp": False}
 
     intro_text = str(messages.get("intro") or "")
     stories_text = str(messages.get("stories") or "")
     new_res_text = messages.get("new_resources")
-    markup = _featured_keyboard(messages.get("featured") or [], messages.get("items") or [])
+    items: list[PublicationItem] = messages.get("items") or []
+    markup = _stories_keyboard(items)
 
     if owner:
         ok_intro = await _send_telegram(bot, owner, intro_text)
@@ -221,13 +228,11 @@ async def deliver_daily_digest(
         logger.warning("TELEGRAM_OWNER_CHAT_ID not set — skipping Telegram digest")
 
     ok_wa_intro = await _send_whatsapp(intro_text)
-    ok_wa_stories = await _send_whatsapp(stories_text, reply_markup=markup)
+    ok_wa_stories = await _send_whatsapp(stories_text)
+    result["whatsapp_picker"] = await _send_whatsapp_picker(items)
     if new_res_text:
         await _send_whatsapp(str(new_res_text))
     result["whatsapp"] = ok_wa_intro and ok_wa_stories
-
-    if pdfs and owner:
-        result["pdfs"] = await _send_pdfs(bot, owner, pdfs)
     return result
 
 

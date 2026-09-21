@@ -16,7 +16,6 @@ from imt_access import analyze, delivery, store, stories
 from imt_access.catalog import sync_catalog
 from imt_access.portal import PortalClient
 from imt_access.publications import (
-    download_epw_pdfs,
     fetch_epw_current_issue,
     fetch_et_prime_stories,
     fetch_ft_headlines,
@@ -71,17 +70,13 @@ async def run_catalog_sync(*, alert_new: bool = True, bot: Any = None) -> dict[s
 
 def _fetch_daily_blocking(settings: IMTSettings) -> dict[str, Any]:
     """Blocking part of the daily job: portal + external fetches."""
-    out: dict[str, Any] = {"epw_issue": None, "ft": [], "et_prime": [], "pdfs": []}
+    out: dict[str, Any] = {"epw_issue": None, "ft": [], "et_prime": []}
 
     with PortalClient(settings) as portal:
         portal.ensure_session()
         try:
             issue = fetch_epw_current_issue(portal)
             out["epw_issue"] = issue
-            if issue and settings.imt_epw_pdf_count > 0:
-                out["pdfs"] = download_epw_pdfs(
-                    portal, issue, max_pdfs=settings.imt_epw_pdf_count
-                )
         except Exception as exc:
             logger.exception("EPW fetch failed: %s", exc)
             out["epw_error"] = str(exc)
@@ -130,7 +125,6 @@ async def run_daily_job(
     epw_issue = fetched.get("epw_issue")
     ft_items = fetched.get("ft") or []
     et_items = fetched.get("et_prime") or []
-    pdfs = fetched.get("pdfs") or []
 
     intro = None
     if settings.imt_llm_summaries:
@@ -172,7 +166,6 @@ async def run_daily_job(
         "epw_issue": epw_issue.label if epw_issue else None,
         "ft_headlines": len(ft_items),
         "et_prime_stories": len(et_items),
-        "pdfs": len(pdfs),
         "stored_publications": inserted,
         "catalog": catalog_result or None,
         "errors": {
@@ -184,7 +177,7 @@ async def run_daily_job(
         result["preview"] = (messages["intro"] + "\n\n" + messages["stories"])[:2000]
         return result
 
-    delivery_result = await delivery.deliver_daily_digest(bot, messages, pdfs)
+    delivery_result = await delivery.deliver_daily_digest(bot, messages)
     result["delivery"] = delivery_result
 
     any_sent = bool(delivery_result.get("telegram") or delivery_result.get("whatsapp"))

@@ -271,8 +271,49 @@ def test_build_digest_messages_split_and_numbered():
         "FT headline one",
         "ET Prime story one",
     ]
-    # Featured: Special Articles pick (#2), first FT (#3), first ET Prime (#4).
-    assert msgs["featured"] == [2, 3, 4]
+    # The story list asks the reader to pick a story.
+    assert "tap a number" in msgs["stories"].lower()
+
+
+def test_stories_keyboard_number_grid():
+    from imt_access.delivery import _stories_keyboard
+
+    items = [
+        PublicationItem(kind="epw", title=f"Story {i}", url=f"http://x/{i}")
+        for i in range(1, 14)
+    ]
+    markup = _stories_keyboard(items)
+    buttons = [b for row in markup.inline_keyboard for b in row]
+    assert [b.text for b in buttons] == [str(i) for i in range(1, 14)]
+    assert buttons[0].callback_data == "story:1"
+    assert buttons[-1].callback_data == "story:13"
+    # 6 per row: 13 buttons -> 3 rows (6 + 6 + 1)
+    assert [len(row) for row in markup.inline_keyboard] == [6, 6, 1]
+    assert _stories_keyboard([]) is None
+
+
+def test_whatsapp_story_picker_sections_and_ids():
+    from imt_access.delivery import _whatsapp_story_picker
+
+    items = (
+        [PublicationItem(kind="epw", title=f"EPW story {i}", url=f"http://x/e{i}") for i in range(1, 13)]
+        + [PublicationItem(kind="ft", title=f"FT story {i}", url=f"http://x/f{i}") for i in range(1, 4)]
+        + [PublicationItem(kind="et_prime", title="ET story", url="http://x/p1")]
+    )
+    picker = _whatsapp_story_picker(items)
+    assert picker["type"] == "list"
+    sections = picker["action"]["sections"]
+    # EPW splits into two 10-row chunks, then FT, then ET Prime.
+    assert [len(s["rows"]) for s in sections] == [10, 2, 3, 1]
+    assert sections[0]["title"].startswith("EPW")
+    assert sections[2]["title"].startswith("Financial Times")
+    first_row = sections[0]["rows"][0]
+    assert first_row["id"] == "story:1"
+    assert first_row["title"].startswith("1. ")
+    assert len(first_row["title"]) <= 24
+    last_row = sections[-1]["rows"][0]
+    assert last_row["id"] == "story:16"
+    assert _whatsapp_story_picker([]) is None
 
 
 def test_build_digest_messages_escapes_html():
