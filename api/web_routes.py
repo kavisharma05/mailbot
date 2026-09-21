@@ -287,7 +287,9 @@ def _web_format_sessions(sessions: list[dict[str, Any]], day: date) -> str:
     return "\n".join(lines)
 
 
-def _web_local_list_reply(intent: str, text: str) -> str | None:
+def _web_local_list_reply(
+    intent: str, text: str, user_id: str | None = None
+) -> str | None:
     """DB-only answers for due / classes / missed / undated — skip Gmail + LLM."""
     now = now_ist()
     if intent == INTENT_SCHEDULE:
@@ -909,7 +911,7 @@ async def chat_message(body: ChatMessageBody, user: dict = Depends(web_user)):
         intent in (INTENT_DUE_LIST, INTENT_SCHEDULE, INTENT_MISSED_LIST, INTENT_UNDATED_LIST)
         and not _is_specific_deadline_question(text)
     ):
-        reply = await asyncio.to_thread(_web_local_list_reply, intent, text)
+        reply = await asyncio.to_thread(_web_local_list_reply, intent, text, uid)
         if reply:
             remember_web_turn(bot_text=reply, intent=intent)
             return {"reply": reply, "draft": None}

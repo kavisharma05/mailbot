@@ -206,7 +206,11 @@ def is_email_processed_cached(message_id: str, user_id: str | None = None) -> bo
     import time
 
     now = time.time()
-    cache_key = f"{resolve_user_id(user_id)}:{message_id}"
+    cache_key = (
+        f"{resolve_user_id(user_id)}:{message_id}"
+        if multi_user_schema_ready()
+        else message_id
+    )
     _prune_processed_cache(now)
     cached = _processed_cache.get(cache_key)
     if cached and cached > now:
@@ -225,7 +229,11 @@ def cache_email_processed(message_id: str, user_id: str | None = None) -> None:
     import time
 
     now = time.time()
-    cache_key = f"{resolve_user_id(user_id)}:{message_id}"
+    cache_key = (
+        f"{resolve_user_id(user_id)}:{message_id}"
+        if multi_user_schema_ready()
+        else message_id
+    )
     _processed_cache[cache_key] = now + _PROCESSED_CACHE_TTL
     _prune_processed_cache(now)
 

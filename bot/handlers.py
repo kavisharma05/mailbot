@@ -40,6 +40,7 @@ from ai.intent import (
 )
 from config import get_settings
 from gmail_api.client import send_email
+from services.user_ids import OWNER_SEED_USER_ID
 from services.contacts import (
     backfill_contacts_from_inbox,
     extract_person_reference,
@@ -178,16 +179,28 @@ def _extract_verify_tag(text: str) -> tuple[bool, str]:
 def _resolve_user(update: Update) -> dict[str, Any] | None:
     from services.users import ensure_owner_user, get_owner_user, get_user_by_telegram_id
 
-    ensure_owner_user()
     tg = update.effective_user
     if not tg:
         return None
+    settings = get_settings()
+    owner_id = (
+        settings.owner_user_id()
+        if hasattr(settings, "owner_user_id")
+        else getattr(settings, "telegram_owner_user_id", "")
+        or getattr(settings, "telegram_owner_chat_id", "")
+    )
+    if str(tg.id) == str(owner_id):
+        return get_owner_user() or {
+            "id": OWNER_SEED_USER_ID,
+            "role": "owner",
+            "telegram_user_id": str(tg.id),
+            "telegram_chat_id": str(getattr(update.effective_chat, "id", tg.id)),
+            "is_active": True,
+        }
+    ensure_owner_user()
     row = get_user_by_telegram_id(tg.id)
     if row:
         return row
-    settings = get_settings()
-    if str(tg.id) == str(settings.owner_user_id()):
-        return get_owner_user()
     return None
 
 
