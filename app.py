@@ -715,40 +715,46 @@ async def oauth_callback(
     )
 
 
-if WEB_DIST.is_dir():
-    assets_dir = WEB_DIST / "assets"
-    if assets_dir.is_dir():
-        fastapi_app.mount("/assets", StaticFiles(directory=assets_dir), name="web-assets")
+assets_dir = WEB_DIST / "assets"
+if assets_dir.is_dir():
+    fastapi_app.mount("/assets", StaticFiles(directory=assets_dir), name="web-assets")
 
-    @fastapi_app.get("/")
-    async def web_app_root():
-        return FileResponse(
-            WEB_DIST / "index.html",
-            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
-        )
 
-    @fastapi_app.get("/{spa_path:path}")
-    async def web_app_spa(spa_path: str):
-        blocked_prefixes = (
-            "api/",
-            "telegram/",
-            "whatsapp/",
-            "tasks/",
-            "oauth/",
-            "healthz",
-            "ping",
-            "privacy",
-            "ws",
-        )
-        if spa_path.startswith(blocked_prefixes) or spa_path in blocked_prefixes:
-            raise HTTPException(status_code=404, detail="Not found")
-        file_path = WEB_DIST / spa_path
-        if file_path.is_file():
-            return FileResponse(file_path)
-        return FileResponse(
-            WEB_DIST / "index.html",
-            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
-        )
+def _web_index_response() -> FileResponse:
+    index = WEB_DIST / "index.html"
+    if not index.is_file():
+        logger.error("Web frontend missing at %s; deployment build did not include web/dist", index)
+        raise HTTPException(status_code=503, detail="Web frontend is unavailable")
+    return FileResponse(
+        index,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@fastapi_app.get("/")
+async def web_app_root():
+    return _web_index_response()
+
+
+@fastapi_app.get("/{spa_path:path}")
+async def web_app_spa(spa_path: str):
+    blocked_prefixes = (
+        "api/",
+        "telegram/",
+        "whatsapp/",
+        "tasks/",
+        "oauth/",
+        "healthz",
+        "ping",
+        "privacy",
+        "ws",
+    )
+    if spa_path.startswith(blocked_prefixes) or spa_path in blocked_prefixes:
+        raise HTTPException(status_code=404, detail="Not found")
+    file_path = WEB_DIST / spa_path
+    if file_path.is_file():
+        return FileResponse(file_path)
+    return _web_index_response()
 
 
 app = InstantPingMiddleware(fastapi_app)

@@ -4,7 +4,7 @@ WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
-RUN npm run build
+RUN npm run build && test -s /web/dist/index.html
 
 FROM python:3.11-slim
 WORKDIR /app
@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 COPY --from=web /web/dist /app/web/dist
+RUN test -s /app/web/dist/index.html
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 10000
