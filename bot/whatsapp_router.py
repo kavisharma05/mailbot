@@ -88,6 +88,21 @@ async def _dispatch_callback(data: str, phone: str, user_data: dict) -> None:
         await handlers.section_button(update, context)
     elif data.startswith("story:"):
         await handlers.story_button(update, context)
+    elif data.startswith("storylist:"):
+        # Meta caps list messages at 10 rows, so the daily story picker drills
+        # down one chunk at a time (rows here carry story:<n> onwards).
+        from imt_access import stories as imt_stories
+        from imt_access.delivery import whatsapp_story_chunk_picker
+
+        try:
+            offset = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        manifest = imt_stories.load_manifest()
+        items = manifest["items"] if manifest else []
+        picker = whatsapp_story_chunk_picker(items, offset)
+        if picker:
+            await get_whatsapp_client().send_interactive(phone, picker)
     elif data == handlers.CLEAR_CHAT_CB:
         await handlers.clear_chat_button(update, context)
     elif data.startswith("act:"):

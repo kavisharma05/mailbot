@@ -129,41 +129,68 @@ def _stories_keyboard(items: list[PublicationItem]):
     return InlineKeyboardMarkup(rows)
 
 
-def _whatsapp_story_picker(items: list[PublicationItem]) -> dict[str, Any] | None:
-    """Interactive 'Read a story' list message, sectioned by source.
+_WA_LIST_ROW_CAP = 10  # Meta enforces a 10-row total limit on list messages
 
-    Rows carry story:<n> ids, which the WhatsApp router already dispatches to
-    the story-brief handler. Kept separate from send_text because the markup
-    converter caps lists at a single 10-row section.
+
+def _item_get(item: Any, key: str) -> str:
+    if isinstance(item, dict):
+        return str(item.get(key) or "")
+    return str(getattr(item, key, "") or "")
+
+
+def _chunk_label(chunk: list[Any], start: int) -> str:
+    kinds = {_item_get(it, "kind") for it in chunk}
+    rng = f"{start + 1}–{start + len(chunk)}"
+    if len(kinds) == 1:
+        return f"{KIND_LABELS.get(next(iter(kinds)), 'Stories')} {rng}"[:24]
+    return f"Stories {rng}"[:24]
+
+
+def _whatsapp_story_picker(items: list[Any]) -> dict[str, Any] | None:
+    """Top-level 'Read a story' list: one row per chunk of 10 stories.
+
+    Meta caps list messages at 10 rows total, so 30+ stories can't be listed
+    directly. Rows carry storylist:<offset> ids; the WhatsApp router answers
+    with whatsapp_story_chunk_picker for that chunk (rows = story:<n>).
     """
     if not items:
         return None
 
-    sections: list[dict[str, Any]] = []
-    current_kind: str | None = None
-    section: dict[str, Any] | None = None
-    chunk_start = 1
-    for i, item in enumerate(items, start=1):
-        kind = str(getattr(item, "kind", "") or "other")
-        if kind != current_kind or len(section["rows"]) >= 10:
-            if section:
-                sections.append(section)
-            current_kind = kind
-            chunk_start = i
-            section = {"title": KIND_LABELS.get(kind, kind)[:24], "rows": []}
-        title = f"{i}. {getattr(item, 'title', '')}"
-        section["rows"].append({"id": f"story:{i}", "title": title[:24]})
-        section["title"] = f"{KIND_LABELS.get(kind, kind)} {chunk_start}–{i}"[:24]
-    if section:
-        sections.append(section)
-
+    rows = []
+    for start in range(0, len(items), _WA_LIST_ROW_CAP):
+        chunk = items[start : start + _WA_LIST_ROW_CAP]
+        rows.append({"id": f"storylist:{start}", "title": _chunk_label(chunk, start)})
     return {
         "type": "list",
         "body": {
             "text": "Which story do you want to read in detail? "
-            "Pick one below — or reply with its number."
+            "Pick a section below — or just reply with its number."
         },
-        "action": {"button": "📖 Read a story", "sections": sections[:10]},
+        "action": {"button": "📖 Read a story", "sections": [{"title": "Today's stories", "rows": rows}]},
+    }
+
+
+def whatsapp_story_chunk_picker(items: list[Any], offset: int) -> dict[str, Any] | None:
+    """Second-level list: the 10 stories starting at <offset>, tappable."""
+    if offset < 0:
+        return None
+    chunk = items[offset : offset + _WA_LIST_ROW_CAP]
+    if not chunk:
+        return None
+    rows = [
+        {
+            "id": f"story:{offset + i + 1}",
+            "title": f"{offset + i + 1}. {_item_get(it, 'title')}"[:24],
+        }
+        for i, it in enumerate(chunk)
+    ]
+    return {
+        "type": "list",
+        "body": {"text": "Tap a story for its detailed brief:"},
+        "action": {
+            "button": "📖 Stories",
+            "sections": [{"title": _chunk_label(chunk, offset), "rows": rows}],
+        },
     }
 
 

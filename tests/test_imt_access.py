@@ -292,28 +292,39 @@ def test_stories_keyboard_number_grid():
     assert _stories_keyboard([]) is None
 
 
-def test_whatsapp_story_picker_sections_and_ids():
-    from imt_access.delivery import _whatsapp_story_picker
+def test_whatsapp_story_picker_chunk_drilldown():
+    from imt_access.delivery import _whatsapp_story_picker, whatsapp_story_chunk_picker
 
     items = (
         [PublicationItem(kind="epw", title=f"EPW story {i}", url=f"http://x/e{i}") for i in range(1, 13)]
         + [PublicationItem(kind="ft", title=f"FT story {i}", url=f"http://x/f{i}") for i in range(1, 4)]
         + [PublicationItem(kind="et_prime", title="ET story", url="http://x/p1")]
     )
+    # Meta caps lists at 10 rows: top level offers one row per 10-story chunk.
     picker = _whatsapp_story_picker(items)
     assert picker["type"] == "list"
-    sections = picker["action"]["sections"]
-    # EPW splits into two 10-row chunks, then FT, then ET Prime.
-    assert [len(s["rows"]) for s in sections] == [10, 2, 3, 1]
-    assert sections[0]["title"].startswith("EPW")
-    assert sections[2]["title"].startswith("Financial Times")
-    first_row = sections[0]["rows"][0]
-    assert first_row["id"] == "story:1"
-    assert first_row["title"].startswith("1. ")
-    assert len(first_row["title"]) <= 24
-    last_row = sections[-1]["rows"][0]
-    assert last_row["id"] == "story:16"
+    rows = picker["action"]["sections"][0]["rows"]
+    assert [r["id"] for r in rows] == ["storylist:0", "storylist:10"]
+    assert rows[0]["title"] == "EPW 1–10"
+    assert rows[1]["title"] == "Stories 11–16"  # mixed EPW/FT/ET chunk
+    for row in rows:
+        assert len(row["title"]) <= 24
     assert _whatsapp_story_picker([]) is None
+
+    # Second level: the chunk's stories, numbered globally, ready for story:<n>.
+    chunk = whatsapp_story_chunk_picker(items, 10)
+    crows = chunk["action"]["sections"][0]["rows"]
+    assert len(crows) == 6
+    assert crows[0]["id"] == "story:11"
+    assert crows[-1]["id"] == "story:16"
+    assert crows[0]["title"].startswith("11. ")
+    for row in crows:
+        assert len(row["title"]) <= 24
+    assert whatsapp_story_chunk_picker(items, 99) is None
+    assert whatsapp_story_chunk_picker(items, -1) is None
+    # Manifest dicts work too (WhatsApp router passes manifest items).
+    as_dicts = [it.to_row() for it in items]
+    assert whatsapp_story_chunk_picker(as_dicts, 0)["action"]["sections"][0]["rows"][0]["id"] == "story:1"
 
 
 def test_build_digest_messages_escapes_html():
