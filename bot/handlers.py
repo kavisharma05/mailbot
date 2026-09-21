@@ -997,6 +997,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/done <n> — mark item #n from the last list (/due, /missed, or /undated)\n"
             "/classes — today's classes for your section (tap to set it first time)\n"
             "/section — change or check your section\n"
+            "/library — library e-resources & latest briefing\n"
+            "/story <n> — full brief of any story (or just reply with its number)\n"
             "/ask <question> — ask about deadlines, mails, senders, or email content\n"
             "Add #verify to any question for a fresh Gmail answer with cited sources\n"
             "/send — compose and send an email\n"
@@ -1364,6 +1366,101 @@ async def section_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.edit_message_text(
         f"Got it — showing Section {section} from now on. Run /classes anytime."
     )
+
+
+_STORY_NUM_RE = re.compile(r"^(?:story|brief|detail|details)?\s*#?\s*(\d{1,2})\s*$", re.IGNORECASE)
+
+
+async def _send_story_brief_reply(message, n: int) -> bool:
+    """Send the full brief for story #n from the latest library digest.
+
+    Returns True when n matched a story (message handled), False when there is
+    no recent digest or the number is out of range (caller should fall through
+    to normal chat handling).
+    """
+    from imt_access import stories as imt_stories
+
+    manifest = await asyncio.to_thread(imt_stories.load_manifest)
+    size = imt_stories.manifest_size(manifest)
+    if not manifest or n < 1 or n > size:
+        return False
+
+    await message.chat.send_action("typing")
+    try:
+        result = await asyncio.to_thread(imt_stories.get_story_brief, n)
+    except Exception as exc:
+        logger.exception("Story brief failed for #%s: %s", n, exc)
+        result = None
+    if not result:
+        await message.reply_text("Couldn't load that story right now. Try again in a minute.")
+        return True
+
+    text = imt_stories.format_story_brief_message(result)
+    if not result.get("brief"):
+        text += "\n\n<i>Couldn't fetch the story text — the link above opens it directly.</i>"
+    await reply_long(message, text, parse_mode="HTML", disable_web_page_preview=True)
+    return True
+
+
+async def story_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Full brief of any story from the latest library briefing (/story 7)."""
+    if not _require_user(update) or not update.message:
+        return
+
+    from imt_access import stories as imt_stories
+
+    args = " ".join(context.args).strip().lstrip("#") if context.args else ""
+    if args:
+        try:
+            n = int(args)
+        except ValueError:
+            await update.message.reply_text("Usage: /story <number> — e.g. /story 7")
+            return
+        if not await _send_story_brief_reply(update.message, n):
+            await update.message.reply_text(
+                "No story with that number. Run /story to see the latest story list."
+            )
+        return
+
+    # No argument: resend the compact numbered list as a picker.
+    manifest = await asyncio.to_thread(imt_stories.load_manifest)
+    if not manifest:
+        await update.message.reply_text(
+            "No library briefing yet — it runs every morning at 7:20 AM IST."
+        )
+        return
+    from imt_access.stories import KIND_LABELS as _STORY_KIND_LABELS
+
+    lines = [f"<b>🗞 Stories — {escape_html(str(manifest['date']))}</b>", ""]
+    current_kind: str | None = None
+    for item in manifest["items"]:
+        kind = str(item.get("kind") or "")
+        if kind != current_kind:
+            current_kind = kind
+            lines.append(f"<b>{escape_html(_STORY_KIND_LABELS.get(kind, kind))}</b>")
+        lines.append(f"{item.get('n')}. {escape_html(str(item.get('title') or ''))}")
+    lines.append("")
+    lines.append("<i>Reply with a number or /story &lt;n&gt; for the full brief.</i>")
+    await reply_long(
+        update.message, "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+    )
+
+
+async def story_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline '⭐ #n' button under the digest -> send that story's brief."""
+    if not _require_user(update):
+        return
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    try:
+        n = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer()
+        return
+    await query.answer("Fetching the story brief…")
+    if query.message:
+        await _send_story_brief_reply(query.message, n)
 
 
 async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2106,6 +2203,15 @@ async def chat_message(
         await update.message.reply_text("Ask me about your deadlines, placements, or admin items.")
         return
 
+    # Library story-brief shortcut: a bare number ("7") or "story 7" right
+    # after the daily briefing resolves to that story's full brief.
+    story_match = _STORY_NUM_RE.match(question)
+    if story_match:
+        if await _send_story_brief_reply(update.message, int(story_match.group(1))):
+            remember_turn(context.user_data, user_text=question, intent="story_brief")
+            return
+        # No such story — fall through to normal chat handling.
+
     convo = get_convo(context.user_data)
     classified = await asyncio.to_thread(classify_message, question, convo)
     intent = classified.get("intent", INTENT_MAILBOX_QA)
@@ -2566,8 +2672,10 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("done", done_command))
     application.add_handler(CommandHandler("classes", classes_command))
     application.add_handler(CommandHandler("library", library_command))
+    application.add_handler(CommandHandler("story", story_command))
     application.add_handler(CommandHandler("section", section_command))
     application.add_handler(CallbackQueryHandler(section_button, pattern=r"^section:"))
+    application.add_handler(CallbackQueryHandler(story_button, pattern=r"^story:\d+$"))
     application.add_handler(CallbackQueryHandler(clear_chat_button, pattern=f"^{CLEAR_CHAT_CB}$"))
     application.add_handler(CallbackQueryHandler(action_button, pattern=r"^act:"))
     application.add_handler(CallbackQueryHandler(addtask_callback, pattern=r"^addtask:"))

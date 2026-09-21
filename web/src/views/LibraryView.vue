@@ -49,6 +49,33 @@ function switchTab(next) {
 function kindMeta(kind) {
   return KIND_META[kind] || { label: kind, icon: 'article', color: 'text-ink-2' }
 }
+
+const expandedBriefs = ref(new Set())
+
+function briefKey(item) {
+  return `${item.kind}|${item.url}`
+}
+
+function briefFor(item) {
+  const key = briefKey(item)
+  return expandedBriefs.value.has(key) ? library.briefs[key] : null
+}
+
+function briefLoadingFor(item) {
+  return !!library.briefLoading[briefKey(item)]
+}
+
+async function toggleBrief(item) {
+  const key = briefKey(item)
+  const next = new Set(expandedBriefs.value)
+  if (next.has(key)) {
+    next.delete(key)
+  } else {
+    next.add(key)
+    await library.fetchStoryBrief(item)
+  }
+  expandedBriefs.value = next
+}
 </script>
 
 <template>
@@ -119,17 +146,42 @@ function kindMeta(kind) {
               <span class="text-caption text-ink-3 ml-auto">{{ group.date }}</span>
             </div>
             <div class="flex flex-col divide-y divide-hairline">
-              <a
+              <div
                 v-for="item in group.items"
                 :key="item.id || item.url"
-                :href="item.url"
-                target="_blank"
-                rel="noopener"
-                class="py-2 flex flex-col gap-0.5 tappable"
+                class="py-2 flex flex-col gap-0.5"
               >
-                <span class="text-body text-ink leading-snug">{{ item.title }}</span>
-                <span v-if="item.section" class="text-caption text-ink-3">{{ item.section }}</span>
-              </a>
+                <div class="flex items-start gap-2">
+                  <a
+                    :href="item.url"
+                    target="_blank"
+                    rel="noopener"
+                    class="flex-1 min-w-0 tappable"
+                  >
+                    <span class="text-body text-ink leading-snug">{{ item.title }}</span>
+                    <span v-if="item.section" class="block text-caption text-ink-3">{{ item.section }}</span>
+                  </a>
+                  <button
+                    type="button"
+                    class="shrink-0 w-8 h-8 rounded-full bg-fill flex items-center justify-center tappable"
+                    :title="briefFor(item) ? 'Hide brief' : 'AI brief'"
+                    @click="toggleBrief(item)"
+                  >
+                    <span
+                      class="material-symbols-outlined text-[16px]"
+                      :class="[
+                        briefLoadingFor(item) ? 'text-accent animate-spin' : '',
+                        !briefLoadingFor(item) && briefFor(item) ? 'text-accent' : '',
+                        !briefLoadingFor(item) && !briefFor(item) ? 'text-ink-3' : '',
+                      ]"
+                    >{{ briefLoadingFor(item) ? 'progress_activity' : 'auto_awesome' }}</span>
+                  </button>
+                </div>
+                <p
+                  v-if="briefFor(item)"
+                  class="text-caption text-ink-2 leading-relaxed whitespace-pre-wrap bg-fill rounded-xl px-3 py-2 mt-1"
+                >{{ briefFor(item) }}</p>
+              </div>
             </div>
           </div>
         </div>

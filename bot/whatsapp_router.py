@@ -37,6 +37,8 @@ _COMMANDS: dict[str, object] = {
     "done": handlers.done_command,
     "classes": handlers.classes_command,
     "section": handlers.section_command,
+    "library": handlers.library_command,
+    "story": handlers.story_command,
     "ask": handlers.ask_command,
     "send": handlers.send_command,
     "cancel": handlers.cancel_command,
@@ -84,6 +86,8 @@ async def _dispatch_callback(data: str, phone: str, user_data: dict) -> None:
 
     if data.startswith("section:"):
         await handlers.section_button(update, context)
+    elif data.startswith("story:"):
+        await handlers.story_button(update, context)
     elif data == handlers.CLEAR_CHAT_CB:
         await handlers.clear_chat_button(update, context)
     elif data.startswith("act:"):

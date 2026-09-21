@@ -31,6 +31,7 @@ async function logout() {
           :class="wsConnected ? 'bg-success' : 'bg-ink-3'"
         />
         <span class="text-caption text-ink-3">{{ wsConnected ? 'Live' : 'Offline' }}</span>
+        </div>
       </div>
     </div>
   </header>

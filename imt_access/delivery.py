@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import io
 import logging
+from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from config import get_settings
 from services.formatting import escape_html
@@ -16,6 +18,9 @@ from services.telegram_util import send_html_detailed
 
 from imt_access.catalog import Resource
 from imt_access.publications import EpwIssue, PdfAttachment, PublicationItem
+from imt_access.stories import KIND_LABELS
+
+IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 
@@ -30,49 +35,90 @@ def _whatsapp_phone() -> str:
     return (get_settings().whatsapp_owner_phone or "").lstrip("+").replace(" ", "").replace("-", "")
 
 
-def format_daily_digest(
+def build_digest_messages(
     *,
     epw_issue: EpwIssue | None,
     ft_items: list[PublicationItem],
     et_items: list[PublicationItem],
     intro: str | None = None,
     new_resources: list[Resource] | None = None,
-) -> str:
-    """Build the Telegram-HTML daily digest."""
-    lines: list[str] = ["<b>📖 Library Daily — e-resources briefing</b>", ""]
-    if intro:
-        lines.append(f"<i>{escape_html(intro.strip())}</i>")
-        lines.append("")
+    run_date: date | None = None,
+) -> dict[str, Any]:
+    """Build the daily briefing as separate, focused messages (less clutter).
 
+    Returns:
+      intro         — short header + LLM editorial (its own message)
+      stories       — the numbered story list (its own message)
+      new_resources — optional alert text when the portal adds databases
+      items         — ordered story list (numbering matches the manifest)
+      featured      — story numbers worth a one-tap button
+    """
+    day_label = (run_date or datetime.now(IST).date()).strftime("%a %d %b")
+
+    items: list[PublicationItem] = []
     if epw_issue:
-        lines.append(f"<b>{_KIND_META['epw'][0]} {escape_html(epw_issue.label)}</b>")
-        for section, items in epw_issue.sections.items():
-            if not items:
-                continue
-            lines.append(f"<u>{escape_html(section)}</u>")
-            for item in items[:10]:
-                lines.append(f"• {escape_html(item.title)}")
-            if len(items) > 10:
-                lines.append(f"  …and {len(items) - 10} more")
-        lines.append("")
+        items.extend(epw_issue.items)
+    items.extend(ft_items)
+    items.extend(et_items)
 
-    for kind, items in (("ft", ft_items), ("et_prime", et_items)):
-        if not items:
+    # --- message 1: intro ---
+    intro_lines = [f"<b>📖 Library Daily — {day_label}</b>", ""]
+    if intro:
+        intro_lines.append(f"<i>{escape_html(intro.strip())}</i>")
+        intro_lines.append("")
+    intro_lines.append("Today's stories follow in the next message — reply with any number for the full brief.")
+
+    # --- message 2: numbered story list ---
+    story_lines: list[str] = ["<b>🗞 Today's stories</b>", ""]
+    n = 0
+    if epw_issue:
+        story_lines.append(f"<b>{_KIND_META['epw'][0]} {escape_html(epw_issue.label)}</b>")
+        for section, section_items in epw_issue.sections.items():
+            if not section_items:
+                continue
+            story_lines.append(f"<u>{escape_html(section)}</u>")
+            for item in section_items:
+                n += 1
+                story_lines.append(f"{n}. {escape_html(item.title)}")
+        story_lines.append("")
+    for kind, kind_items in (("ft", ft_items), ("et_prime", et_items)):
+        if not kind_items:
             continue
         emoji, label = _KIND_META[kind]
-        lines.append(f"<b>{emoji} {label}</b>")
-        for item in items:
-            lines.append(f'• <a href="{escape_html(item.url)}">{escape_html(item.title)}</a>')
-        lines.append("")
+        story_lines.append(f"<b>{emoji} {label}</b>")
+        for item in kind_items:
+            n += 1
+            story_lines.append(
+                f'{n}. <a href="{escape_html(item.url)}">{escape_html(item.title)}</a>'
+            )
+        story_lines.append("")
+    story_lines.append("<i>Reply with a number (e.g. 7) or /story 7 for the full brief.</i>")
 
+    # --- featured picks: one-tap buttons for the day's most useful reads ---
+    featured: list[int] = []
+    if epw_issue and epw_issue.items:
+        special = next(
+            (it for it in epw_issue.items if it.section.lower() == "special articles"),
+            epw_issue.items[0],
+        )
+        featured.append(items.index(special) + 1)
+    if ft_items:
+        featured.append(items.index(ft_items[0]) + 1)
+    if et_items:
+        featured.append(items.index(et_items[0]) + 1)
+
+    # --- optional message 3: new resources ---
+    new_res_text: str | None = None
     if new_resources:
-        lines.append("<b>🆕 New e-resources on the portal</b>")
-        for res in new_resources[:10]:
-            lines.append(f"• {escape_html(res.name)} <i>({escape_html(res.category)})</i>")
-        lines.append("")
+        new_res_text = format_new_resources_alert(new_resources)
 
-    lines.append("All links open via the library portal. More in the web app → Library tab.")
-    return "\n".join(lines).strip()
+    return {
+        "intro": "\n".join(intro_lines).strip(),
+        "stories": "\n".join(story_lines).strip(),
+        "new_resources": new_res_text,
+        "items": items,
+        "featured": featured,
+    }
 
 
 def format_new_resources_alert(new_resources: list[Resource]) -> str:
@@ -84,17 +130,38 @@ def format_new_resources_alert(new_resources: list[Resource]) -> str:
     return "\n".join(lines)
 
 
-async def _send_telegram(bot, chat_id: str, text: str) -> bool:
-    result = await send_html_detailed(bot, chat_id, text, disable_web_page_preview=True)
+def _featured_keyboard(featured: list[int], items: list[PublicationItem]):
+    """One-tap brief buttons for the day's featured stories (Telegram inline;
+    auto-converts to WhatsApp reply buttons in send_text)."""
+    if not featured:
+        return None
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    buttons = []
+    for n in featured[:3]:
+        item = items[n - 1] if 0 < n <= len(items) else None
+        kind = str(getattr(item, "kind", "") or "")
+        label = KIND_LABELS.get(kind, "Story")
+        buttons.append(InlineKeyboardButton(f"⭐ #{n} {label}", callback_data=f"story:{n}"))
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
+
+async def _send_telegram(bot, chat_id: str, text: str, reply_markup=None) -> bool:
+    kwargs: dict[str, Any] = {"disable_web_page_preview": True}
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
+    result = await send_html_detailed(bot, chat_id, text, **kwargs)
     return result.ok
 
 
-async def _send_whatsapp(text: str) -> bool:
+async def _send_whatsapp(text: str, reply_markup=None) -> bool:
     client = get_whatsapp_client()
     phone = _whatsapp_phone()
     if not client.enabled or not phone:
         return False
-    return await client.send_text(phone, text, from_html=True, outbox_kind="imt_daily")
+    return await client.send_text(
+        phone, text, from_html=True, outbox_kind="imt_daily", reply_markup=reply_markup
+    )
 
 
 async def _send_pdfs(bot, chat_id: str, pdfs: list[PdfAttachment]) -> dict[str, int]:
@@ -127,20 +194,37 @@ async def _send_pdfs(bot, chat_id: str, pdfs: list[PdfAttachment]) -> dict[str, 
 
 async def deliver_daily_digest(
     bot,
-    text: str,
+    messages: dict[str, Any],
     pdfs: list[PdfAttachment] | None = None,
 ) -> dict[str, Any]:
-    """Send the daily digest to the owner on Telegram + WhatsApp."""
+    """Send the daily briefing as separate messages on Telegram + WhatsApp.
+
+    Order: intro -> numbered story list (with featured buttons) -> optional
+    new-resources alert -> PDF attachments.
+    """
     settings = get_settings()
     owner = settings.telegram_owner_chat_id
     result: dict[str, Any] = {"telegram": False, "whatsapp": False, "pdfs": {}}
 
+    intro_text = str(messages.get("intro") or "")
+    stories_text = str(messages.get("stories") or "")
+    new_res_text = messages.get("new_resources")
+    markup = _featured_keyboard(messages.get("featured") or [], messages.get("items") or [])
+
     if owner:
-        result["telegram"] = await _send_telegram(bot, owner, text)
+        ok_intro = await _send_telegram(bot, owner, intro_text)
+        ok_stories = await _send_telegram(bot, owner, stories_text, reply_markup=markup)
+        if new_res_text:
+            await _send_telegram(bot, owner, str(new_res_text))
+        result["telegram"] = ok_intro and ok_stories
     else:
         logger.warning("TELEGRAM_OWNER_CHAT_ID not set — skipping Telegram digest")
 
-    result["whatsapp"] = await _send_whatsapp(text)
+    ok_wa_intro = await _send_whatsapp(intro_text)
+    ok_wa_stories = await _send_whatsapp(stories_text, reply_markup=markup)
+    if new_res_text:
+        await _send_whatsapp(str(new_res_text))
+    result["whatsapp"] = ok_wa_intro and ok_wa_stories
 
     if pdfs and owner:
         result["pdfs"] = await _send_pdfs(bot, owner, pdfs)

@@ -213,6 +213,43 @@ def list_publications(*, limit: int = 60, kind: str | None = None) -> list[dict[
         return []
 
 
+def get_publication_summary(kind: str, url: str, publication_date: str) -> str | None:
+    """Return the cached story brief for a publication row, if any."""
+    if not _table_ok("imt_publications") or not url:
+        return None
+    try:
+        db = get_db()
+        result = (
+            db.table("imt_publications")
+            .select("summary")
+            .eq("kind", kind)
+            .eq("url", url)
+            .eq("publication_date", publication_date)
+            .not_.is_("summary", "null")
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        summary = rows[0].get("summary") if rows else None
+        return str(summary) if summary else None
+    except Exception as exc:
+        _handle_error("imt_publications", "get_publication_summary", exc)
+        return None
+
+
+def update_publication_summary(kind: str, url: str, publication_date: str, summary: str) -> None:
+    """Cache a generated story brief on the matching publication row."""
+    if not _table_ok("imt_publications") or not url or not summary:
+        return
+    try:
+        db = get_db()
+        db.table("imt_publications").update({"summary": summary}).eq("kind", kind).eq(
+            "url", url
+        ).eq("publication_date", publication_date).execute()
+    except Exception as exc:
+        _handle_error("imt_publications", "update_publication_summary", exc)
+
+
 # --- imt_reports ---
 
 

@@ -9,6 +9,8 @@ export const useLibraryStore = defineStore('library', {
     publications: [],
     analysis: null,
     refreshing: false,
+    briefs: {},
+    briefLoading: {},
   }),
   getters: {
     categories: (s) => s.overview?.categories || [],
@@ -39,6 +41,23 @@ export const useLibraryStore = defineStore('library', {
     async fetchAnalysis() {
       const { data } = await api.get('/api/library/analysis')
       this.analysis = data
+    },
+    async fetchStoryBrief(item) {
+      const key = `${item.kind}|${item.url}`
+      if (this.briefs[key]) return this.briefs[key]
+      this.briefLoading = { ...this.briefLoading, [key]: true }
+      try {
+        const { data } = await api.get('/api/library/story-brief', {
+          params: { kind: item.kind, url: item.url, date: item.publication_date },
+        })
+        if (data.ok) {
+          this.briefs = { ...this.briefs, [key]: data.brief }
+          return data.brief
+        }
+        return null
+      } finally {
+        this.briefLoading = { ...this.briefLoading, [key]: false }
+      }
     },
     async refreshCatalog() {
       this.refreshing = true

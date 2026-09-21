@@ -7,7 +7,7 @@ from datetime import date
 import pytest
 
 from imt_access.catalog import parse_catalog, sync_catalog
-from imt_access.delivery import format_daily_digest, format_new_resources_alert
+from imt_access.delivery import build_digest_messages, format_new_resources_alert
 from imt_access.otp import extract_otp
 from imt_access.portal import _jwt_expiry
 from imt_access.publications import (
@@ -16,6 +16,7 @@ from imt_access.publications import (
     _parse_issue_date,
     fetch_ft_headlines,
 )
+from imt_access import stories as imt_stories
 
 CATALOG_HTML = """
 <html><body>
@@ -225,33 +226,165 @@ def test_fetch_ft_headlines_handles_failure(monkeypatch):
 # --- digest formatting ---
 
 
-def test_format_daily_digest_includes_all_sections():
+def _sample_digest_inputs():
     issue = EpwIssue(
         label="Vol. 61, Issue No. 38, 19 Sep, 2026",
         issue_path="/journal/2026/38",
         publication_date=date(2026, 9, 19),
     )
     issue.sections["Editorials"] = [
-        PublicationItem(kind="epw", title="Dire Straits for the Hegemon", url="http://x/a")
+        PublicationItem(kind="epw", title="Dire Straits for the Hegemon", url="http://x/a", section="Editorials")
+    ]
+    issue.sections["Special Articles"] = [
+        PublicationItem(kind="epw", title="Credit-Deposit Ratio", url="http://x/b", section="Special Articles")
     ]
     ft = [PublicationItem(kind="ft", title="FT headline one", url="https://www.ft.com/content/1")]
     et = [PublicationItem(kind="et_prime", title="ET Prime story one", url="https://economictimes.indiatimes.com/prime/1")]
-
-    text = format_daily_digest(epw_issue=issue, ft_items=ft, et_items=et, intro="Busy day.")
-    assert "Library Daily" in text
-    assert "Vol. 61, Issue No. 38" in text
-    assert "Dire Straits for the Hegemon" in text
-    assert "Financial Times" in text
-    assert "https://www.ft.com/content/1" in text
-    assert "ET Prime" in text
-    assert "Busy day." in text
+    return issue, ft, et
 
 
-def test_format_daily_digest_escapes_html():
+def test_build_digest_messages_split_and_numbered():
+    issue, ft, et = _sample_digest_inputs()
+    msgs = build_digest_messages(
+        epw_issue=issue, ft_items=ft, et_items=et, intro="Busy day.", run_date=date(2026, 9, 21)
+    )
+
+    # Intro and story list are separate messages.
+    assert "Library Daily" in msgs["intro"]
+    assert "Busy day." in msgs["intro"]
+    assert "Dire Straits" not in msgs["intro"]
+
+    stories = msgs["stories"]
+    assert "Today's stories" in stories
+    assert "Vol. 61, Issue No. 38" in stories
+    # Numbering is global across sources, in order: EPW sections -> FT -> ET.
+    assert "1. Dire Straits for the Hegemon" in stories
+    assert "2. Credit-Deposit Ratio" in stories
+    assert '3. <a href="https://www.ft.com/content/1">FT headline one</a>' in stories
+    assert "4. <a" in stories and "ET Prime story one</a>" in stories
+    assert "https://www.ft.com/content/1" in stories
+
+    # Ordered items match the numbering (manifest order).
+    assert [i.title for i in msgs["items"]] == [
+        "Dire Straits for the Hegemon",
+        "Credit-Deposit Ratio",
+        "FT headline one",
+        "ET Prime story one",
+    ]
+    # Featured: Special Articles pick (#2), first FT (#3), first ET Prime (#4).
+    assert msgs["featured"] == [2, 3, 4]
+
+
+def test_build_digest_messages_escapes_html():
     ft = [PublicationItem(kind="ft", title="A <b>bold</b> move & more", url="https://www.ft.com/content/1")]
-    text = format_daily_digest(epw_issue=None, ft_items=ft, et_items=[])
-    assert "<b>bold</b>" not in text
-    assert "&lt;b&gt;bold&lt;/b&gt;" in text
+    msgs = build_digest_messages(epw_issue=None, ft_items=ft, et_items=[])
+    assert "<b>bold</b>" not in msgs["stories"]
+    assert "&lt;b&gt;bold&lt;/b&gt;" in msgs["stories"]
+
+
+def test_build_digest_messages_new_resources_separate():
+    from imt_access.catalog import Resource
+
+    _issue, ft, _et = _sample_digest_inputs()
+    res = [Resource(portal_id="p1", name="New DB", category="Online Journals", url="http://x")]
+    msgs = build_digest_messages(
+        epw_issue=None, ft_items=ft, et_items=[], new_resources=res
+    )
+    assert msgs["new_resources"] is not None
+    assert "New DB" in msgs["new_resources"]
+    assert "New DB" not in msgs["stories"]
+
+
+# --- story manifest + briefs ---
+
+
+def test_manifest_roundtrip(monkeypatch):
+    saved: dict[str, str] = {}
+    monkeypatch.setattr(
+        imt_stories.store,
+        "save_report",
+        lambda kind, content: saved.update({"kind": kind, "content": content}),
+    )
+    monkeypatch.setattr(
+        imt_stories.store,
+        "get_latest_report",
+        lambda kind: {"content": saved["content"]} if saved.get("kind") == kind else None,
+    )
+
+    items = [
+        PublicationItem(kind="epw", title="A", url="http://x/a", section="Editorials"),
+        PublicationItem(kind="ft", title="B", url="http://x/b"),
+    ]
+    today = imt_stories.datetime.now(imt_stories.IST).date()
+    imt_stories.save_manifest(items, today)
+
+    manifest = imt_stories.load_manifest()
+    assert manifest is not None
+    assert manifest["date"] == today.isoformat()
+    assert imt_stories.manifest_size(manifest) == 2
+    assert imt_stories.manifest_item(manifest, 2)["title"] == "B"
+    assert imt_stories.manifest_item(manifest, 3) is None
+
+
+def test_load_manifest_rejects_stale(monkeypatch):
+    old = json.dumps({"date": "2020-01-01", "items": [{"n": 1, "kind": "ft", "title": "x", "url": "u"}]})
+    monkeypatch.setattr(imt_stories.store, "get_latest_report", lambda kind: {"content": old})
+    assert imt_stories.load_manifest() is None
+
+
+def test_get_story_brief_uses_cache(monkeypatch):
+    manifest = {
+        "date": imt_stories.datetime.now(imt_stories.IST).date().isoformat(),
+        "items": [{"n": 1, "kind": "ft", "title": "T", "url": "http://x/1", "section": ""}],
+    }
+    monkeypatch.setattr(imt_stories, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(imt_stories.store, "get_publication_summary", lambda *a: "cached brief")
+    result = imt_stories.get_story_brief(1)
+    assert result["brief"] == "cached brief"
+    assert result["cached"] is True
+
+
+def test_get_story_brief_generates_and_caches(monkeypatch):
+    manifest = {
+        "date": imt_stories.datetime.now(imt_stories.IST).date().isoformat(),
+        "items": [{"n": 1, "kind": "ft", "title": "T", "url": "http://x/1", "section": ""}],
+    }
+    monkeypatch.setattr(imt_stories, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(imt_stories.store, "get_publication_summary", lambda *a: None)
+    monkeypatch.setattr(imt_stories, "fetch_story_text", lambda item: ("some text " * 100, True))
+    monkeypatch.setattr(imt_stories, "build_story_brief", lambda item, text, full: "fresh brief")
+    updated: list[tuple] = []
+    monkeypatch.setattr(
+        imt_stories.store, "update_publication_summary", lambda *a: updated.append(a)
+    )
+    result = imt_stories.get_story_brief(1)
+    assert result["brief"] == "fresh brief"
+    assert result["cached"] is False
+    assert updated and updated[0][3] == "fresh brief"
+
+
+def test_format_story_brief_message():
+    result = {
+        "item": {"kind": "epw", "title": "Credit & You", "url": "http://x/a", "section": "Special Articles"},
+        "brief": "• point one\nWhy it matters for you: banking",
+        "date": "2026-09-21",
+    }
+    text = imt_stories.format_story_brief_message(result)
+    assert "Credit &amp; You" in text
+    assert "EPW" in text
+    assert "Special Articles" in text
+    assert "point one" in text
+    assert "http://x/a" in text
+
+
+def test_story_number_regex():
+    from bot.handlers import _STORY_NUM_RE
+
+    for text, n in [("7", 7), ("12", 12), ("story 7", 7), ("Story #12", 12), ("brief 3", 3)]:
+        m = _STORY_NUM_RE.match(text)
+        assert m and int(m.group(1)) == n
+    for text in ("story", "123", "7 pm", "seven", "story time", ""):
+        assert _STORY_NUM_RE.match(text) is None
 
 
 def test_format_new_resources_alert():

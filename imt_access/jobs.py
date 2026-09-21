@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from imt_access import analyze, delivery, store
+from imt_access import analyze, delivery, store, stories
 from imt_access.catalog import sync_catalog
 from imt_access.portal import PortalClient
 from imt_access.publications import (
@@ -145,21 +145,24 @@ async def run_daily_job(
         except Exception as exc:
             logger.info("LLM intro skipped: %s", exc)
 
-    text = delivery.format_daily_digest(
+    messages = delivery.build_digest_messages(
         epw_issue=epw_issue,
         ft_items=ft_items,
         et_items=et_items,
         intro=intro,
         new_resources=new_resources or None,
+        run_date=today,
     )
 
-    # Persist publication items for the web app.
+    # Persist publication items for the web app + the story manifest so
+    # /story <n> (or a bare "7" reply) resolves hours later on any channel.
     rows = []
     if epw_issue:
         rows.extend(item.to_row() for item in epw_issue.items)
     rows.extend(item.to_row() for item in ft_items)
     rows.extend(item.to_row() for item in et_items)
     inserted = await asyncio.to_thread(store.insert_publications, rows)
+    await asyncio.to_thread(stories.save_manifest, messages["items"], today)
 
     result: dict[str, Any] = {
         "ok": True,
@@ -178,10 +181,10 @@ async def run_daily_job(
     }
 
     if dry_run:
-        result["preview"] = text[:2000]
+        result["preview"] = (messages["intro"] + "\n\n" + messages["stories"])[:2000]
         return result
 
-    delivery_result = await delivery.deliver_daily_digest(bot, text, pdfs)
+    delivery_result = await delivery.deliver_daily_digest(bot, messages, pdfs)
     result["delivery"] = delivery_result
 
     any_sent = bool(delivery_result.get("telegram") or delivery_result.get("whatsapp"))

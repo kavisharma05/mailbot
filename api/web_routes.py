@@ -38,6 +38,7 @@ from gmail_api.auth import reset_gmail_user_context, set_gmail_user_context
 from services.mailbox_user import reset as reset_mailbox_user
 from services.mailbox_user import set_user as set_mailbox_user
 from gmail_api.client import send_email
+from services.contacts import (
     extract_person_reference,
     looks_like_recipient_switch,
     resolve_contact_email,
@@ -1108,6 +1109,40 @@ async def library_analysis():
         "available": True,
         "content": report.get("content"),
         "created_at": report.get("created_at"),
+    }
+
+
+@router.get("/library/story-brief")
+async def library_story_brief(kind: str, url: str, date: str):
+    """On-demand detailed brief for one story (cached after first request)."""
+    from imt_access import stories as imt_stories
+
+    item = {"kind": kind, "url": url, "title": "", "section": ""}
+
+    def _load() -> dict[str, Any]:
+        # Fill in the title from the stored publication row when possible.
+        from imt_access import store as imt_store
+
+        rows = imt_store.list_publications(limit=200, kind=kind)
+        for row in rows:
+            if row.get("url") == url:
+                item["title"] = row.get("title") or ""
+                item["section"] = row.get("section") or ""
+                break
+        return imt_stories.get_brief_for_item(item, date)
+
+    try:
+        result = await asyncio.to_thread(_load)
+    except Exception as exc:
+        logger.warning("library story-brief failed: %s", exc)
+        return {"ok": False, "error": "brief_unavailable"}
+    if not result.get("brief"):
+        return {"ok": False, "error": "brief_unavailable", "item": result.get("item")}
+    return {
+        "ok": True,
+        "title": result["item"].get("title"),
+        "brief": result["brief"],
+        "cached": result.get("cached", False),
     }
 
 
