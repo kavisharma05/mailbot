@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import time
 from collections import OrderedDict
+
+logger = logging.getLogger(__name__)
 
 # Telegram may retry the same update while Gmail+LLM work is still running.
 _DEDUPE_TTL_SECONDS = 600
@@ -70,19 +73,45 @@ async def should_process_webhook_event(event_id: str | None) -> bool:
             _seen_str.pop(uid, None)
         if key in _seen_str:
             return False
+
+    try:
+        from services.db import webhook_event_seen
+
+        seen = await asyncio.to_thread(webhook_event_seen, key)
+    except Exception:
+        seen = None
+    if seen is True:
+        async with _lock:
+            _seen_str[key] = now
+        return False
+
+    async with _lock:
+        if key in _seen_str:
+            return False
         _seen_str[key] = now
         while len(_seen_str) > _MAX_ENTRIES:
             _seen_str.popitem(last=False)
+        return True
 
+
+async def forget_webhook_event(event_id: str | None) -> None:
+    """Allow a retry after handling failed. A stored success is not forgotten."""
+    if not event_id:
+        return
+    async with _lock:
+        _seen_str.pop(str(event_id), None)
+
+
+async def remember_webhook_event(event_id: str | None) -> None:
+    """Persist a successfully handled id so a restart does not answer it twice."""
+    if not event_id:
+        return
     try:
         from services.db import claim_webhook_event
 
-        claimed = await asyncio.to_thread(claim_webhook_event, key)
+        await asyncio.to_thread(claim_webhook_event, str(event_id))
     except Exception:
-        claimed = None
-    if claimed is False:
-        return False
-    return True
+        logger.debug("webhook event persist failed", exc_info=True)
 
 
 async def already_sent_content(chat_id: str | int, text: str) -> bool:

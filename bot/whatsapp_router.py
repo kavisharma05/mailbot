@@ -269,7 +269,10 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
     if wants_digest:
         flushed = await flush_pending_digest(normalized, user_data)
     else:
-        await announce_pending_digest(normalized, user_data)
+        try:
+            await announce_pending_digest(normalized, user_data)
+        except Exception:
+            logger.exception("WhatsApp digest nudge failed")
 
     # Menu / digest-keyword turns can return after the flush.
     if msg_type == "text":

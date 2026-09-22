@@ -22,6 +22,25 @@ def _phone_to_user_id(phone: str) -> int:
     return abs(hash(digits)) % (10**12)
 
 
+def _owner_actor_id(phone: str) -> int:
+    """Telegram owner id, so handlers recognize this WhatsApp chat.
+
+    The Cloud API user id is a phone number. That never matches the Telegram
+    owner id, and chat_message then returns without sending a reply.
+    """
+    try:
+        from config import get_settings
+
+        settings = get_settings()
+        raw = settings.owner_user_id() if hasattr(settings, "owner_user_id") else ""
+        raw = str(raw or "").strip()
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+    except Exception:
+        logger.debug("WhatsApp owner id lookup failed", exc_info=True)
+    return _phone_to_user_id(phone)
+
+
 @dataclass
 class WhatsAppUser:
     id: int
@@ -50,9 +69,9 @@ class WhatsAppMessage:
         self.text = text
         self.message_id = message_id
         self._bot = bot
-        uid = _phone_to_user_id(phone)
-        self.from_user = WhatsAppUser(id=uid)
-        self.chat = WhatsAppChat(id=uid, inbound_message_id=message_id)
+        phone_id = _phone_to_user_id(phone)
+        self.from_user = WhatsAppUser(id=_owner_actor_id(phone))
+        self.chat = WhatsAppChat(id=phone_id, inbound_message_id=message_id)
         self.reply_to_message = None
         self.entities = None
 
@@ -75,9 +94,9 @@ class WhatsAppCallbackMessage:
     def __init__(self, phone: str, bot: WhatsAppBot) -> None:
         self._phone = phone
         self._bot = bot
-        uid = _phone_to_user_id(phone)
-        self.chat_id = uid
-        self.chat = WhatsAppChat(id=uid)
+        phone_id = _phone_to_user_id(phone)
+        self.chat_id = phone_id
+        self.chat = WhatsAppChat(id=phone_id)
         self.text: str | None = None
         self.caption: str | None = None
         self.message_id = 0
@@ -98,8 +117,7 @@ class WhatsAppCallbackQuery:
         self.data = data
         self._bot = bot
         self.message = WhatsAppCallbackMessage(phone, bot)
-        uid = _phone_to_user_id(phone)
-        self.from_user = WhatsAppUser(id=uid)
+        self.from_user = WhatsAppUser(id=_owner_actor_id(phone))
 
     async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
         del text, show_alert
@@ -116,6 +134,8 @@ class WhatsAppCallbackQuery:
 
 
 class WhatsAppUpdate:
+    is_whatsapp = True
+
     def __init__(
         self,
         *,

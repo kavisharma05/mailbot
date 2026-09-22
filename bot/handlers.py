@@ -2164,8 +2164,16 @@ async def chat_message(
     text_override: str | None = None,
 ) -> None:
     """Answer free-text questions in DMs, mentions, or replies to the bot."""
-    if not _require_user(update) or not update.message or not (text_override or update.message.text):
+    if not update.message or not (text_override or update.message.text):
         return
+    if not _require_user(update):
+        if not getattr(update, "is_whatsapp", False):
+            return
+        from services.mailbox_user import set_user
+        from services.user_ids import OWNER_SEED_USER_ID
+        from services.users import get_owner_user
+
+        set_user(get_owner_user() or {"id": OWNER_SEED_USER_ID, "role": "owner", "is_active": True})
     input_text = text_override or update.message.text
 
     if _get_compose(context.user_data):

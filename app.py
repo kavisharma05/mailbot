@@ -31,7 +31,12 @@ from services.messaging.outbox import take_outbound
 from services.messaging.pending_digest import stash_and_nudge
 from services.messaging.webhook import extract_inbound_messages, extract_status_events
 from services.messaging.whatsapp import errors_indicate_outside_window, get_whatsapp_client
-from services.telegram_dedupe import should_process_update, should_process_webhook_event
+from services.telegram_dedupe import (
+    forget_webhook_event,
+    remember_webhook_event,
+    should_process_update,
+    should_process_webhook_event,
+)
 from services.timeutil import digest_window_open, now_ist
 from services.monitoring import ping_heartbeat
 from services.reminders import run_scheduled_reminders
@@ -370,6 +375,18 @@ async def _process_whatsapp_payload(payload: dict) -> None:
             await process_whatsapp_message(phone, msg)
         except Exception as exc:
             logger.exception("WhatsApp message handling failed: %s", exc)
+            await forget_webhook_event(msg_id)
+            try:
+                await client.send_text(
+                    phone,
+                    "I hit a problem answering that. Send it once more.",
+                    from_html=False,
+                    template_fallback=False,
+                )
+            except Exception:
+                logger.debug("WhatsApp error reply failed", exc_info=True)
+        else:
+            await remember_webhook_event(msg_id)
 
 
 @fastapi_app.get("/whatsapp/webhook")

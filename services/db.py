@@ -996,6 +996,30 @@ def get_class_sessions_for_message(
 _webhook_events_table_missing = False
 
 
+def webhook_event_seen(event_id: str) -> bool | None:
+    """True if this id was already handled, False if not, None if the table is missing."""
+    global _webhook_events_table_missing
+    if _webhook_events_table_missing or not event_id:
+        return None
+    try:
+        db = get_db()
+        existing = (
+            db.table("webhook_events")
+            .select("event_id")
+            .eq("event_id", event_id)
+            .limit(1)
+            .execute()
+        )
+        return bool(existing.data)
+    except Exception as exc:
+        err = str(exc).lower()
+        if "webhook_events" in err and ("does not exist" in err or "42p01" in err):
+            _webhook_events_table_missing = True
+            return None
+        logger.warning("webhook_event_seen failed: %s", exc)
+        return None
+
+
 def claim_webhook_event(event_id: str) -> bool | None:
     """Return True if this event id is new, False if already stored, None if the table is missing."""
     global _webhook_events_table_missing

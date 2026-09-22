@@ -8,6 +8,60 @@ def test_command_map_includes_core_commands():
         assert cmd in _COMMANDS
 
 
+def test_whatsapp_actor_is_the_telegram_owner_not_the_phone(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_OWNER_USER_ID", "424242")
+    from config import get_settings
+
+    get_settings.cache_clear()
+    from bot.whatsapp_adapter import build_text_update
+
+    update = build_text_update("919999999999", "hi", "wamid.1")
+    assert update.effective_user.id == 424242
+    assert update.effective_chat.id == 919999999999
+    get_settings.cache_clear()
+
+
+def test_whatsapp_hi_reaches_chat(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("WHATSAPP_OWNER_PHONE", "919999999999")
+    from config import get_settings
+
+    get_settings.cache_clear()
+    from bot import whatsapp_router
+
+    seen: list[str] = []
+
+    async def fake_load(_phone):
+        return {}
+
+    async def fake_save(_phone, _data):
+        return None
+
+    async def fake_chat(update, context, **kwargs):
+        seen.append(update.message.text)
+        await update.message.reply_text("Hey — ask about deadlines, mail, or classes, or send /menu.")
+
+    monkeypatch.setattr(whatsapp_router, "load_user_data", fake_load)
+    monkeypatch.setattr(whatsapp_router, "save_user_data", fake_save)
+    monkeypatch.setattr(whatsapp_router, "announce_pending_digest", AsyncMock(return_value=False))
+    monkeypatch.setattr(whatsapp_router.handlers, "chat_message", fake_chat)
+    monkeypatch.setattr(
+        "bot.whatsapp_adapter.get_whatsapp_client",
+        lambda: type("C", (), {"send_text": AsyncMock(return_value=True)})(),
+    )
+
+    asyncio.run(
+        whatsapp_router.process_whatsapp_message(
+            "919999999999",
+            {"id": "m-hi", "type": "text", "text": {"body": "hi"}},
+        )
+    )
+    assert seen == ["hi"]
+    get_settings.cache_clear()
+
+
 def test_whatsapp_message_has_entities_so_chat_does_not_crash():
     from bot.whatsapp_adapter import build_text_update
 
