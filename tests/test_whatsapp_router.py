@@ -62,6 +62,80 @@ def test_whatsapp_hi_reaches_chat(monkeypatch):
     get_settings.cache_clear()
 
 
+def test_unknown_whatsapp_command_gets_a_reply(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("WHATSAPP_OWNER_PHONE", "919999999999")
+    from config import get_settings
+
+    get_settings.cache_clear()
+    from bot import whatsapp_router
+
+    sent: list[str] = []
+
+    async def fake_load(_phone):
+        return {}
+
+    async def fake_save(_phone, _data):
+        return None
+
+    async def fake_send(_self, phone, text, **kwargs):
+        del phone, kwargs
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(whatsapp_router, "load_user_data", fake_load)
+    monkeypatch.setattr(whatsapp_router, "save_user_data", fake_save)
+    monkeypatch.setattr(whatsapp_router, "announce_pending_digest", AsyncMock(return_value=False))
+    client = type("C", (), {"send_text": fake_send})()
+    monkeypatch.setattr(whatsapp_router, "get_whatsapp_client", lambda: client)
+
+    asyncio.run(
+        whatsapp_router.process_whatsapp_message(
+            "919999999999",
+            {"id": "m-x", "type": "text", "text": {"body": "/notacommand"}},
+        )
+    )
+    assert sent and "don't know that command" in sent[0].lower()
+    get_settings.cache_clear()
+
+
+def test_callback_toast_is_a_message_unless_the_tap_already_replied():
+    import asyncio
+
+    from bot.whatsapp_adapter import WhatsAppBot, WhatsAppCallbackQuery
+
+    sent: list[str] = []
+
+    class Bot(WhatsAppBot):
+        async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None, **kwargs):
+            del chat_id, parse_mode, reply_markup, kwargs
+            sent.append(text)
+            return None
+
+    bot = Bot()
+    query = WhatsAppCallbackQuery("919999999999", "act:done:1", bot)
+
+    async def run():
+        await query.answer("Already closed or not found.")
+        assert query.take_notice() == "Already closed or not found."
+        await query.answer("Marked done.")
+        await query.edit_message_text("Done")
+        assert query.take_notice() is None
+
+    asyncio.run(run())
+    assert sent == ["Done"]
+
+
+def test_smalltalk_covers_hii_and_good_morning():
+    from bot.handlers import _is_smalltalk
+
+    assert _is_smalltalk("hii")
+    assert _is_smalltalk("Good morning!")
+    assert not _is_smalltalk("what's due tomorrow")
+
+
 def test_whatsapp_message_has_entities_so_chat_does_not_crash():
     from bot.whatsapp_adapter import build_text_update
 

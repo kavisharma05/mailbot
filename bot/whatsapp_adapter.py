@@ -94,6 +94,7 @@ class WhatsAppCallbackMessage:
     def __init__(self, phone: str, bot: WhatsAppBot) -> None:
         self._phone = phone
         self._bot = bot
+        self._query: WhatsAppCallbackQuery | None = None
         phone_id = _phone_to_user_id(phone)
         self.chat_id = phone_id
         self.chat = WhatsAppChat(id=phone_id)
@@ -104,6 +105,9 @@ class WhatsAppCallbackMessage:
 
     async def reply_text(self, text: str, parse_mode: str | None = None, reply_markup: Any = None, **kwargs: Any):
         del kwargs
+        if self._query is not None:
+            self._query._notice = None
+            self._query._replied = True
         await self._bot.send_message(self._phone, text, parse_mode=parse_mode, reply_markup=reply_markup)
         return _SentMessageStub()
 
@@ -116,11 +120,22 @@ class WhatsAppCallbackQuery:
         self._phone = phone
         self.data = data
         self._bot = bot
+        self._notice: str | None = None
+        self._replied = False
         self.message = WhatsAppCallbackMessage(phone, bot)
+        self.message._query = self
         self.from_user = WhatsAppUser(id=_owner_actor_id(phone))
 
     async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
-        del text, show_alert
+        """Telegram shows this as a toast. WhatsApp has no toast, so keep the text to send."""
+        del show_alert
+        if text and str(text).strip():
+            self._notice = str(text).strip()
+
+    def take_notice(self) -> str | None:
+        text = None if self._replied else self._notice
+        self._notice = None
+        return text
 
     async def edit_message_text(
         self,
@@ -130,6 +145,8 @@ class WhatsAppCallbackQuery:
         **kwargs: Any,
     ) -> None:
         del kwargs
+        self._notice = None
+        self._replied = True
         await self._bot.send_message(self._phone, text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
@@ -180,7 +197,9 @@ class WhatsAppBot:
         phone = str(chat_id).lstrip("+")
         client = get_whatsapp_client()
         from_html = parse_mode == "HTML"
-        await client.send_text(phone, text, from_html=from_html, reply_markup=reply_markup)
+        ok = await client.send_text(phone, text, from_html=from_html, reply_markup=reply_markup)
+        if not ok:
+            raise RuntimeError("WhatsApp send failed")
         return _SentMessageStub()
 
     async def delete_message(self, chat_id: str | int, message_id: int) -> None:

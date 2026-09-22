@@ -249,6 +249,9 @@ async def lifespan(app: FastAPI):
     await ptb_app.initialize()
     await ptb_app.start()
     await register_bot_commands(ptb_app)
+    from bot.whatsapp_adapter import whatsapp_bot
+
+    whatsapp_bot.username = ptb_app.bot.username
     logger.info("Telegram application started")
     watcher_task = asyncio.create_task(_background_watcher_loop())
     keep_alive_task = asyncio.create_task(_keep_alive_loop())

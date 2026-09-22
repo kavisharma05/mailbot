@@ -156,6 +156,8 @@ async def _send_piece_with_retry(
             raise
         except Exception as exc:
             last_error = str(exc)
+            if "WhatsApp send failed" in last_error:
+                raise
             if mode == "HTML" and allow_plain_fallback and _is_html_parse_error(exc):
                 logger.warning("HTML parse failed; retrying chunk as plain text")
                 piece = _strip_html_tags(piece)

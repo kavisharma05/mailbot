@@ -141,7 +141,24 @@ _TASK_CANCEL_WORDS = frozenset({"cancel", "stop", "discard", "abort", "/cancel"}
 # How many recent message IDs to try when clearing bot clutter in owner DM
 _CLEAR_CHAT_SCAN_LIMIT = 25
 
-GREETINGS = {"hi", "hey", "hello", "yo", "sup", "hii", "hiii", "heya"}
+GREETINGS = {"hi", "hey", "hello", "yo", "sup", "hii", "hiii", "heya", "hola"}
+_SMALLTALK = GREETINGS | {
+    "thanks",
+    "thank you",
+    "thx",
+    "ok",
+    "okay",
+    "good morning",
+    "good evening",
+    "good night",
+    "gm",
+    "gn",
+}
+
+
+def _is_smalltalk(question: str) -> bool:
+    cleaned = re.sub(r"[^a-z\s]", "", (question or "").lower()).strip()
+    return cleaned in _SMALLTALK
 
 SCHEDULE_KEYWORDS = ("class", "classes", "schedule", "timetable", "time table", "lecture")
 
@@ -189,7 +206,9 @@ def _resolve_user(update: Update) -> dict[str, Any] | None:
         else getattr(settings, "telegram_owner_user_id", "")
         or getattr(settings, "telegram_owner_chat_id", "")
     )
-    if str(tg.id) == str(owner_id):
+    if str(tg.id) == str(owner_id) or getattr(update, "is_whatsapp", False):
+        # WhatsApp is already limited to the owner phone. Treat that chat as
+        # the owner even when the Cloud API id is the phone, not the Telegram id.
         return get_owner_user() or {
             "id": OWNER_SEED_USER_ID,
             "role": "owner",
@@ -1506,8 +1525,12 @@ async def story_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer()
         return
     await query.answer("Fetching the story brief…")
-    if query.message:
-        await _send_story_brief_reply(query.message, n)
+    if not query.message:
+        return
+    if not await _send_story_brief_reply(query.message, n):
+        await query.message.reply_text(
+            "No story with that number. Send /library for the latest list."
+        )
 
 
 async def library_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2267,7 +2290,7 @@ async def chat_message(
             return
         # No such story — fall through to normal chat handling.
 
-    greeting = re.fullmatch(r"(?:hi|hello|hey|thanks|thank you)[.!]?", question, flags=re.IGNORECASE)
+    greeting = _is_smalltalk(question)
     if greeting:
         reply = "Hey — ask about deadlines, mail, or classes, or send /menu."
         await update.message.reply_text(reply)
@@ -2671,7 +2694,10 @@ async def backfill_contacts_command(update: Update, context: ContextTypes.DEFAUL
 
 
 async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not update.message:
+        return
+    if not _is_owner(update):
+        await update.message.reply_text("Only the owner can invite people.")
         return
     from services.users import create_invite
 
@@ -2683,7 +2709,8 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not invite:
         await update.message.reply_text("Could not create invite.")
         return
-    link = f"https://t.me/{context.bot.username}?start=invite_{invite['invite_code']}"
+    bot_name = context.bot.username or "IMTAssistant_bot"
+    link = f"https://t.me/{bot_name}?start=invite_{invite['invite_code']}"
     await update.message.reply_text(
         f"Invite for @{invite['username']} (expires {invite['expires_at'][:10]}):\n{link}\n\n"
         "They tap that link and press Start. Then they open "
@@ -2712,7 +2739,10 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update) or not update.message:
+    if not update.message:
+        return
+    if not _is_owner(update):
+        await update.message.reply_text("Only the owner can list users.")
         return
     from services.users import list_users
 

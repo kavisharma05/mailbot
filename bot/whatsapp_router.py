@@ -48,6 +48,9 @@ _COMMANDS: dict[str, object] = {
     "cancel": handlers.cancel_command,
     "reset": handlers.reset_command,
     "new": handlers.reset_command,
+    "login": handlers.login_command,
+    "invite": handlers.invite_command,
+    "users": handlers.users_command,
     "backfill_contacts": handlers.backfill_contacts_command,
 }
 
@@ -83,6 +86,12 @@ async def _dispatch_callback(data: str, phone: str, user_data: dict) -> None:
             await handler(update, context)  # type: ignore[operator]
         else:
             logger.info("Unknown WhatsApp menu command: %s", cmd[:40])
+            await get_whatsapp_client().send_text(
+                phone,
+                "I don't know that menu item. Send /menu to see the list.",
+                from_html=False,
+                template_fallback=False,
+            )
         return
 
     update = build_callback_update(phone, data)
@@ -101,12 +110,26 @@ async def _dispatch_callback(data: str, phone: str, user_data: dict) -> None:
         try:
             offset = int(data.split(":", 1)[1])
         except ValueError:
+            await get_whatsapp_client().send_text(
+                phone,
+                "I couldn't open that story list. Reply with a story number instead.",
+                from_html=False,
+                template_fallback=False,
+            )
             return
         manifest = imt_stories.load_manifest()
         items = manifest["items"] if manifest else []
         picker = whatsapp_story_chunk_picker(items, offset)
         if picker:
             await get_whatsapp_client().send_interactive(phone, picker)
+        else:
+            await get_whatsapp_client().send_text(
+                phone,
+                "No stories in that section. Reply with a story number from the list.",
+                from_html=False,
+                template_fallback=False,
+            )
+        return
     elif data == handlers.CLEAR_CHAT_CB:
         await handlers.clear_chat_button(update, context)
     elif data.startswith("act:"):
@@ -119,7 +142,22 @@ async def _dispatch_callback(data: str, phone: str, user_data: dict) -> None:
         await handlers.confirm_callback(update, context)
     else:
         logger.info("Unhandled WhatsApp callback: %s", data[:80])
+        await get_whatsapp_client().send_text(
+            phone,
+            "I didn't recognize that tap. Send /menu or type a question.",
+            from_html=False,
+            template_fallback=False,
+        )
         return
+
+    notice = update.callback_query.take_notice() if update.callback_query else None
+    if notice:
+        await get_whatsapp_client().send_text(
+            phone,
+            notice,
+            from_html=False,
+            template_fallback=False,
+        )
 
 
 async def _dispatch_text(text: str, phone: str, message_id: str, user_data: dict) -> None:
@@ -141,6 +179,13 @@ async def _dispatch_text(text: str, phone: str, message_id: str, user_data: dict
             update = build_text_update(phone, stripped, message_id)
             await handler(update, context)  # type: ignore[operator]
             return
+        await get_whatsapp_client().send_text(
+            phone,
+            "I don't know that command. Send /menu, or just type a question.",
+            from_html=False,
+            template_fallback=False,
+        )
+        return
 
     # Bare "menu" keyword (MNP-bot style) opens the interactive menu.
     if stripped.lower() in MENU_KEYWORDS:
@@ -345,6 +390,13 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
                 cb = ""
             if cb:
                 await _dispatch_callback(cb, normalized, user_data)
+            else:
+                await get_whatsapp_client().send_text(
+                    normalized,
+                    "I didn't catch that tap. Send /menu or type a question.",
+                    from_html=False,
+                    template_fallback=False,
+                )
         elif msg_type in {"image", "audio", "voice"}:
             await _process_media(
                 message,
@@ -353,7 +405,15 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
                 user_data=user_data,
             )
         else:
-            logger.debug("Unsupported WhatsApp message type: %s", msg_type)
+            if msg_type not in {"reaction", "system", "unsupported", ""}:
+                await get_whatsapp_client().send_text(
+                    normalized,
+                    "I can read text, photos, and voice notes. Send one of those, or /menu.",
+                    from_html=False,
+                    template_fallback=False,
+                )
+            else:
+                logger.debug("Unsupported WhatsApp message type: %s", msg_type)
     finally:
         if user_data != snapshot:
             await save_user_data(normalized, user_data)

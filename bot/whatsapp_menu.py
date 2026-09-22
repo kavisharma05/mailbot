@@ -23,8 +23,8 @@ MENU_KEYWORDS = {"menu", "main menu", "options"}
 
 _WELCOME_BODY = (
     "👋 *Mailbot ready!*\n\n"
-    "Morning (7 AM) and evening (8 PM) digests land here — "
-    "if one is waiting, any reply opens it.\n"
+    "Morning and evening digests land here. "
+    "If one is waiting, reply DIGEST to open it.\n"
     "Tap *📋 Open menu* below — or just type a question about "
     "your mail, deadlines, or tasks."
 )
