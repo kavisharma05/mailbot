@@ -16,7 +16,11 @@ from bot.whatsapp_adapter import (
     whatsapp_bot,
 )
 from bot.whatsapp_menu import CMD_PREFIX, MENU_KEYWORDS, send_main_menu
-from services.messaging.pending_digest import DIGEST_KEYWORDS, flush_pending_digest
+from services.messaging.pending_digest import (
+    DIGEST_KEYWORDS,
+    announce_pending_digest,
+    flush_pending_digest,
+)
 from services.messaging.phone import normalize_wa_digits, wa_phones_match
 from services.messaging.state import load_user_data, save_user_data
 from services.messaging.whatsapp import get_whatsapp_client
@@ -238,10 +242,34 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
     msg_id = str(message.get("id") or "")
     msg_type = message.get("type")
 
-    # Any inbound message opens Meta's 24h window — deliver a stashed digest first.
+    # An inbound message opens Meta's 24h window. The full digest is sent only
+    # when they ask for it, so Hello and /menu do not dump a briefing.
     user_data = await load_user_data(normalized)
     snapshot = copy.deepcopy(user_data)
-    flushed = await flush_pending_digest(normalized, user_data)
+    wants_digest = False
+    if msg_type == "text":
+        body = (message.get("text") or {}).get("body") or ""
+        stripped = body.strip()
+        lower = stripped.lower()
+        wants_digest = lower in DIGEST_KEYWORDS or (
+            stripped.startswith("/")
+            and stripped.split()[0][1:].split("@")[0].lower() == "digest"
+        )
+    elif msg_type == "interactive":
+        interactive = message.get("interactive") or {}
+        if interactive.get("type") == "list_reply":
+            cb = (interactive.get("list_reply") or {}).get("id") or ""
+        elif interactive.get("type") == "button_reply":
+            cb = (interactive.get("button_reply") or {}).get("id") or ""
+        else:
+            cb = ""
+        wants_digest = cb == f"{CMD_PREFIX}digest"
+
+    flushed = False
+    if wants_digest:
+        flushed = await flush_pending_digest(normalized, user_data)
+    else:
+        await announce_pending_digest(normalized, user_data)
 
     # Menu / digest-keyword turns can return after the flush.
     if msg_type == "text":
@@ -260,7 +288,9 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
             if user_data != snapshot:
                 await save_user_data(normalized, user_data)
             return
-        if lower in DIGEST_KEYWORDS:
+        if lower in DIGEST_KEYWORDS or (
+            stripped.startswith("/") and stripped.split()[0][1:].split("@")[0].lower() == "digest"
+        ):
             if not flushed:
                 await get_whatsapp_client().send_text(
                     normalized,

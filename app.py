@@ -32,7 +32,7 @@ from services.messaging.pending_digest import stash_and_nudge
 from services.messaging.webhook import extract_inbound_messages, extract_status_events
 from services.messaging.whatsapp import errors_indicate_outside_window, get_whatsapp_client
 from services.telegram_dedupe import should_process_update, should_process_webhook_event
-from services.timeutil import now_ist
+from services.timeutil import digest_window_open, now_ist
 from services.monitoring import ping_heartbeat
 from services.reminders import run_scheduled_reminders
 from services.watcher import (
@@ -496,6 +496,10 @@ async def digest_morning(
     if not hmac.compare_digest(x_task_secret, settings.task_secret):
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
+    if not dry_run and not force and not digest_window_open("morning"):
+        logger.info("Morning digest skipped: outside 07:00–09:00 IST")
+        return {"ok": True, "skipped": "outside_window"}
+
     result = await run_morning_digest(
         ptb_app.bot, dry_run=bool(dry_run), force=bool(force)
     )
@@ -512,6 +516,10 @@ async def digest_evening(
     settings = get_settings()
     if not hmac.compare_digest(x_task_secret, settings.task_secret):
         raise HTTPException(status_code=403, detail="Invalid task secret")
+
+    if not dry_run and not force and not digest_window_open("evening"):
+        logger.info("Evening digest skipped: outside 20:00–22:00 IST")
+        return {"ok": True, "skipped": "outside_window"}
 
     result = await run_evening_digest(
         ptb_app.bot, dry_run=bool(dry_run), force=bool(force)
@@ -532,6 +540,10 @@ async def imt_daily_task(
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
     from imt_access.jobs import run_daily_job
+
+    if not dry_run and not force and not digest_window_open("library"):
+        logger.info("Library digest skipped: outside 07:15–10:00 IST")
+        return {"ok": True, "skipped": "outside_window"}
 
     async with imt_daily_lock:
         result = await run_daily_job(

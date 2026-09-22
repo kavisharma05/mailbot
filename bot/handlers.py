@@ -953,8 +953,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await start_command(update, context)
 
 
+def _web_login_url() -> str:
+    base = (get_settings().render_url or "https://mailbot-rl4s.onrender.com").rstrip("/")
+    return f"{base}/login"
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from services.users import claim_invite, is_owner_user, link_telegram_to_user
+    from services.users import claim_invite, is_owner_user, link_telegram_to_user, request_login_code
 
     tg = update.effective_user
     chat = update.effective_chat
@@ -963,6 +968,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     args = context.args or []
     if args and str(args[0]).startswith("invite_"):
+        if not (tg.username or "").strip():
+            await update.message.reply_text(
+                "Set a Telegram @username in your profile first, then open the invite link again."
+            )
+            return
         code = str(args[0])[len("invite_") :]
         claimed = claim_invite(
             code,
@@ -970,11 +980,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             telegram_chat_id=str(chat.id),
             telegram_username=tg.username,
         )
-        if claimed:
+        if isinstance(claimed, dict) and claimed.get("_claim_error") == "username_mismatch":
+            expected = claimed.get("expected") or "the invited username"
             await update.message.reply_text(
-                "You're registered. Open the web app and log in with your Telegram username.\n"
-                "Use /login anytime for a fresh web login code."
+                f"This invite is for @{expected}. You're @{tg.username}. "
+                "Ask the owner to send a link for your username."
             )
+            return
+        if claimed:
+            username = str(claimed.get("telegram_username") or tg.username or "").lstrip("@")
+            login = request_login_code(username) if username else {}
+            otp = login.pop("_code_for_bot", None) if isinstance(login, dict) else None
+            lines = [
+                "You're registered.",
+                "",
+                f"1. Open {_web_login_url()}",
+                f"2. Username: @{username}" if username else "2. Send /login for a web code",
+            ]
+            if otp:
+                lines.append(f"3. Code (10 minutes): {otp}")
+            else:
+                lines.append("3. Send /login here if you need a new code")
+            lines.append("4. After you sign in, tap Connect Gmail. Mail alerts start once that finishes.")
+            await update.message.reply_text("\n".join(lines))
         else:
             await update.message.reply_text("That invite link is invalid or expired.")
         return
@@ -1028,9 +1056,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         msg = await update.message.reply_text(
             "Welcome to Mailbot.\n\n"
-            "Connect Gmail in the web app, then you'll get deadline alerts here.\n"
-            "/login — get a code for the web app\n"
-            "/due /classes /ask /send — same as the owner bot.\n"
+            f"1. Open {_web_login_url()} and sign in with your Telegram username.\n"
+            "2. Send /login here if you need a fresh code.\n"
+            "3. After you sign in, tap Connect Gmail. Deadline alerts come here once that finishes.\n\n"
+            "/due /classes /ask /send — same commands as the owner.\n"
             "/status — sync health",
             reply_markup=_quick_action_keyboard(),
         )
@@ -2641,11 +2670,11 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not invite:
         await update.message.reply_text("Could not create invite.")
         return
-    settings = get_settings()
-    bot_name = (settings.render_url or "t.me").split("/")[-1]
     link = f"https://t.me/{context.bot.username}?start=invite_{invite['invite_code']}"
     await update.message.reply_text(
-        f"Invite for @{invite['username']} (expires {invite['expires_at'][:10]}):\n{link}"
+        f"Invite for @{invite['username']} (expires {invite['expires_at'][:10]}):\n{link}\n\n"
+        "They tap that link and press Start. Then they open "
+        f"{_web_login_url()} with the same username and tap Connect Gmail."
     )
 
 

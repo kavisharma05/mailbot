@@ -2,8 +2,8 @@
 
 Meta allows free-form messages only after the user writes first. We do not
 fight that: if a digest cannot be delivered, we stash the full text and
-(optionally) send an approved utility-template nudge. The next inbound
-message from the owner opens the window and we deliver the stash.
+(optionally) send an approved utility-template nudge. The stash is delivered
+only when the owner asks for it (DIGEST). A normal reply just opens the window.
 """
 
 from __future__ import annotations
@@ -42,10 +42,34 @@ def _owner_phone() -> str:
 
 def _teaser(kind: str) -> str:
     if kind == "morning":
-        return "Morning digest ready. Reply DIGEST or tap Menu to open it."
+        return "Morning digest ready. Reply DIGEST to open it."
     if kind == "evening":
-        return "Evening digest ready. Reply DIGEST or tap Menu to open it."
-    return "New mail alert waiting. Reply to open it."
+        return "Evening digest ready. Reply DIGEST to open it."
+    return "A saved briefing is waiting. Reply DIGEST to open it."
+
+
+def pending_digest_line(kind: str) -> str:
+    if kind == "morning":
+        return "Your morning briefing is saved. Reply DIGEST to read it."
+    if kind == "evening":
+        return "Your evening briefing is saved. Reply DIGEST to read it."
+    return "A saved briefing is waiting. Reply DIGEST to read it."
+
+
+async def announce_pending_digest(phone: str, user_data: dict[str, Any]) -> bool:
+    """Mention a stashed digest once. Does not send the full text."""
+    pending = user_data.get(PENDING_KEY)
+    if not isinstance(pending, dict) or not pending.get("text") or pending.get("announced"):
+        return False
+    ok = await get_whatsapp_client().send_text(
+        phone,
+        pending_digest_line(str(pending.get("kind") or "")),
+        from_html=False,
+        template_fallback=False,
+    )
+    if ok:
+        pending["announced"] = True
+    return ok
 
 
 async def stash_pending_digest(phone: str, *, kind: str, text: str) -> None:
@@ -100,8 +124,8 @@ async def flush_pending_digest(phone: str, user_data: dict[str, Any] | None = No
 async def stash_and_nudge(phone: str, *, kind: str, text: str) -> bool:
     """Stash content for later and send the approved template nudge.
 
-    Returns True when the template nudge was sent. The stashed text flushes
-    automatically when the owner's next inbound message opens the 24h window.
+    Returns True when the template nudge was sent. The stashed text is sent
+    only when the owner replies DIGEST.
     """
     await stash_pending_digest(phone, kind=kind, text=text)
     tmpl = digest_template_name()

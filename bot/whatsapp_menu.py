@@ -95,8 +95,8 @@ async def send_main_menu(phone: str, *, style: str = "menu") -> bool:
     client = get_whatsapp_client()
     ok = await client.send_interactive(phone, main_menu_interactive(style))
     if not ok:
-        # Fall back to plain text so the user still gets something useful.
+        # Distinct from the list body so a late failure does not repeat the same line.
         logger.warning("WhatsApp menu send failed (style=%s); falling back to text", style)
-        fallback = _BODIES.get(style, _MENU_BODY) + "\n\nType /help anytime for commands."
+        fallback = "Menu didn't open as a list. Type /due, /classes, /library, or /help."
         ok = await client.send_text(phone, fallback, from_html=False)
     return ok

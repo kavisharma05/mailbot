@@ -102,6 +102,25 @@ def test_schedule_queries_prefix_from_clause():
     assert all("from:registrar@college.edu" in q for q in queries)
 
 
+def test_digest_window_blocks_late_cron():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from services.timeutil import digest_window_open
+
+    ist = ZoneInfo("Asia/Kolkata")
+    morning = datetime(2026, 9, 22, 7, 30, tzinfo=ist)
+    late = datetime(2026, 9, 22, 11, 5, tzinfo=ist)
+    evening = datetime(2026, 9, 22, 20, 10, tzinfo=ist)
+    library = datetime(2026, 9, 22, 7, 20, tzinfo=ist)
+    assert digest_window_open("morning", morning) is True
+    assert digest_window_open("morning", late) is False
+    assert digest_window_open("evening", evening) is True
+    assert digest_window_open("evening", morning) is False
+    assert digest_window_open("library", library) is True
+    assert digest_window_open("library", late) is False
+
+
 def test_deadline_display_drops_stale_tomorrow_note():
     display = format_deadline_display(
         "2026-08-22T18:32:00+00:00",

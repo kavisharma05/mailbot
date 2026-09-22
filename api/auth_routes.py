@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from api.deps import get_current_user
 from config import get_settings
 from services.users import (
+    discard_latest_login_code,
     get_user_by_id,
     request_login_code,
     revoke_session_token,
@@ -72,6 +73,7 @@ async def auth_request_code(body: RequestCodeBody):
             "It expires in 10 minutes. Do not share this code.",
         )
         if not sent:
+            discard_latest_login_code(str(user_id), body.username)
             return {"ok": False, "message": "Could not send code via Telegram. Try /login in the bot."}
     return {"ok": True, "message": result.get("message", "Check Telegram for your code.")}
 

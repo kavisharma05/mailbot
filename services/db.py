@@ -119,7 +119,7 @@ def get_watch_state(user_id: str | None = None) -> dict[str, Any] | None:
         rows = result.data or []
         if rows:
             return rows[0]
-        db.table("watch_state").insert({"user_id": uid, "id": 1}).execute()
+        db.table("watch_state").insert({"user_id": uid}).execute()
         result = db.table("watch_state").select("*").eq("user_id", uid).limit(1).execute()
         rows = result.data or []
         return rows[0] if rows else None
@@ -159,7 +159,7 @@ def update_watch_state(
     if multi_user_schema_ready():
         existing = db.table("watch_state").select("user_id").eq("user_id", uid).limit(1).execute()
         if not (existing.data or []):
-            db.table("watch_state").insert({"user_id": uid, "id": 1, **payload}).execute()
+            db.table("watch_state").insert({"user_id": uid, **payload}).execute()
         else:
             db.table("watch_state").update(payload).eq("user_id", uid).execute()
     else:
@@ -967,6 +967,7 @@ def set_preferred_section(section: str, user_id: str | None = None) -> None:
         get_db().table("users").update(
             {"preferred_section": sec, "updated_at": now}
         ).eq("id", uid).execute()
+        return
     get_db().table("user_prefs").upsert(
         {
             "id": 1,
@@ -1252,7 +1253,7 @@ def mark_digest_sent(kind: str, sent_on: date | None = None, user_id: str | None
         if multi_user_schema_ready():
             existing = db.table("digest_state").select("user_id").eq("user_id", uid).limit(1).execute()
             if not (existing.data or []):
-                db.table("digest_state").insert({"user_id": uid, "id": 1}).execute()
+                db.table("digest_state").insert({"user_id": uid}).execute()
             db.table("digest_state").update(
                 {column: day.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}
             ).eq("user_id", uid).execute()
@@ -1563,7 +1564,6 @@ def persist_refresh_token(
         }
         if multi_user_schema_ready():
             row["user_id"] = uid
-            row["id"] = 1
             db.table("oauth_tokens").upsert(row, on_conflict="user_id,provider").execute()
         else:
             row["id"] = 1

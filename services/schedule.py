@@ -1547,7 +1547,16 @@ def format_schedule_share(sessions: list[dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
+def _visible_in_timetable(session: dict[str, Any]) -> bool:
+    """Drop cancelled rows that have no real clock (placeholder midnight)."""
+    cancelled = bool(session.get("cancelled")) or overlay_kind(session.get("notes")) == "cancelled"
+    if not cancelled:
+        return True
+    return _display_clock(session.get("start_time"), cancelled=True) != "time not listed"
+
+
 def _format_session_block(sessions: list[dict[str, Any]], title: str) -> str:
+    sessions = [s for s in sessions if _visible_in_timetable(s)]
     if not sessions:
         return ""
     lines = [title, ""]

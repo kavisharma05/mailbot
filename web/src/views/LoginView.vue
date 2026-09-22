@@ -51,7 +51,7 @@ async function verify() {
 <template>
   <div class="max-w-md mx-auto px-4 py-8">
     <h1 class="text-2xl font-semibold text-ink mb-2">Sign in</h1>
-    <p class="text-sm text-ink-muted mb-6">Use your Telegram username. We send a one-time code in Telegram.</p>
+    <p class="text-sm text-ink-muted mb-6">Use the Telegram username on your invite. We send a one-time code in the bot. After you sign in, connect Gmail on the home screen.</p>
 
     <div v-if="step === 1" class="space-y-4">
       <label class="block text-sm font-medium text-ink">Telegram username</label>
@@ -90,7 +90,7 @@ async function verify() {
     </div>
 
     <p v-if="inviteCode" class="mt-4 text-sm text-ink-muted">
-      First time? Open the bot with your invite link, send /start, then request a code again.
+      Open the invite link in Telegram and press Start. The bot sends your code. Then come back here and enter it.
     </p>
     <p v-if="message" class="mt-4 text-sm text-ink-muted">{{ message }}</p>
   </div>

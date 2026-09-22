@@ -343,6 +343,18 @@ def claim_invite(
         )
         rows = result.data or []
         if not rows:
+            already = (
+                db.table("user_invites")
+                .select("*")
+                .eq("invite_code", code)
+                .limit(1)
+                .execute()
+            )
+            claimed_rows = already.data or []
+            if claimed_rows:
+                existing = get_user_by_telegram_id(telegram_user_id)
+                if existing and str(existing.get("id")) == str(claimed_rows[0].get("claimed_by")):
+                    return existing
             return None
         invite = rows[0]
         exp = invite.get("expires_at")
@@ -351,7 +363,7 @@ def claim_invite(
         norm_inv = _normalize_username(invite.get("telegram_username"))
         norm_user = _normalize_username(telegram_username)
         if norm_user and norm_inv and norm_user != norm_inv:
-            return None
+            return {"_claim_error": "username_mismatch", "expected": norm_inv}
         display = (telegram_username or norm_inv or "Student").lstrip("@")
         user_row = (
             db.table("users")
@@ -465,6 +477,24 @@ def request_login_code(username: str) -> dict[str, Any]:
         "user_id": user["id"],
         "_code_for_bot": code,
     }
+
+
+def discard_latest_login_code(user_id: str, username: str) -> None:
+    """Drop an unused code so a failed Telegram send does not lock the user out."""
+    norm = _normalize_username(username)
+    if norm:
+        _last_code_sent.pop(norm, None)
+    try:
+        db = get_db()
+        (
+            db.table("login_codes")
+            .delete()
+            .eq("user_id", user_id)
+            .is_("consumed_at", "null")
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("discard_latest_login_code failed: %s", exc)
 
 
 def verify_login_code(username: str, code: str) -> dict[str, Any]:

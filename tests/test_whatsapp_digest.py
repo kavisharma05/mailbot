@@ -130,7 +130,7 @@ def test_flush_sends_stashed_digest(monkeypatch):
     assert PENDING_KEY not in user_data
 
 
-def test_router_flushes_pending_on_menu(monkeypatch):
+def test_router_does_not_flush_pending_on_menu(monkeypatch):
     monkeypatch.setenv("WHATSAPP_OWNER_PHONE", "1111111111")
     from config import get_settings
 
@@ -161,6 +161,40 @@ def test_router_flushes_pending_on_menu(monkeypatch):
         whatsapp_router.process_whatsapp_message(
             "1111111111",
             {"id": "m1", "type": "text", "text": {"body": "menu"}},
+        )
+    )
+    assert flushed == []
+
+
+def test_router_flushes_pending_on_digest_keyword(monkeypatch):
+    monkeypatch.setenv("WHATSAPP_OWNER_PHONE", "1111111111")
+    from config import get_settings
+
+    get_settings.cache_clear()
+    from bot import whatsapp_router
+
+    flushed: list[str] = []
+
+    async def fake_flush(phone, user_data=None):
+        flushed.append(phone)
+        if user_data is not None:
+            user_data.pop("pending_whatsapp_digest", None)
+        return True
+
+    async def fake_load(_phone):
+        return {}
+
+    async def fake_save(_phone, _data):
+        return None
+
+    monkeypatch.setattr(whatsapp_router, "flush_pending_digest", fake_flush)
+    monkeypatch.setattr(whatsapp_router, "load_user_data", fake_load)
+    monkeypatch.setattr(whatsapp_router, "save_user_data", fake_save)
+
+    _run(
+        whatsapp_router.process_whatsapp_message(
+            "1111111111",
+            {"id": "m2", "type": "text", "text": {"body": "digest"}},
         )
     )
     assert flushed == ["1111111111"]

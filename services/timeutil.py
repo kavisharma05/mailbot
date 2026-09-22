@@ -13,6 +13,24 @@ from dateutil.relativedelta import FR, MO, SA, SU, TH, TU, WE, relativedelta
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# GitHub cron can arrive hours late. Digests only send inside these IST windows
+# unless the caller passes force=1.
+MORNING_DIGEST_HOURS = range(7, 9)  # 07:00–08:59
+EVENING_DIGEST_HOURS = range(20, 22)  # 20:00–21:59
+
+
+def digest_window_open(kind: str, now: datetime | None = None) -> bool:
+    """True when a scheduled digest is allowed to send."""
+    now = now or datetime.now(IST)
+    if kind == "morning":
+        return now.hour in MORNING_DIGEST_HOURS
+    if kind == "evening":
+        return now.hour in EVENING_DIGEST_HOURS
+    if kind == "library":
+        minutes = now.hour * 60 + now.minute
+        return (7 * 60 + 15) <= minutes < (10 * 60)
+    return False
+
 _WEEKDAY_MAP = {
     "monday": MO,
     "mon": MO,
