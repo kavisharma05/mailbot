@@ -21,17 +21,46 @@ from imt_access.stories import KIND_LABELS
 
 IST = ZoneInfo("Asia/Kolkata")
 
+
 logger = logging.getLogger(__name__)
 
 _KIND_META = {
-    "epw": ("📚", "EPW — Economic & Political Weekly"),
-    "ft": ("🗞", "Financial Times — top headlines"),
-    "et_prime": ("🇮🇳", "ET Prime — top stories"),
+    "epw": ("📚", "EPW"),
+    "ft": ("🗞", "Financial Times"),
+    "et_prime": ("🇮🇳", "ET Prime"),
 }
+
+# Chat briefing stays short. The web Library tab still has the full catalog.
+EPW_DIGEST_LIMIT = 2
+HEADLINE_DIGEST_LIMIT = 2
+_EPW_SKIP_SECTIONS = ("book review", "from 50 years", "letters", "archive")
+_EPW_PREFER_SECTIONS = ("editorial", "commentary", "special article", "insight", "perspective")
 
 
 def _whatsapp_phone() -> str:
     return (get_settings().whatsapp_owner_phone or "").lstrip("+").replace(" ", "").replace("-", "")
+
+
+def _pick_epw(issue: EpwIssue | None, limit: int = EPW_DIGEST_LIMIT) -> list[PublicationItem]:
+    """A couple of current EPW pieces, not book reviews or archive reprints."""
+    if issue is None:
+        return []
+    preferred: list[PublicationItem] = []
+    rest: list[PublicationItem] = []
+    for section, section_items in issue.sections.items():
+        low = section.lower()
+        if any(skip in low for skip in _EPW_SKIP_SECTIONS):
+            continue
+        bucket = preferred if any(name in low for name in _EPW_PREFER_SECTIONS) else rest
+        bucket.extend(section_items)
+    return (preferred + rest)[:limit]
+
+
+def _story_line(n: int, item: PublicationItem) -> str:
+    title = escape_html(item.title)
+    if item.url and item.kind != "epw":
+        return f'{n}. <a href="{escape_html(item.url)}">{title}</a>'
+    return f"{n}. {title}"
 
 
 def build_digest_messages(
@@ -43,64 +72,54 @@ def build_digest_messages(
     new_resources: list[Resource] | None = None,
     run_date: date | None = None,
 ) -> dict[str, Any]:
-    """Build the daily briefing as separate, focused messages (less clutter).
+    """One short daily list: a few EPW pieces, two FT headlines, two ET stories.
 
-    Returns:
-      intro         — short header + LLM editorial (its own message)
-      stories       — the numbered story list (its own message)
-      new_resources — optional alert text when the portal adds databases
-      items         — ordered story list (numbering matches the manifest)
-      featured      — story numbers worth a one-tap button
+    ``intro`` is ignored on purpose. The old editorial was a second wall of text
+    that did not match the numbered list. The web Library tab keeps the full set.
     """
+    del intro  # chat briefing no longer includes the long editorial
     day_label = (run_date or datetime.now(IST).date()).strftime("%a %d %b")
+    groups: list[tuple[str, str, list[PublicationItem]]] = [
+        ("epw", epw_issue.label if epw_issue else "EPW", _pick_epw(epw_issue)),
+        ("ft", "", ft_items[:HEADLINE_DIGEST_LIMIT]),
+        ("et_prime", "", et_items[:HEADLINE_DIGEST_LIMIT]),
+    ]
 
     items: list[PublicationItem] = []
-    if epw_issue:
-        items.extend(epw_issue.items)
-    items.extend(ft_items)
-    items.extend(et_items)
-
-    # --- message 1: intro ---
-    intro_lines = [f"<b>📖 Library Daily — {day_label}</b>", ""]
-    if intro:
-        intro_lines.append(f"<i>{escape_html(intro.strip())}</i>")
-        intro_lines.append("")
-    intro_lines.append("Today's stories follow — tap a number (or reply with it) for a detailed brief.")
-
-    # --- message 2: numbered story list ---
-    story_lines: list[str] = ["<b>🗞 Today's stories</b>", ""]
+    lines = [
+        f"<b>📖 Library — {day_label}</b>",
+        "",
+        "A few stories worth reading. Reply with a number for the brief.",
+        "",
+    ]
     n = 0
-    if epw_issue:
-        story_lines.append(f"<b>{_KIND_META['epw'][0]} {escape_html(epw_issue.label)}</b>")
-        for section, section_items in epw_issue.sections.items():
-            if not section_items:
-                continue
-            story_lines.append(f"<u>{escape_html(section)}</u>")
-            for item in section_items:
-                n += 1
-                story_lines.append(f"{n}. {escape_html(item.title)}")
-        story_lines.append("")
-    for kind, kind_items in (("ft", ft_items), ("et_prime", et_items)):
-        if not kind_items:
+    for kind, extra_label, group_items in groups:
+        if not group_items:
             continue
         emoji, label = _KIND_META[kind]
-        story_lines.append(f"<b>{emoji} {label}</b>")
-        for item in kind_items:
+        heading = f"{emoji} {label}"
+        if extra_label:
+            heading += f" — {escape_html(extra_label)}"
+        lines.append(f"<b>{heading}</b>")
+        for item in group_items:
             n += 1
-            story_lines.append(
-                f'{n}. <a href="{escape_html(item.url)}">{escape_html(item.title)}</a>'
-            )
-        story_lines.append("")
-    story_lines.append("<i>Which one do you want to read? Tap a number below 👇</i>")
+            items.append(item)
+            lines.append(_story_line(n, item))
+        lines.append("")
+    if n == 0:
+        lines.append("Nothing new from EPW, FT, or ET Prime today.")
+    else:
+        lines.append(f"<i>Reply 1–{n} for a detailed brief.</i>")
 
-    # --- optional message 3: new resources ---
     new_res_text: str | None = None
     if new_resources:
-        new_res_text = format_new_resources_alert(new_resources)
+        # Kept for the web/catalog path. The daily chat does not send this separately.
+        new_res_text = format_new_resources_alert(new_resources[:3])
 
+    text = "\n".join(lines).strip()
     return {
-        "intro": "\n".join(intro_lines).strip(),
-        "stories": "\n".join(story_lines).strip(),
+        "intro": "",
+        "stories": text,
         "new_resources": new_res_text,
         "items": items,
     }
@@ -163,8 +182,7 @@ def _whatsapp_story_picker(items: list[Any]) -> dict[str, Any] | None:
     return {
         "type": "list",
         "body": {
-            "text": "Which story do you want to read in detail? "
-            "Pick a section below — or just reply with its number."
+            "text": "Reply with a story number, or pick a section."
         },
         "action": {"button": "📖 Read a story", "sections": [{"title": "Today's stories", "rows": rows}]},
     }
@@ -239,30 +257,19 @@ async def deliver_daily_digest(
     owner = settings.telegram_owner_chat_id
     result: dict[str, Any] = {"telegram": False, "whatsapp": False}
 
-    intro_text = str(messages.get("intro") or "")
     stories_text = str(messages.get("stories") or "")
-    new_res_text = messages.get("new_resources")
     items: list[PublicationItem] = messages.get("items") or []
     markup = _stories_keyboard(items)
 
     if owner:
-        ok_intro = await _send_telegram(bot, owner, intro_text)
-        ok_stories = await _send_telegram(bot, owner, stories_text, reply_markup=markup)
-        if new_res_text:
-            await _send_telegram(bot, owner, str(new_res_text))
-        result["telegram"] = ok_intro and ok_stories
+        result["telegram"] = await _send_telegram(bot, owner, stories_text, reply_markup=markup)
     else:
         logger.warning("TELEGRAM_OWNER_CHAT_ID not set — skipping Telegram digest")
 
-    ok_wa_intro = await _send_whatsapp(intro_text)
-    ok_wa_stories = await _send_whatsapp(stories_text)
-    picker_ok, picker_err = await _send_whatsapp_picker(items)
-    result["whatsapp_picker"] = picker_ok
-    if picker_err:
-        result["whatsapp_picker_error"] = picker_err
-    if new_res_text:
-        await _send_whatsapp(str(new_res_text))
-    result["whatsapp"] = ok_wa_intro and ok_wa_stories
+    # One WhatsApp message. Replying with the number opens the brief; a second
+    # "pick a section" list was a duplicate of this same list.
+    result["whatsapp"] = await _send_whatsapp(stories_text)
+    result["whatsapp_picker"] = False
     return result
 
 

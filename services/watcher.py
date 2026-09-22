@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -276,6 +277,26 @@ def _should_alert(
     return confidence in ("high", "medium")
 
 
+_NOISE_MAIL_RE = re.compile(
+    r"\b(?:newsletter|e-?paper|newspaper|clippings?|fyi|for your information)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_noise_mail(
+    *,
+    category: str,
+    task: str | None,
+    summary: str | None,
+    subject: str | None = None,
+) -> bool:
+    """Newsletters and FYI mail should not ping the owner as a new task."""
+    blob = " ".join(part for part in (subject, task, summary) if part)
+    if category == "other" and (not (task or "").strip() or _NOISE_MAIL_RE.search(blob)):
+        return True
+    return bool(_NOISE_MAIL_RE.search(blob) and category == "other")
+
+
 def _should_owner_dm(
     settings: Settings,
     *,
@@ -283,7 +304,10 @@ def _should_owner_dm(
     category: str,
     task: str | None,
     summary: str | None,
+    subject: str | None = None,
 ) -> bool:
+    if _is_noise_mail(category=category, task=task, summary=summary, subject=subject):
+        return False
     if settings.owner_dm_all_mail:
         return True
     if is_actionable:

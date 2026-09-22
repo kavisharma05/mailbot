@@ -410,6 +410,26 @@ def item_effective_deadline_dt(
     return resolve_deadline_text(text, now=ref)
 
 
+_STALE_RELATIVE_NOTE = re.compile(
+    r"\b(today|tomorrow|tonight|yesterday|tmrw)\b",
+    re.IGNORECASE,
+)
+
+
+def _deadline_note(deadline_text: str | None) -> str:
+    """Keep a useful extracted note, but drop phrases that go stale.
+
+    Classifiers store "tomorrow 11:30 PM" next to an absolute date. Weeks later
+    that parenthetical still says tomorrow, which makes digests unreadable.
+    """
+    note = (deadline_text or "").strip()
+    if not note or _STALE_RELATIVE_NOTE.search(note):
+        return ""
+    if len(note) > 80:
+        note = note[:77].rstrip(" ,.;") + "…"
+    return note
+
+
 def format_deadline_display(
     deadline_date: str | None,
     deadline_text: str | None,
@@ -437,16 +457,20 @@ def format_deadline_display(
                 days = total_minutes // (24 * 60)
                 hours = (total_minutes % (24 * 60)) // 60
                 relative = f"Due in {days}d" + (f" {hours}h" if hours else "")
-        elif delta <= timedelta(0) and delta >= timedelta(hours=-24):
+        elif delta <= timedelta(0) and delta >= timedelta(hours=-36):
             overdue_mins = int(abs(delta.total_seconds()) // 60)
             if overdue_mins < 60:
                 relative = f"Overdue {overdue_mins}m ago"
             else:
-                relative = f"Overdue {overdue_mins // 60}h ago"
+                hours = overdue_mins // 60
+                relative = f"Overdue {hours}h ago" if hours < 48 else "Overdue"
+        elif delta < timedelta(hours=-36):
+            relative = "Overdue"
         if relative:
             formatted = f"{relative} — {formatted}"
-        if deadline_text and deadline_text.strip():
-            return f"{formatted} ({deadline_text.strip()})"
+        note = _deadline_note(deadline_text)
+        if note:
+            return f"{formatted} ({note})"
         return formatted
     if deadline_text and deadline_text.strip():
         return deadline_text.strip()

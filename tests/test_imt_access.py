@@ -249,13 +249,10 @@ def test_build_digest_messages_split_and_numbered():
         epw_issue=issue, ft_items=ft, et_items=et, intro="Busy day.", run_date=date(2026, 9, 21)
     )
 
-    # Intro and story list are separate messages.
-    assert "Library Daily" in msgs["intro"]
-    assert "Busy day." in msgs["intro"]
-    assert "Dire Straits" not in msgs["intro"]
-
+    assert msgs["intro"] == ""
     stories = msgs["stories"]
-    assert "Today's stories" in stories
+    assert "Library —" in stories
+    assert "Busy day." not in stories
     assert "Vol. 61, Issue No. 38" in stories
     # Numbering is global across sources, in order: EPW sections -> FT -> ET.
     assert "1. Dire Straits for the Hegemon" in stories
@@ -272,7 +269,27 @@ def test_build_digest_messages_split_and_numbered():
         "ET Prime story one",
     ]
     # The story list asks the reader to pick a story.
-    assert "tap a number" in msgs["stories"].lower()
+    assert "reply with a number" in msgs["stories"].lower()
+    assert len(msgs["items"]) == 4
+
+
+def test_build_digest_messages_keeps_only_a_few_stories():
+    issue = EpwIssue(label="Vol. 61", issue_path="/journal/2026/38", publication_date=date(2026, 9, 19))
+    issue.sections["Editorials"] = [
+        PublicationItem(kind="epw", title="Editorial one", url="http://x/1", section="Editorials"),
+        PublicationItem(kind="epw", title="Editorial two", url="http://x/2", section="Editorials"),
+        PublicationItem(kind="epw", title="Editorial three", url="http://x/3", section="Editorials"),
+    ]
+    issue.sections["Book Reviews"] = [
+        PublicationItem(kind="epw", title="A long book review", url="http://x/b", section="Book Reviews"),
+    ]
+    ft = [PublicationItem(kind="ft", title=f"FT {i}", url=f"https://www.ft.com/content/{i}") for i in range(5)]
+    et = [PublicationItem(kind="et_prime", title=f"ET {i}", url=f"https://et/{i}") for i in range(5)]
+    msgs = build_digest_messages(epw_issue=issue, ft_items=ft, et_items=et)
+    titles = [item.title for item in msgs["items"]]
+    assert titles == ["Editorial one", "Editorial two", "FT 0", "FT 1", "ET 0", "ET 1"]
+    assert "book review" not in msgs["stories"].lower()
+    assert "Editorial three" not in msgs["stories"]
 
 
 def test_stories_keyboard_number_grid():

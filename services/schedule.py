@@ -816,6 +816,14 @@ def apply_schedule_changes(
         return overlays
 
 
+def _display_clock(start_time: Any, *, cancelled: bool = False) -> str:
+    """Hide placeholder midnight times on cancellations that have no real slot."""
+    raw = str(start_time or "").strip()
+    if cancelled and raw in {"", "00:00", "0:00", "00:00:00", "—", "-"}:
+        return "time not listed"
+    return html.escape(raw or "—")
+
+
 def format_schedule_change_share(
     overlays: list[dict[str, Any]],
     *,
@@ -841,7 +849,7 @@ def format_schedule_change_share(
             day_label = date.fromisoformat(str(row["session_date"])[:10]).strftime("%a, %d %b")
         except (TypeError, ValueError, KeyError):
             day_label = str(row.get("session_date") or "")
-        start = html.escape(str(row.get("start_time") or "—"))
+        start = _display_clock(row.get("start_time"), cancelled=kind == "cancelled")
         room = html.escape(str(row.get("room") or "Room TBA"))
         detail = html.escape(public_session_notes(row.get("notes")) or "")
         title = labels.get(kind, "Updated")
@@ -1548,9 +1556,6 @@ def _format_session_block(sessions: list[dict[str, Any]], title: str) -> str:
         key=lambda x: (x.get("session_date") or "", x.get("start_time") or ""),
     ):
         course = html.escape(str(s.get("course_or_topic") or "Class"))
-        start = html.escape(str(s.get("start_time") or "—"))
-        end = s.get("end_time")
-        time_bit = start + (f"–{html.escape(str(end))}" if end else "")
         room = html.escape(str(s.get("room") or "Room TBA"))
         faculty = s.get("faculty")
         day_label = ""
@@ -1561,6 +1566,9 @@ def _format_session_block(sessions: list[dict[str, Any]], title: str) -> str:
         except (TypeError, ValueError):
             pass
         cancelled = bool(s.get("cancelled")) or overlay_kind(s.get("notes")) == "cancelled"
+        start = _display_clock(s.get("start_time"), cancelled=cancelled)
+        end = s.get("end_time")
+        time_bit = start + (f"–{html.escape(str(end))}" if end and start != "time not listed" else "")
         change = s.get("change") or overlay_kind(s.get("notes"))
         display_notes = public_session_notes(s.get("notes")) if overlay_kind(s.get("notes")) else (s.get("notes") or None)
         status = ""

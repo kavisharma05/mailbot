@@ -2225,6 +2225,19 @@ async def chat_message(
             return
         # No such story — fall through to normal chat handling.
 
+    greeting = re.fullmatch(r"(?:hi|hello|hey|thanks|thank you)[.!]?", question, flags=re.IGNORECASE)
+    if greeting:
+        reply = "Hey — ask about deadlines, mail, or classes, or send /menu."
+        await update.message.reply_text(reply)
+        remember_turn(context.user_data, user_text=question, bot_text=reply, intent="smalltalk")
+        return
+
+    if re.search(r"\bswitch\s+to\b", question, flags=re.IGNORECASE):
+        reply = "I choose the AI automatically. Ask me about mail, deadlines, or classes."
+        await update.message.reply_text(reply)
+        remember_turn(context.user_data, user_text=question, bot_text=reply, intent="smalltalk")
+        return
+
     convo = get_convo(context.user_data)
     classified = await asyncio.to_thread(classify_message, question, convo)
     intent = classified.get("intent", INTENT_MAILBOX_QA)

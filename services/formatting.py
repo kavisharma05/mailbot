@@ -39,9 +39,9 @@ PRIORITY_CATEGORIES = frozenset({"placement", "certification"})
 ALLOWED_HTML_TAGS = frozenset({"b", "i", "pre"})
 
 DEFAULT_LIST_LIMIT = 20
-DIGEST_DUE_LIMIT = 20
-DIGEST_OVERDUE_LIMIT = 12
-DIGEST_PRIORITY_LIMIT = 12
+DIGEST_DUE_LIMIT = 8
+DIGEST_OVERDUE_LIMIT = 5
+DIGEST_PRIORITY_LIMIT = 5
 DIGEST_RECENT_LIMIT = 8
 
 _WHITESPACE_RE = re.compile(r"[ \t]+\n")
@@ -440,7 +440,13 @@ def format_morning_digest(
     recent_items: list[dict[str, Any]],
 ) -> str:
     date_str = today.strftime("%a, %d %b %Y")
-    priority = collect_priority_items(today_items, recent_items)
+    today_day = today.date()
+    priority = [
+        item
+        for item in collect_priority_items(today_items, recent_items)
+        if (due := _item_local_date(item)) is not None
+        and today_day - timedelta(days=1) <= due <= today_day + timedelta(days=2)
+    ]
     priority_ids = {str(i.get("id")) for i in priority if i.get("id")}
 
     lines = [
@@ -499,15 +505,35 @@ def format_morning_digest(
     return normalize_whitespace("\n".join(lines))
 
 
+def _item_local_date(item: dict[str, Any]) -> date | None:
+    dt = item_effective_deadline_dt(item)
+    if dt is None:
+        return None
+    return dt.astimezone(IST).date()
+
+
 def format_evening_digest(
     *,
     tomorrow: datetime,
     classes_text: str,
     overdue_items: list[dict[str, Any]],
     tomorrow_items: list[dict[str, Any]],
+    older_open_count: int = 0,
 ) -> str:
     date_str = tomorrow.strftime("%a, %d %b %Y")
-    priority = collect_priority_items(overdue_items, tomorrow_items)
+    tomorrow_day = tomorrow.date()
+    recent_start = tomorrow_day - timedelta(days=8)
+    overdue_items = [
+        item
+        for item in overdue_items
+        if (due := _item_local_date(item)) is not None and recent_start <= due < tomorrow_day
+    ]
+    # Priority is what still matters for tomorrow, not every old placement task.
+    priority = [
+        item
+        for item in collect_priority_items(overdue_items, tomorrow_items)
+        if (due := _item_local_date(item)) is not None and tomorrow_day - timedelta(days=2) <= due <= tomorrow_day
+    ]
     priority_ids = {str(i.get("id")) for i in priority if i.get("id")}
 
     lines = [
@@ -546,7 +572,16 @@ def format_evening_digest(
     )
     if tomorrow_section:
         lines.append(tomorrow_section)
-    elif not classes_text:
+    elif not classes_text and not priority and not overdue_section:
         lines.append("Nothing due tomorrow and no classes scheduled yet.")
+
+    if older_open_count:
+        lines.extend(
+            [
+                "",
+                f"<i>{older_open_count} older open task{'s' if older_open_count != 1 else ''} "
+                "left out of this briefing. Send /missed to see them.</i>",
+            ]
+        )
 
     return normalize_whitespace("\n".join(lines))

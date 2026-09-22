@@ -126,24 +126,10 @@ async def run_daily_job(
     ft_items = fetched.get("ft") or []
     et_items = fetched.get("et_prime") or []
 
-    intro = None
-    if settings.imt_llm_summaries:
-        try:
-            intro = await asyncio.to_thread(
-                analyze.summarize_daily,
-                epw_label=epw_issue.label if epw_issue else None,
-                epw_count=len(epw_issue.items) if epw_issue else 0,
-                ft_titles=[i.title for i in ft_items],
-                et_titles=[i.title for i in et_items],
-            )
-        except Exception as exc:
-            logger.info("LLM intro skipped: %s", exc)
-
     messages = delivery.build_digest_messages(
         epw_issue=epw_issue,
         ft_items=ft_items,
         et_items=et_items,
-        intro=intro,
         new_resources=new_resources or None,
         run_date=today,
     )

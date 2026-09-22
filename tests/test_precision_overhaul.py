@@ -102,6 +102,40 @@ def test_schedule_queries_prefix_from_clause():
     assert all("from:registrar@college.edu" in q for q in queries)
 
 
+def test_deadline_display_drops_stale_tomorrow_note():
+    display = format_deadline_display(
+        "2026-08-22T18:32:00+00:00",
+        "tomorrow 00:02",
+    )
+    assert "Aug 2026" in display
+    assert "Overdue" in display
+    assert "tomorrow" not in display.lower()
+
+
+def test_evening_digest_hides_month_old_priority():
+    from services.formatting import format_evening_digest
+
+    tomorrow = datetime(2026, 9, 23, 20, 0, tzinfo=IST)
+    stale = {
+        "id": "old",
+        "task": "Forward the Accenture mail",
+        "category": "placement",
+        "course_or_topic": "Midterm",
+        "deadline_date": "2026-08-22T18:32:00+00:00",
+        "deadline_text": "tomorrow 00:02",
+    }
+    text = format_evening_digest(
+        tomorrow=tomorrow,
+        classes_text="",
+        overdue_items=[stale],
+        tomorrow_items=[],
+        older_open_count=12,
+    )
+    assert "Accenture" not in text
+    assert "12 older open tasks" in text
+    assert "tomorrow 00:02" not in text
+
+
 def test_relative_deadline_display_within_48h():
     future = datetime.now(IST) + timedelta(hours=3, minutes=15)
     iso = future.isoformat()

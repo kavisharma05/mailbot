@@ -173,23 +173,30 @@ async def run_evening_digest(bot, *, dry_run: bool = False, force: bool = False)
     )
 
     overdue_items: list[dict[str, Any]] = []
+    older_open_count = 0
     all_open = await asyncio.to_thread(
         get_assignments_due_between,
-        today.date() - timedelta(days=30),
+        today.date() - timedelta(days=45),
         today.date() - timedelta(days=1),
         IST,
         category=None,
     )
     for item in all_open:
         local_dt = _deadline_local_date(item, IST)
-        if local_dt and local_dt.date() < today.date():
+        if not local_dt or local_dt.date() >= today.date():
+            continue
+        age_days = (today.date() - local_dt.date()).days
+        if age_days <= 7:
             overdue_items.append(item)
+        else:
+            older_open_count += 1
 
     text = format_evening_digest(
         tomorrow=tomorrow,
         classes_text=classes_text,
         overdue_items=overdue_items,
         tomorrow_items=tomorrow_items,
+        older_open_count=older_open_count,
     )
 
     sent: list[str] = []
