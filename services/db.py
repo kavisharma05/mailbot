@@ -46,6 +46,32 @@ def resolve_user_id(user_id: str | None) -> str:
     return user_id or OWNER_SEED_USER_ID
 
 
+def processed_message_key(message_id: str, user_id: str | None = None) -> str:
+    """Keep the owner's bare Gmail id. Namespace every other mailbox so ids cannot collide."""
+    uid = resolve_user_id(user_id)
+    if multi_user_schema_ready() and uid != OWNER_SEED_USER_ID:
+        return f"{uid}:{message_id}"
+    return message_id
+
+
+def _class_user_id(user_id: str | None = None) -> str:
+    if user_id:
+        return user_id
+    from services.mailbox_user import user_id as current_user_id
+
+    return current_user_id()
+
+
+def _scope_class_rows(query, user_id: str | None = None):
+    """Limit timetable rows to one mailbox. Legacy owner rows may still have a null user_id."""
+    if not multi_user_schema_ready():
+        return query
+    uid = _class_user_id(user_id)
+    if uid == OWNER_SEED_USER_ID:
+        return query.or_(f"user_id.eq.{uid},user_id.is.null")
+    return query.eq("user_id", uid)
+
+
 def _eq_user(query, user_id: str | None):
     if multi_user_schema_ready():
         return query.eq("user_id", resolve_user_id(user_id))
@@ -168,10 +194,14 @@ def update_watch_state(
 
 def _is_email_processed_db(message_id: str, user_id: str | None = None) -> bool:
     db = get_db()
-    query = db.table("processed_emails").select("message_id").eq("message_id", message_id)
-    if multi_user_schema_ready():
-        query = query.eq("user_id", resolve_user_id(user_id))
-    result = query.limit(1).execute()
+    key = processed_message_key(message_id, user_id)
+    result = (
+        db.table("processed_emails")
+        .select("message_id")
+        .eq("message_id", key)
+        .limit(1)
+        .execute()
+    )
     return bool(result.data)
 
 
@@ -249,15 +279,16 @@ def mark_email_processed(
 ) -> bool:
     try:
         db = get_db()
+        uid = resolve_user_id(user_id)
         row: dict[str, Any] = {
-            "message_id": message_id,
+            "message_id": processed_message_key(message_id, uid),
             "is_actionable": is_actionable,
             "confidence": "delivery_failed" if delivery_failed else confidence,
             "assignment_id": assignment_id,
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
         if multi_user_schema_ready():
-            row["user_id"] = resolve_user_id(user_id)
+            row["user_id"] = uid
         db.table("processed_emails").upsert(row, on_conflict="message_id").execute()
         cache_email_processed(message_id, user_id=user_id)
         return True
@@ -873,12 +904,18 @@ def log_low_confidence(kind: str, payload: dict[str, Any]) -> None:
         logger.exception("log_low_confidence failed: %s", exc)
 
 
-def insert_class_sessions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def insert_class_sessions(
+    rows: list[dict[str, Any]], user_id: str | None = None
+) -> list[dict[str, Any]]:
     if not rows:
         return []
     try:
         db = get_db()
-        result = db.table("class_sessions").insert(rows).execute()
+        payload = rows
+        if multi_user_schema_ready():
+            uid = _class_user_id(user_id)
+            payload = [{**row, "user_id": row.get("user_id") or uid} for row in rows]
+        result = db.table("class_sessions").insert(payload).execute()
         return result.data or []
     except Exception as exc:
         logger.exception("insert_class_sessions failed: %s", exc)
@@ -886,42 +923,48 @@ def insert_class_sessions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 @_safe_write
-def delete_class_sessions_for_week(week_start: str) -> None:
+def delete_class_sessions_for_week(week_start: str, user_id: str | None = None) -> None:
     db = get_db()
-    db.table("class_sessions").delete().eq("week_start", week_start).execute()
+    query = db.table("class_sessions").delete().eq("week_start", week_start)
+    _scope_class_rows(query, user_id).execute()
 
 
 @_safe_write
-def delete_class_sessions_for_message(gmail_message_id: str) -> None:
+def delete_class_sessions_for_message(gmail_message_id: str, user_id: str | None = None) -> None:
     db = get_db()
-    db.table("class_sessions").delete().eq("gmail_message_id", gmail_message_id).execute()
+    query = db.table("class_sessions").delete().eq("gmail_message_id", gmail_message_id)
+    _scope_class_rows(query, user_id).execute()
 
 
 @_safe_read([])
-def get_classes_on(session_date: str) -> list[dict[str, Any]]:
+def get_classes_on(session_date: str, user_id: str | None = None) -> list[dict[str, Any]]:
     db = get_db()
-    result = (
+    query = (
         db.table("class_sessions")
         .select(
             "id, course_or_topic, session_date, start_time, end_time, room, faculty, notes, week_start"
         )
         .eq("session_date", session_date)
-        .order("start_time")
-        .execute()
     )
+    result = _scope_class_rows(query, user_id).order("start_time").execute()
     return result.data or []
 
 
 @_safe_read([])
-def get_classes_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
+def get_classes_between(
+    start_date: str, end_date: str, user_id: str | None = None
+) -> list[dict[str, Any]]:
     db = get_db()
-    result = (
+    query = (
         db.table("class_sessions")
         .select(
             "id, course_or_topic, session_date, start_time, end_time, room, faculty, notes, week_start"
         )
         .gte("session_date", start_date)
         .lte("session_date", end_date)
+    )
+    result = (
+        _scope_class_rows(query, user_id)
         .order("session_date")
         .order("start_time")
         .execute()
@@ -930,14 +973,19 @@ def get_classes_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
 
 
 @_safe_read([])
-def get_class_sessions_for_message(gmail_message_id: str) -> list[dict[str, Any]]:
+def get_class_sessions_for_message(
+    gmail_message_id: str, user_id: str | None = None
+) -> list[dict[str, Any]]:
     db = get_db()
-    result = (
+    query = (
         db.table("class_sessions")
         .select(
             "id, course_or_topic, session_date, start_time, end_time, room, faculty, notes, week_start, gmail_message_id"
         )
         .eq("gmail_message_id", gmail_message_id)
+    )
+    result = (
+        _scope_class_rows(query, user_id)
         .order("session_date")
         .order("start_time")
         .execute()
@@ -945,8 +993,46 @@ def get_class_sessions_for_message(gmail_message_id: str) -> list[dict[str, Any]
     return result.data or []
 
 
+_webhook_events_table_missing = False
+
+
+def claim_webhook_event(event_id: str) -> bool | None:
+    """Return True if this event id is new, False if already stored, None if the table is missing."""
+    global _webhook_events_table_missing
+    if _webhook_events_table_missing or not event_id:
+        return None
+    try:
+        db = get_db()
+        existing = (
+            db.table("webhook_events")
+            .select("event_id")
+            .eq("event_id", event_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return False
+        db.table("webhook_events").insert({"event_id": event_id}).execute()
+        return True
+    except Exception as exc:
+        err = str(exc).lower()
+        if "webhook_events" in err and ("does not exist" in err or "42p01" in err):
+            _webhook_events_table_missing = True
+            return None
+        if "duplicate" in err or "23505" in err:
+            return False
+        logger.warning("claim_webhook_event failed: %s", exc)
+        return None
+
+
 @_safe_read(None)
 def get_preferred_section(user_id: str | None = None) -> str | None:
+    if user_id is None and multi_user_schema_ready():
+        from services.mailbox_user import current
+
+        active = current()
+        if active and active.get("id"):
+            user_id = str(active["id"])
     uid = resolve_user_id(user_id)
     if multi_user_schema_ready():
         result = get_db().table("users").select("preferred_section").eq("id", uid).execute()
@@ -1263,7 +1349,7 @@ def mark_digest_sent(kind: str, sent_on: date | None = None, user_id: str | None
             ).eq("id", 1).execute()
     except Exception as exc:
         err = str(exc).lower()
-        if "digest_state" in err or "does not exist" in err or "42p01" in err:
+        if "does not exist" in err or "42p01" in err:
             _digest_state_table_missing = True
             logger.warning("digest_state table missing — using in-memory fallback: %s", exc)
         else:

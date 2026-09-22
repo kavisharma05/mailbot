@@ -205,7 +205,12 @@ def _resolve_user(update: Update) -> dict[str, Any] | None:
 
 
 def _require_user(update: Update) -> dict[str, Any] | None:
-    return _resolve_user(update)
+    user = _resolve_user(update)
+    if user:
+        from services.mailbox_user import set_user
+
+        set_user(user)
+    return user
 
 
 def _is_owner(update: Update) -> bool:

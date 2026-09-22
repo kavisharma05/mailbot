@@ -227,6 +227,30 @@ async def _send_whatsapp_picker(items: list[PublicationItem]) -> tuple[bool, str
         return False, str(exc)
 
 
+def _peer_telegram_chats(owner_chat: str | None) -> list[str]:
+    """Students with a Telegram chat. The library list is the same for everyone."""
+    from services.db import multi_user_schema_ready
+
+    if not multi_user_schema_ready():
+        return []
+    try:
+        from services.users import is_owner_user, list_users
+    except Exception:
+        return []
+    owner_chat = str(owner_chat or "")
+    chats: list[str] = []
+    seen = {owner_chat} if owner_chat else set()
+    for user in list_users(active_only=True):
+        if is_owner_user(user):
+            continue
+        chat = str(user.get("telegram_chat_id") or "").strip()
+        if not chat or chat in seen:
+            continue
+        seen.add(chat)
+        chats.append(chat)
+    return chats
+
+
 async def _send_telegram(bot, chat_id: str, text: str, reply_markup=None) -> bool:
     kwargs: dict[str, Any] = {"disable_web_page_preview": True}
     if reply_markup is not None:
@@ -265,6 +289,9 @@ async def deliver_daily_digest(
         result["telegram"] = await _send_telegram(bot, owner, stories_text, reply_markup=markup)
     else:
         logger.warning("TELEGRAM_OWNER_CHAT_ID not set — skipping Telegram digest")
+
+    for chat_id in _peer_telegram_chats(owner):
+        await _send_telegram(bot, chat_id, stories_text, reply_markup=markup)
 
     # One WhatsApp message. Replying with the number opens the brief; a second
     # "pick a section" list was a duplicate of this same list.

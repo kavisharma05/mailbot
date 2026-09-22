@@ -281,6 +281,15 @@ _NOISE_MAIL_RE = re.compile(
     r"\b(?:newsletter|e-?paper|newspaper|clippings?|fyi|for your information)\b",
     re.IGNORECASE,
 )
+# These identify a newsletter even when the model files it as a deadline or task.
+_STRONG_NOISE_RE = re.compile(
+    r"\b(?:newsletter|e-?paper|newspaper|clippings?)\b",
+    re.IGNORECASE,
+)
+_NOISE_SENDER_RE = re.compile(
+    r"business\s*standard|newspaper|e-?paper|clippings",
+    re.IGNORECASE,
+)
 
 
 def _is_noise_mail(
@@ -289,12 +298,15 @@ def _is_noise_mail(
     task: str | None,
     summary: str | None,
     subject: str | None = None,
+    sender: str | None = None,
 ) -> bool:
-    """Newsletters and FYI mail should not ping the owner as a new task."""
-    blob = " ".join(part for part in (subject, task, summary) if part)
+    """Newsletters and FYI mail should not ping anyone or become tasks."""
+    blob = " ".join(part for part in (subject, task, summary, sender) if part)
+    if _STRONG_NOISE_RE.search(blob) or _NOISE_SENDER_RE.search(sender or ""):
+        return True
     if category == "other" and (not (task or "").strip() or _NOISE_MAIL_RE.search(blob)):
         return True
-    return bool(_NOISE_MAIL_RE.search(blob) and category == "other")
+    return False
 
 
 def _should_owner_dm(
@@ -305,8 +317,11 @@ def _should_owner_dm(
     task: str | None,
     summary: str | None,
     subject: str | None = None,
+    sender: str | None = None,
 ) -> bool:
-    if _is_noise_mail(category=category, task=task, summary=summary, subject=subject):
+    if _is_noise_mail(
+        category=category, task=task, summary=summary, subject=subject, sender=sender
+    ):
         return False
     if settings.owner_dm_all_mail:
         return True
@@ -558,6 +573,8 @@ async def _process_message(
                     category="admin",
                     task=result.get("task"),
                     summary=summary,
+                    subject=details.get("subject"),
+                    sender=details.get("sender"),
                 )
             ):
                 owner_sent = await send_owner_update(
@@ -598,21 +615,8 @@ async def _process_message(
                     "changes": len(stored_changes),
                 },
             )
-            if is_actionable and confidence in ("high", "medium"):
-                assignment = await asyncio.to_thread(
-                    insert_assignment,
-                    {
-                        **_assignment_payload(result, details, "admin", confidence),
-                        "course_or_topic": result.get("course_or_topic")
-                        or (changes[0].get("course_or_topic") if changes else None)
-                        or "Class schedule",
-                        "task": result.get("task") or "Class schedule updated",
-                    },
-                )
-                if assignment:
-                    assignment_id = assignment["id"]
-                elif not already_alerted and not any(delivered.values()):
-                    return await _fail_delivery(error="assignment_insert_failed")
+            # The class list already shows the cancellation or extra session.
+            # A second "attend this class" task repeats the same fact in the digest.
             if not delivery_ok:
                 return await _fail_delivery()
             finalize = await _finalize_processed()
@@ -658,6 +662,8 @@ async def _process_message(
                     category=category,
                     task=result.get("task"),
                     summary=summary,
+                    subject=details.get("subject"),
+                    sender=details.get("sender"),
                 )
             ):
                 owner_sent = await send_owner_update(
@@ -718,6 +724,8 @@ async def _process_message(
             category=category,
             task=result.get("task"),
             summary=summary,
+            subject=details.get("subject"),
+            sender=details.get("sender"),
         )
         and not is_actionable
     ):
@@ -732,7 +740,14 @@ async def _process_message(
         else:
             delivery_ok = False
 
-    if is_actionable:
+    noise_mail = _is_noise_mail(
+        category=category,
+        task=result.get("task"),
+        summary=summary,
+        subject=details.get("subject"),
+        sender=details.get("sender"),
+    )
+    if is_actionable and not noise_mail:
         assignment = await asyncio.to_thread(
             insert_assignment,
             _assignment_payload(result, details, category, confidence),
@@ -760,6 +775,8 @@ async def _process_message(
                 category=category,
                 task=result.get("task"),
                 summary=summary,
+                subject=details.get("subject"),
+                sender=details.get("sender"),
             )
         ):
             owner_sent = await send_owner_update(

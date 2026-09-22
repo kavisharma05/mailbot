@@ -13,10 +13,10 @@ from dateutil.relativedelta import FR, MO, SA, SU, TH, TU, WE, relativedelta
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# GitHub cron can arrive hours late. Digests only send inside these IST windows
-# unless the caller passes force=1.
-MORNING_DIGEST_HOURS = range(7, 9)  # 07:00–08:59
-EVENING_DIGEST_HOURS = range(20, 22)  # 20:00–21:59
+# GitHub cron can arrive hours late. Catch up the same IST day, and stop the
+# evening briefing at midnight so "tomorrow" cannot roll forward.
+MORNING_DIGEST_HOURS = range(7, 16)  # 07:00–15:59
+EVENING_DIGEST_HOURS = range(20, 24)  # 20:00–23:59
 
 
 def digest_window_open(kind: str, now: datetime | None = None) -> bool:
@@ -28,7 +28,7 @@ def digest_window_open(kind: str, now: datetime | None = None) -> bool:
         return now.hour in EVENING_DIGEST_HOURS
     if kind == "library":
         minutes = now.hour * 60 + now.minute
-        return (7 * 60 + 15) <= minutes < (10 * 60)
+        return (7 * 60 + 15) <= minutes < (16 * 60)
     return False
 
 _WEEKDAY_MAP = {

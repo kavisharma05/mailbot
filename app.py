@@ -62,13 +62,13 @@ KEEP_ALIVE_RETRY_SECONDS = 30
 KEEP_ALIVE_MAX_RETRIES = 3
 DIGEST_SCHEDULER_INTERVAL_SECONDS = 60
 MORNING_DIGEST_HOUR = 7
-MORNING_DIGEST_END_HOUR = 9
+MORNING_DIGEST_END_HOUR = 16
 EVENING_DIGEST_HOUR = 20
-EVENING_DIGEST_END_HOUR = 22
+EVENING_DIGEST_END_HOUR = 24
 # IMT library daily briefing: fires after the morning digest window opens.
 IMT_DAILY_START_HOUR = 7
 IMT_DAILY_START_MINUTE = 15
-IMT_DAILY_END_HOUR = 10
+IMT_DAILY_END_HOUR = 16
 PING_BODY = b"ok"
 
 digest_scheduler_lock = asyncio.Lock()
@@ -187,7 +187,7 @@ async def _background_watcher_loop() -> None:
 
 
 async def _digest_scheduler_loop() -> None:
-    """Fire morning (07:00-09:00 IST) and evening (20:00-22:00 IST) digests while awake."""
+    """Fire morning (07:00-16:00 IST) and evening (20:00-24:00 IST) digests while awake."""
     while True:
         try:
             now = now_ist()
@@ -212,7 +212,7 @@ async def _digest_scheduler_loop() -> None:
 
 
 async def _imt_daily_scheduler_loop() -> None:
-    """Fire the IMT library daily briefing (07:15-10:00 IST) while awake.
+    """Fire the IMT library daily briefing (07:15-16:00 IST) while awake.
 
     Idempotent per IST day via imt_state — the GitHub Actions cron backup can
     hit /tasks/imt-daily on the same day without double-sending.
@@ -497,7 +497,7 @@ async def digest_morning(
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
     if not dry_run and not force and not digest_window_open("morning"):
-        logger.info("Morning digest skipped: outside 07:00–09:00 IST")
+        logger.info("Morning digest skipped: outside 07:00–16:00 IST")
         return {"ok": True, "skipped": "outside_window"}
 
     result = await run_morning_digest(
@@ -518,7 +518,7 @@ async def digest_evening(
         raise HTTPException(status_code=403, detail="Invalid task secret")
 
     if not dry_run and not force and not digest_window_open("evening"):
-        logger.info("Evening digest skipped: outside 20:00–22:00 IST")
+        logger.info("Evening digest skipped: outside 20:00–24:00 IST")
         return {"ok": True, "skipped": "outside_window"}
 
     result = await run_evening_digest(
@@ -542,7 +542,7 @@ async def imt_daily_task(
     from imt_access.jobs import run_daily_job
 
     if not dry_run and not force and not digest_window_open("library"):
-        logger.info("Library digest skipped: outside 07:15–10:00 IST")
+        logger.info("Library digest skipped: outside 07:15–16:00 IST")
         return {"ok": True, "skipped": "outside_window"}
 
     async with imt_daily_lock:

@@ -55,7 +55,11 @@ async def should_process_update(update_id: int | None) -> bool:
 
 
 async def should_process_webhook_event(event_id: str | None) -> bool:
-    """Dedupe non-Telegram webhooks (e.g. WhatsApp message.id)."""
+    """Dedupe non-Telegram webhooks (e.g. WhatsApp message.id).
+
+    Memory covers this process. webhook_events covers a restart, when Meta
+    retries the same message id and would otherwise send the menu twice.
+    """
     if not event_id:
         return True
     key = str(event_id)
@@ -69,7 +73,16 @@ async def should_process_webhook_event(event_id: str | None) -> bool:
         _seen_str[key] = now
         while len(_seen_str) > _MAX_ENTRIES:
             _seen_str.popitem(last=False)
-        return True
+
+    try:
+        from services.db import claim_webhook_event
+
+        claimed = await asyncio.to_thread(claim_webhook_event, key)
+    except Exception:
+        claimed = None
+    if claimed is False:
+        return False
+    return True
 
 
 async def already_sent_content(chat_id: str | int, text: str) -> bool:

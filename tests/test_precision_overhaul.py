@@ -110,15 +110,52 @@ def test_digest_window_blocks_late_cron():
 
     ist = ZoneInfo("Asia/Kolkata")
     morning = datetime(2026, 9, 22, 7, 30, tzinfo=ist)
-    late = datetime(2026, 9, 22, 11, 5, tzinfo=ist)
+    late_same_day = datetime(2026, 9, 22, 11, 5, tzinfo=ist)
+    after_afternoon = datetime(2026, 9, 22, 16, 5, tzinfo=ist)
     evening = datetime(2026, 9, 22, 20, 10, tzinfo=ist)
+    late_evening = datetime(2026, 9, 22, 23, 40, tzinfo=ist)
+    after_midnight = datetime(2026, 9, 23, 0, 10, tzinfo=ist)
     library = datetime(2026, 9, 22, 7, 20, tzinfo=ist)
     assert digest_window_open("morning", morning) is True
-    assert digest_window_open("morning", late) is False
+    assert digest_window_open("morning", late_same_day) is True
+    assert digest_window_open("morning", after_afternoon) is False
     assert digest_window_open("evening", evening) is True
+    assert digest_window_open("evening", late_evening) is True
+    assert digest_window_open("evening", after_midnight) is False
     assert digest_window_open("evening", morning) is False
     assert digest_window_open("library", library) is True
-    assert digest_window_open("library", late) is False
+    assert digest_window_open("library", late_same_day) is True
+    assert digest_window_open("library", after_afternoon) is False
+
+
+def test_newsletter_is_noise_even_when_filed_as_a_task():
+    from services.watcher import _is_noise_mail
+
+    assert _is_noise_mail(
+        category="deadline",
+        task="Read today's brief",
+        summary="Business Standard e-paper newsletter",
+        subject="RBI OMOs reduce liquidity",
+        sender="Business Standard <news@business-standard.com>",
+    )
+    assert not _is_noise_mail(
+        category="deadline",
+        task="Attend CP exam",
+        summary="CP exam on 24 Sep 2:15 pm in LRC Hall",
+        subject="Re: CP exam",
+        sender="Vinay Ch <vinay@imtnag.ac.in>",
+    )
+
+
+def test_processed_mail_key_namespaces_other_mailboxes():
+    from services.db import processed_message_key
+    from services.user_ids import OWNER_SEED_USER_ID
+
+    with patch("services.db.multi_user_schema_ready", return_value=True):
+        assert processed_message_key("abc", OWNER_SEED_USER_ID) == "abc"
+        assert processed_message_key("abc", "student-1") == "student-1:abc"
+    with patch("services.db.multi_user_schema_ready", return_value=False):
+        assert processed_message_key("abc", "student-1") == "abc"
 
 
 def test_deadline_display_drops_stale_tomorrow_note():

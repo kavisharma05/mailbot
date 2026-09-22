@@ -48,3 +48,9 @@ create unique index if not exists idx_digest_state_user_unique on digest_state (
 drop index if exists idx_oauth_tokens_user_provider;
 create unique index if not exists idx_oauth_tokens_user_provider
     on oauth_tokens (user_id, provider);
+
+-- WhatsApp retries the same message id after a restart. Remember it here.
+create table if not exists webhook_events (
+    event_id text primary key,
+    seen_at timestamptz not null default now()
+);
