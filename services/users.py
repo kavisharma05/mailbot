@@ -38,6 +38,34 @@ def _normalize_username(username: str | None) -> str:
     return u
 
 
+def telegram_profile_display_name(
+    first_name: str | None,
+    last_name: str | None,
+    username: str | None = None,
+) -> str:
+    """Real name from Telegram profile — never the @username (used for mail sign-offs)."""
+    _ = username  # reserved for callers; usernames must not become display names
+    parts: list[str] = []
+    for raw in (first_name, last_name):
+        bit = (raw or "").strip()
+        if bit and not bit.startswith("["):
+            parts.append(bit)
+    return " ".join(parts)
+
+
+def display_name_is_telegram_handle(name: str, user: dict[str, Any]) -> bool:
+    """True when the stored name is just the Telegram @handle, not a person name."""
+    n = (name or "").strip()
+    if not n:
+        return False
+    handle = str(user.get("telegram_username") or "").lstrip("@").strip()
+    if not handle:
+        return False
+    compact_name = n.lower().replace(" ", "").replace("_", "")
+    compact_handle = handle.lower().replace("_", "")
+    return compact_name == compact_handle
+
+
 def _users_table_ok() -> bool:
     global _users_table_missing
     if _users_table_missing:
@@ -248,8 +276,7 @@ def stored_name_should_come_from_gmail(user: dict[str, Any] | None) -> bool:
     name = str(user.get("display_name") or "").strip()
     if not name or name.startswith("[") or name.lower() in {"student", "owner"}:
         return True
-    handle = str(user.get("telegram_username") or "").lstrip("@").strip()
-    if handle and name.lower().replace(" ", "") == handle.lower().replace("_", ""):
+    if display_name_is_telegram_handle(name, user):
         return True
     local = str(user.get("gmail_address")).split("@", 1)[0]
     compact = name.lower().replace(" ", "").replace(".", "")
@@ -368,6 +395,8 @@ def claim_invite(
     telegram_user_id: str,
     telegram_chat_id: str,
     telegram_username: str | None = None,
+    telegram_first_name: str | None = None,
+    telegram_last_name: str | None = None,
 ) -> dict[str, Any] | None:
     code = (invite_code or "").strip()
     if not code or not _users_table_ok():
@@ -405,7 +434,9 @@ def claim_invite(
         norm_user = _normalize_username(telegram_username)
         if norm_user and norm_inv and norm_user != norm_inv:
             return {"_claim_error": "username_mismatch", "expected": norm_inv}
-        display = (telegram_username or norm_inv or "Student").lstrip("@")
+        display = telegram_profile_display_name(
+            telegram_first_name, telegram_last_name, telegram_username
+        ) or "Student"
         user_row = (
             db.table("users")
             .insert(
@@ -441,15 +472,23 @@ def link_telegram_to_user(
     telegram_user_id: str,
     telegram_chat_id: str,
     telegram_username: str | None = None,
+    telegram_first_name: str | None = None,
+    telegram_last_name: str | None = None,
 ) -> dict[str, Any] | None:
-    return update_user_fields(
-        user_id,
-        {
-            "telegram_user_id": str(telegram_user_id),
-            "telegram_chat_id": str(telegram_chat_id),
-            "telegram_username": _normalize_username(telegram_username) or None,
-        },
+    fields: dict[str, Any] = {
+        "telegram_user_id": str(telegram_user_id),
+        "telegram_chat_id": str(telegram_chat_id),
+        "telegram_username": _normalize_username(telegram_username) or None,
+    }
+    existing = get_user_by_id(user_id)
+    profile_name = telegram_profile_display_name(
+        telegram_first_name, telegram_last_name, telegram_username
     )
+    if profile_name and existing and display_name_is_telegram_handle(
+        str(existing.get("display_name") or ""), existing
+    ):
+        fields["display_name"] = profile_name
+    return update_user_fields(user_id, fields)
 
 
 def _generate_login_code() -> str:

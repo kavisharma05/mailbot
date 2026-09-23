@@ -34,6 +34,7 @@ def test_student_request_uses_their_mailbox_and_name():
             "role": "student",
             "display_name": "rahul",
             "gmail_address": "2026204@imtnag.ac.in",
+            "telegram_username": "someone_else",
         }
     )
     try:
@@ -91,6 +92,46 @@ def test_dashboard_name_comes_from_gmail_when_handle_is_stored():
     assert not stored_name_should_come_from_gmail(
         {"gmail_address": "", "display_name": "rahul", "telegram_username": "rahul"}
     )
+
+
+def test_student_name_skips_telegram_username_handle():
+    token = set_user(
+        {
+            "id": "student-handle",
+            "role": "student",
+            "display_name": "coolstudent",
+            "telegram_username": "coolstudent",
+            "gmail_address": "",
+        }
+    )
+    try:
+        assert student_name() == "Student"
+    finally:
+        reset(token)
+
+
+def test_student_name_uses_gmail_send_as_when_handle_is_stored():
+    token = set_user(
+        {
+            "id": "student-gmail-name",
+            "role": "student",
+            "display_name": "coolstudent",
+            "telegram_username": "coolstudent",
+            "gmail_address": "rahul@imtnag.ac.in",
+        }
+    )
+    try:
+        with patch("gmail_api.client.primary_mailbox_display_name", return_value="Rahul Sharma"):
+            assert student_name() == "Rahul Sharma"
+    finally:
+        reset(token)
+
+
+def test_telegram_profile_display_name_prefers_real_name():
+    from services.users import telegram_profile_display_name
+
+    assert telegram_profile_display_name("Rahul", "Sharma", "rahul_sh") == "Rahul Sharma"
+    assert telegram_profile_display_name(None, None, "rahul_sh") == ""
 
 
 def test_login_code_hash_stable():

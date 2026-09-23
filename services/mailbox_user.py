@@ -60,15 +60,27 @@ def student_name(settings: Settings | None = None) -> str:
     if u and is_owner_user(u):
         return configured or _pretty_person_name(str(u.get("display_name") or "")) or "Student"
     if u:
+        from services.users import (
+            display_name_is_telegram_handle,
+            refresh_display_name_from_gmail,
+            stored_name_should_come_from_gmail,
+        )
+
+        if stored_name_should_come_from_gmail(u):
+            u = refresh_display_name_from_gmail(u) or u
         name = _pretty_person_name(str(u.get("display_name") or "").strip())
-        if name and name.lower() not in {"student", "owner"}:
+        if (
+            name
+            and name.lower() not in {"student", "owner"}
+            and not display_name_is_telegram_handle(name, u)
+        ):
             return name
         gmail = str(u.get("gmail_address") or "").strip()
         local = gmail.split("@", 1)[0] if "@" in gmail else ""
         pretty_mail = _pretty_person_name(local)
         if pretty_mail and not pretty_mail.isdigit():
             return pretty_mail
-        return name or "Student"
+        return "Student"
     return configured or "Student"
 
 

@@ -1052,6 +1052,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             telegram_user_id=str(tg.id),
             telegram_chat_id=str(chat.id),
             telegram_username=tg.username,
+            telegram_first_name=tg.first_name,
+            telegram_last_name=tg.last_name,
         )
         if isinstance(claimed, dict) and claimed.get("_claim_error") == "username_mismatch":
             expected = claimed.get("expected") or "the invited username"
@@ -1092,6 +1094,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         telegram_user_id=str(tg.id),
         telegram_chat_id=str(chat.id),
         telegram_username=tg.username,
+        telegram_first_name=tg.first_name,
+        telegram_last_name=tg.last_name,
     )
 
     if is_owner_user(user):
