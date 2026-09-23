@@ -1406,6 +1406,8 @@ def _build_user_prompt(
     verified: bool = False,
     convo: dict[str, Any] | None = None,
     resolved_contacts: list[dict[str, Any]] | None = None,
+    bot_status: dict[str, Any] | None = None,
+    include_tracked_items: bool = True,
 ) -> str:
     scope = f"Category hint: {category}" if category else "Category hint: none"
     parts = [scope, ""]
@@ -1434,12 +1436,20 @@ def _build_user_prompt(
         parts.append(f"Mailbox stats (JSON):\n{json.dumps(mailbox_stats, default=str)}")
         parts.append("")
 
-    if not verified:
+    if bot_status:
+        parts.append(f"Bot status (JSON):\n{json.dumps(bot_status, default=str)}")
+        parts.append("")
+
+    if not verified and include_tracked_items:
         slim_items = [_slim_item_for_prompt(i) for i in items[:_MAX_ITEMS]]
         # For pure mailbox questions, keep tracked items short to leave room for mail bodies
         item_limit = 8 if mailbox_stats else _MAX_ITEMS
         parts.append(
             f"Tracked items (JSON):\n{json.dumps(slim_items[:item_limit], default=str)}"
+        )
+    elif not verified:
+        parts.append(
+            "Tracked deadlines were left out because this question is not about deadlines or tasks."
         )
 
     parts.append(f"\nMatching Gmail emails (JSON):\n{json.dumps(emails, default=str)}")
@@ -1558,6 +1568,57 @@ def _looks_like_real_due_answer(answer: str) -> bool:
     )
 
 
+def _question_needs_tracked_items(question: str) -> bool:
+    """Deadline dumps belong only in answers to deadline or task questions."""
+    if _asks_undated_tasks(question) or _is_due_list_question(question):
+        return True
+    q = (question or "").lower()
+    return any(
+        w in q
+        for w in (
+            "deadline",
+            "deadlines",
+            "what's due",
+            "what is due",
+            "whats due",
+            "overdue",
+            "pending",
+            "assignment",
+            "submit",
+            "task",
+            "tasks",
+        )
+    )
+
+
+def _bot_status_facts() -> dict[str, Any]:
+    """Cheap facts for common-sense questions. No live Google call."""
+    try:
+        from gmail_api.auth import _effective_refresh_token
+        from services.mailbox_user import gmail_address, user_id
+
+        address = (gmail_address() or "").strip() or None
+        saved = bool(_effective_refresh_token(user_id()))
+    except Exception:
+        address, saved = None, False
+    return {
+        "gmail_login_saved": saved,
+        "gmail_address": address,
+        "what_i_can_do": (
+            "Search and summarize Gmail, track deadlines, show the class schedule, "
+            "and draft a mail when asked to send one."
+        ),
+    }
+
+
+def _answer_dumps_unasked_deadlines(answer: str, question: str) -> bool:
+    if _question_needs_tracked_items(question):
+        return False
+    text = (answer or "").lower()
+    hits = text.count("due") + text.count("deadline")
+    return hits >= 3 and len(text) > 120
+
+
 def _gather_context_for_question(
     question: str,
     *,
@@ -1613,14 +1674,16 @@ def answer_question(
     if _is_date_time_question(question):
         return _deterministic_date_time_answer(question)
 
-    if not verified:
+    if not verified and _question_needs_tracked_items(question):
         quick = _deterministic_deadline_answer(question, items)
         if quick:
             return quick
 
     if verified:
+        from services.mailbox_user import student_name as active_student_name
+
         system = VERIFIED_ASSISTANT_PROMPT.format(
-            today=today, now=now_str, student_name=get_settings().student_name
+            today=today, now=now_str, student_name=active_student_name()
         )
         try:
             stats, emails = _gather_mailbox_context(question, force_bodies=True, convo=convo)
@@ -1648,8 +1711,10 @@ def answer_question(
             return answer.strip()
         return _format_mailbox_fallback(stats or {}, emails, question)
 
+    from services.mailbox_user import student_name as active_student_name
+
     system = ASSISTANT_PROMPT.format(
-        today=today, now=now_str, student_name=get_settings().student_name
+        today=today, now=now_str, student_name=active_student_name()
     )
 
     stats, emails = _gather_context_for_question(
@@ -1660,6 +1725,7 @@ def answer_question(
         label = person or stats.get("person_filter") or "that person"
         return f"I couldn't find any mail from {label} in the searches I tried."
     resolved = resolve_contact(person) if person and "@" not in person else []
+    about_deadlines = _question_needs_tracked_items(question)
     user = _build_user_prompt(
         question,
         items,
@@ -1669,10 +1735,23 @@ def answer_question(
         mailbox_stats=stats,
         convo=convo,
         resolved_contacts=resolved,
+        bot_status=_bot_status_facts(),
+        include_tracked_items=about_deadlines,
     )
 
     # Primary path: let the LLM understand any natural wording
-    answer = call_text(system, user, temperature=0.55, max_tokens=700)
+    answer = call_text(system, user, temperature=0.4, max_tokens=700)
+    if answer and _answer_dumps_unasked_deadlines(answer, question):
+        answer = call_text(
+            system,
+            user
+            + "\n\nThat draft listed deadlines the student did not ask for. "
+            "Answer only their question, in a few sentences.",
+            temperature=0.2,
+            max_tokens=400,
+        )
+    if answer and _answer_dumps_unasked_deadlines(answer, question):
+        answer = None
     if answer and not _llm_answer_is_useless(answer):
         if _asks_undated_tasks(question) and _answer_looks_generic_due_dump(answer, question):
             return _deterministic_undated_answer(items)

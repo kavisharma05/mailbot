@@ -626,6 +626,55 @@ def _bare_email(text: str) -> str | None:
     return match.group(1).lower() if match else None
 
 
+_GMAIL_STATUS_RE = re.compile(
+    r"(?:"
+    r"\b(?:is|are|am)\b.{0,48}\b(?:gmail|mailbox|inbox)\b.{0,24}\b(?:connect(?:ed|ion)?|link(?:ed)?|work(?:ing)?|ok|fine|live|set\s*up)\b"
+    r"|\b(?:gmail|mailbox|inbox)\b.{0,24}\b(?:connect(?:ed|ion)?|status|working|linked)\b"
+    r"|\b(?:am i|are we)\s+connected\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_gmail_status_question(text: str) -> bool:
+    return bool(_GMAIL_STATUS_RE.search(text or ""))
+
+
+def _gmail_status_reply() -> str:
+    """Live yes/no for 'is Gmail connected' — not a mailbox search."""
+    from google.auth.exceptions import RefreshError
+
+    from gmail_api.auth import _effective_refresh_token, get_credentials
+    from gmail_api.client import get_gmail_service
+    from services.mailbox_user import gmail_address, user_id
+
+    uid = user_id()
+    if not _effective_refresh_token(uid):
+        return (
+            "Gmail is not connected. Open the website and tap Connect Gmail, "
+            "or use the reconnect link when I say access was lost."
+        )
+    try:
+        get_credentials(uid)
+        profile = get_gmail_service(uid).users().getProfile(userId="me").execute()
+        email = (profile.get("emailAddress") or gmail_address() or "your mailbox").strip()
+        return f"Yes — Gmail is connected as {email}."
+    except RefreshError:
+        return (
+            "Gmail is not connected right now. The saved login was rejected. "
+            "Tap Reconnect Gmail and approve access again."
+        )
+    except Exception:
+        logger.exception("Gmail status check failed")
+        saved = gmail_address()
+        if saved:
+            return (
+                f"A Gmail login is saved for {saved}, but I could not confirm it just now. "
+                "Try again in a moment, or reconnect."
+            )
+        return "I could not confirm Gmail right now. Try reconnecting from the website."
+
+
 def _is_llm_status_question(text: str) -> bool:
     q = text or ""
     return bool(_LLM_STATUS_RE.search(q) and _LLM_STATUS_ASK_RE.search(q))
@@ -2297,6 +2346,12 @@ async def chat_message(
         remember_turn(context.user_data, user_text=question, bot_text=reply, intent="smalltalk")
         return
 
+    if _is_gmail_status_question(question):
+        reply = await asyncio.to_thread(_gmail_status_reply)
+        await update.message.reply_text(reply)
+        remember_turn(context.user_data, user_text=question, bot_text=reply, intent="gmail_status")
+        return
+
     if re.search(r"\bswitch\s+to\b", question, flags=re.IGNORECASE):
         reply = "I choose the AI automatically. Ask me about mail, deadlines, or classes."
         await update.message.reply_text(reply)
@@ -2307,7 +2362,7 @@ async def chat_message(
     classified = await asyncio.to_thread(classify_message, question, convo)
     intent = classified.get("intent", INTENT_MAILBOX_QA)
 
-    if intent == INTENT_SMALLTALK:
+    if intent == INTENT_SMALLTALK and _is_smalltalk(question):
         reply = "Hey — ask me about deadlines, mail, /send to compose, or /classes."
         await update.message.reply_text(reply)
         remember_turn(context.user_data, user_text=question, bot_text=reply, intent=intent)

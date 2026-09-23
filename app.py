@@ -733,8 +733,19 @@ async def oauth_callback(
         try:
             profile = get_gmail_service(oauth_user_id).users().getProfile(userId="me").execute()
             email = profile.get("emailAddress")
+            fields: dict[str, str] = {}
             if email:
-                update_user_fields(oauth_user_id, {"gmail_address": email})
+                fields["gmail_address"] = email
+            try:
+                from gmail_api.client import primary_mailbox_display_name
+
+                gmail_name = primary_mailbox_display_name(oauth_user_id)
+                if gmail_name:
+                    fields["display_name"] = gmail_name
+            except Exception as exc:
+                logger.warning("Could not read Gmail display name after connect: %s", exc)
+            if fields:
+                update_user_fields(oauth_user_id, fields)
         except Exception as exc:
             logger.warning("Could not fetch Gmail profile after connect: %s", exc)
         finally:

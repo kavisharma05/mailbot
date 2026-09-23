@@ -76,6 +76,13 @@ def test_compose_rejects_generic_friend_recipient():
         assert not result.get("recipient"), text
 
 
+def test_gmail_connected_question_is_not_compose():
+    with patch("ai.intent._llm_classify") as mock_llm:
+        result = classify_message("Is gmail connected")
+    mock_llm.assert_not_called()
+    assert result["intent"] == INTENT_MAILBOX_QA
+
+
 def test_ambiguous_question_skips_llm_classify():
     with patch("ai.intent._llm_classify") as mock_llm:
         result = classify_message("any update on the CV submission?")

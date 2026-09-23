@@ -238,6 +238,47 @@ def user_has_gmail_token(user_id: str) -> bool:
     return False
 
 
+_gmail_name_checked: set[str] = set()
+
+
+def stored_name_should_come_from_gmail(user: dict[str, Any] | None) -> bool:
+    """True when the saved name is still a handle, roll number, or placeholder."""
+    if not user or not str(user.get("gmail_address") or "").strip():
+        return False
+    name = str(user.get("display_name") or "").strip()
+    if not name or name.startswith("[") or name.lower() in {"student", "owner"}:
+        return True
+    handle = str(user.get("telegram_username") or "").lstrip("@").strip()
+    if handle and name.lower().replace(" ", "") == handle.lower().replace("_", ""):
+        return True
+    local = str(user.get("gmail_address")).split("@", 1)[0]
+    compact = name.lower().replace(" ", "").replace(".", "")
+    if local and compact == local.lower().replace(".", "").replace("_", ""):
+        return True
+    return " " not in name
+
+
+def refresh_display_name_from_gmail(user: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Replace a Telegram handle with the Gmail account name, once per process."""
+    if not user or not user.get("id"):
+        return user
+    uid = str(user["id"])
+    if uid in _gmail_name_checked or not stored_name_should_come_from_gmail(user):
+        return user
+    try:
+        from gmail_api.client import primary_mailbox_display_name
+
+        gmail_name = primary_mailbox_display_name(uid)
+    except Exception as exc:
+        logger.warning("Could not read Gmail display name for %s: %s", uid, exc)
+        return user
+    _gmail_name_checked.add(uid)
+    if not gmail_name or gmail_name == user.get("display_name"):
+        return user
+    updated = update_user_fields(uid, {"display_name": gmail_name})
+    return updated or {**user, "display_name": gmail_name}
+
+
 def update_user_fields(user_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
     if not fields or not _users_table_ok():
         return None

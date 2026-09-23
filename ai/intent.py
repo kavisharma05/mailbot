@@ -31,6 +31,12 @@ INTENT_SMALLTALK = "smalltalk"
 
 _EMAIL_RE = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
 
+
+def _has_compose_verb(text: str) -> bool:
+    """Whole-word match so 'gmail' does not count as the verb 'mail'."""
+    q = (text or "").lower()
+    return any(re.search(rf"\b{re.escape(verb)}\b", q) for verb in _COMPOSE_VERBS)
+
 _COMPOSE_VERBS = (
     "send",
     "write",
@@ -208,7 +214,7 @@ def _is_compose_intent(
             recipient = None
         return True, recipient or email, content or None, email
 
-    if email and any(v in q for v in _COMPOSE_VERBS):
+    if email and _has_compose_verb(q):
         return True, email, _extract_compose_content(text) or None, email
 
     if re.search(r"\b(?:send|write|draft|compose)\b.+\b(?:mail|email)\b", q) and not re.search(
@@ -488,7 +494,7 @@ def classify_message(text: str, convo: dict[str, Any] | None = None) -> dict[str
     # Only spend an LLM round-trip when the user *might* be composing —
     # otherwise default to mailbox Q&A (the answer LLM already handles it).
     # This cuts ~1-3s off most free-text questions.
-    if not any(v in q for v in _COMPOSE_VERBS):
+    if not _has_compose_verb(q):
         return {
             "intent": INTENT_MAILBOX_QA,
             "recipient": None,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 
 from services.users import get_owner_user, resolve_session_token
 
@@ -51,3 +51,18 @@ async def web_user(authorization: str | None = Header(default=None)) -> dict:
     if multi_user_schema_ready():
         return await get_current_user(authorization)
     return default_web_user()
+
+
+def bind_mailbox_user(user: dict = Depends(web_user)):
+    """Keep Gmail, deadlines, contacts, and the sign-off name on this user."""
+    from gmail_api.auth import reset_gmail_user_context, set_gmail_user_context
+    from services.mailbox_user import reset as reset_mailbox
+    from services.mailbox_user import set_user
+
+    mailbox_token = set_user(user)
+    gmail_token = set_gmail_user_context(str(user["id"]))
+    try:
+        yield user
+    finally:
+        reset_gmail_user_context(gmail_token)
+        reset_mailbox(mailbox_token)

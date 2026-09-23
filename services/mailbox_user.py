@@ -44,7 +44,39 @@ def gmail_address(settings: Settings | None = None) -> str:
     u = current()
     if u and u.get("gmail_address"):
         return str(u["gmail_address"]).strip()
+    # A classmate with no mailbox yet must not inherit the owner's Gmail address.
+    if u and not is_owner_user(u):
+        return ""
     return (settings.gmail_user or "").strip()
+
+
+def student_name(settings: Settings | None = None) -> str:
+    """Name used in drafted mail and marksheet matching for the active user."""
+    settings = settings or get_settings()
+    configured = (settings.student_name or "").strip()
+    if configured.startswith("["):
+        configured = ""
+    u = current()
+    if u and is_owner_user(u):
+        return configured or _pretty_person_name(str(u.get("display_name") or "")) or "Student"
+    if u:
+        name = _pretty_person_name(str(u.get("display_name") or "").strip())
+        if name and name.lower() not in {"student", "owner"}:
+            return name
+        gmail = str(u.get("gmail_address") or "").strip()
+        local = gmail.split("@", 1)[0] if "@" in gmail else ""
+        pretty_mail = _pretty_person_name(local)
+        if pretty_mail and not pretty_mail.isdigit():
+            return pretty_mail
+        return name or "Student"
+    return configured or "Student"
+
+
+def _pretty_person_name(name: str) -> str:
+    cleaned = " ".join(name.replace("_", " ").replace(".", " ").split())
+    if cleaned.isalpha() or all(part.isalpha() for part in cleaned.split()):
+        return cleaned.title()
+    return cleaned
 
 
 def use_category_groups() -> bool:

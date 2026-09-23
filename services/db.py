@@ -43,7 +43,14 @@ def multi_user_schema_ready() -> bool:
 
 
 def resolve_user_id(user_id: str | None) -> str:
-    return user_id or OWNER_SEED_USER_ID
+    """Explicit id, else the mailbox bound to this request, else the owner."""
+    if user_id:
+        return user_id
+    from services.mailbox_user import current, user_id as mailbox_id
+
+    if current() is not None:
+        return mailbox_id()
+    return OWNER_SEED_USER_ID
 
 
 def processed_message_key(message_id: str, user_id: str | None = None) -> str:
@@ -1101,14 +1108,17 @@ def upsert_contact(
     rows = existing.data or []
     if rows:
         count = int(rows[0].get("message_count") or 0) + 1
-        db.table("contacts").update(
+        update_q = db.table("contacts").update(
             {
                 "display_name": display_name or rows[0].get("display_name"),
                 "name_key": name_key or rows[0].get("name_key") or "",
                 "message_count": count,
                 "last_seen_at": now,
             }
-        ).eq("email", email).execute()
+        ).eq("email", email)
+        if multi_user_schema_ready():
+            update_q = update_q.eq("user_id", uid)
+        update_q.execute()
         return
     db.table("contacts").insert(
         {

@@ -20,7 +20,13 @@ _web_compose_by_user: dict[str, dict[str, Any] | None] = {}
 
 
 def _uid(user_id: str | None) -> str:
-    return user_id or OWNER_SEED_USER_ID
+    if user_id:
+        return user_id
+    from services.mailbox_user import current, user_id as mailbox_id
+
+    if current() is not None:
+        return mailbox_id()
+    return OWNER_SEED_USER_ID
 
 
 def get_web_convo(user_id: str | None = None) -> dict[str, Any]:

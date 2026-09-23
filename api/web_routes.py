@@ -33,7 +33,7 @@ from ai.intent import (
     classify_message,
 )
 from config import get_settings
-from api.deps import web_user
+from api.deps import bind_mailbox_user, web_user
 from gmail_api.auth import reset_gmail_user_context, set_gmail_user_context
 from services.mailbox_user import reset as reset_mailbox_user
 from services.mailbox_user import set_user as set_mailbox_user
@@ -215,8 +215,10 @@ def _serialize_class(session: dict[str, Any]) -> dict[str, Any]:
 def _greeting_name(user: dict[str, Any] | None = None) -> str:
     if user and user.get("display_name"):
         name = str(user["display_name"]).strip()
-        if not name.startswith("["):
-            return name.split()[0] if name else "there"
+        if name and not name.startswith("[") and name.lower() not in {"student", "owner"}:
+            return name.split()[0]
+    if user and user.get("role") != "owner":
+        return "there"
     settings = get_settings()
     name = (settings.student_name or "Student").strip()
     if name.startswith("["):
@@ -224,8 +226,8 @@ def _greeting_name(user: dict[str, Any] | None = None) -> str:
     return name.split()[0] if name else "there"
 
 
-def _sync_meta() -> dict[str, Any]:
-    state = get_watch_state() or {}
+def _sync_meta(user_id: str | None = None) -> dict[str, Any]:
+    state = get_watch_state(user_id) or {}
     last = state.get("last_checked_at") or state.get("last_heartbeat_at")
     return {
         "synced": True,
@@ -385,6 +387,9 @@ def _activity_items(limit: int = 10, user_id: str | None = None) -> list[dict[st
 
 @router.get("/dashboard")
 async def dashboard(user: dict = Depends(web_user)):
+    from services.users import refresh_display_name_from_gmail
+
+    user = await asyncio.to_thread(refresh_display_name_from_gmail, user) or user
     now = now_ist()
     settings = get_settings()
     uid = user["id"]
@@ -394,7 +399,7 @@ async def dashboard(user: dict = Depends(web_user)):
         buckets = _partition_open_assignments(now=now, user_id=uid)
         sessions = sessions_for_day(today_ist(), section=section)
         activity = _activity_items(5, user_id=uid)
-        sync = _sync_meta()
+        sync = _sync_meta(uid)
         return section, buckets, sessions, activity, sync
 
     try:
@@ -407,7 +412,7 @@ async def dashboard(user: dict = Depends(web_user)):
             "upcoming": [],
             "missed": [],
             "undated": [],
-        }, [], [], _sync_meta()
+        }, [], [], _sync_meta(uid)
         db_ok = False
 
     upcoming = buckets["upcoming"]
@@ -425,7 +430,8 @@ async def dashboard(user: dict = Depends(web_user)):
     gmail_connected = bool(user.get("gmail_address")) or user.get("role") == "owner"
     return {
         "greeting_name": _greeting_name(user),
-        "student_name": user.get("display_name") or settings.student_name,
+        "student_name": user.get("display_name")
+        or (settings.student_name if user.get("role") == "owner" else "Student"),
         "section": section,
         "sync": sync,
         "db_ok": db_ok,
@@ -845,7 +851,7 @@ async def chat_history(user: dict = Depends(web_user)):
 
 
 @router.post("/chat/message")
-async def chat_message(body: ChatMessageBody, user: dict = Depends(web_user)):
+async def chat_message(body: ChatMessageBody, user: dict = Depends(bind_mailbox_user)):
     uid = user["id"]
     text = (body.message or "").strip()
     if not text:
@@ -951,7 +957,7 @@ class ComposeDraftBody(BaseModel):
 
 
 @router.post("/compose/draft")
-async def compose_draft(body: ComposeDraftBody):
+async def compose_draft(body: ComposeDraftBody, user: dict = Depends(bind_mailbox_user)):
     draft = await asyncio.to_thread(compose_email, body.instructions)
     if not draft or "subject" not in draft or "body" not in draft:
         raise HTTPException(status_code=502, detail="Could not generate draft")

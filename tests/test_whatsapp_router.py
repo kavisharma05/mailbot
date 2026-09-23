@@ -129,11 +129,15 @@ def test_callback_toast_is_a_message_unless_the_tap_already_replied():
 
 
 def test_smalltalk_covers_hii_and_good_morning():
-    from bot.handlers import _is_smalltalk
+    from bot.handlers import _is_gmail_status_question, _is_smalltalk
 
     assert _is_smalltalk("hii")
     assert _is_smalltalk("Good morning!")
     assert not _is_smalltalk("what's due tomorrow")
+    assert not _is_smalltalk("Is gmail connected")
+    assert _is_gmail_status_question("Is gmail connected")
+    assert _is_gmail_status_question("is my gmail working?")
+    assert not _is_gmail_status_question("any mail from saleena")
 
 
 def test_whatsapp_message_has_entities_so_chat_does_not_crash():

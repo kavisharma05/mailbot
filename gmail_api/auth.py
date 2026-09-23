@@ -26,6 +26,11 @@ def reset_gmail_user_context(token) -> None:
 
 
 def active_gmail_user_id() -> str:
+    """The mailbox for this request. A bound user wins over the owner default."""
+    from services.mailbox_user import current, user_id
+
+    if current() is not None:
+        return user_id()
     return _gmail_user_id.get()
 
 

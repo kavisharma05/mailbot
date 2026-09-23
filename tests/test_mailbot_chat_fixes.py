@@ -32,6 +32,28 @@ def test_deterministic_date_time_answer_contains_ist():
     assert "Today is" in answer
 
 
+def test_non_deadline_prompt_omits_task_dump():
+    from ai.assistant import _answer_dumps_unasked_deadlines, _build_user_prompt, _question_needs_tracked_items
+
+    assert not _question_needs_tracked_items("Is gmail connected")
+    assert _question_needs_tracked_items("what's due tomorrow")
+    prompt = _build_user_prompt(
+        "Is gmail connected",
+        [{"task": "Bloomberg orientation", "status": "open"}],
+        [],
+        None,
+        None,
+        include_tracked_items=False,
+        bot_status={"gmail_login_saved": True, "gmail_address": "me@imtnag.ac.in"},
+    )
+    assert "Bloomberg orientation" not in prompt
+    assert "gmail_login_saved" in prompt
+    assert "Is gmail connected" in prompt
+    dump = "\n".join(f"{i}. Something\nDue: tomorrow" for i in range(6))
+    assert _answer_dumps_unasked_deadlines(dump, "Is gmail connected")
+    assert not _answer_dumps_unasked_deadlines(dump, "what's due tomorrow")
+
+
 def test_answer_question_date_without_llm():
     with patch("ai.assistant.call_text", return_value=None):
         answer = answer_question("what is the date today", items=[])

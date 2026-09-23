@@ -511,14 +511,32 @@ def get_thread_message_details(
     return details
 
 
+def primary_mailbox_display_name(user_id: str | None = None) -> str | None:
+    """Name shown on the Gmail account (Send mail as), not the Telegram handle."""
+    service = get_gmail_service(user_id)
+    listed = service.users().settings().sendAs().list(userId="me").execute()
+    aliases = listed.get("sendAs") or []
+    primary = next((row for row in aliases if row.get("isPrimary")), None)
+    chosen = primary or (aliases[0] if aliases else None)
+    if not chosen:
+        return None
+    name = str(chosen.get("displayName") or "").strip()
+    return name or None
+
+
 def send_email(to: str, subject: str, body: str, thread_id: str | None = None, from_addr: str | None = None) -> dict[str, str]:
     from config import get_settings
+    from services.mailbox_user import current, gmail_address
 
     service = get_gmail_service()
     settings = get_settings()
+    sender = (from_addr or "").strip() or gmail_address()
+    if not sender and current() is None:
+        sender = (settings.gmail_user or "").strip()
     mime = MIMEText(body)
     mime["to"] = to
-    mime["from"] = from_addr or settings.gmail_user
+    if sender:
+        mime["from"] = sender
     mime["subject"] = subject
 
     raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
