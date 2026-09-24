@@ -10,15 +10,20 @@ def test_command_map_includes_core_commands():
 
 def test_whatsapp_actor_is_the_telegram_owner_not_the_phone(monkeypatch):
     monkeypatch.setenv("TELEGRAM_OWNER_USER_ID", "424242")
+    monkeypatch.setenv("WHATSAPP_OWNER_PHONE", "919999999999")
+    monkeypatch.setenv("WHATSAPP_PHONE_MAP", "")
     from config import get_settings
+    from services.messaging.whatsapp_routing import clear_whatsapp_routing_cache
 
     get_settings.cache_clear()
+    clear_whatsapp_routing_cache()
     from bot.whatsapp_adapter import build_text_update
 
     update = build_text_update("919999999999", "hi", "wamid.1")
     assert update.effective_user.id == 424242
     assert update.effective_chat.id == 919999999999
     get_settings.cache_clear()
+    clear_whatsapp_routing_cache()
 
 
 def test_whatsapp_hi_reaches_chat(monkeypatch):

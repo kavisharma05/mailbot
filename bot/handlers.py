@@ -214,13 +214,17 @@ def _resolve_user(update: Update) -> dict[str, Any] | None:
             row = resolve_whatsapp_bot_user(phone)
             if row:
                 return row
-        return get_owner_user() or {
-            "id": OWNER_SEED_USER_ID,
-            "role": "owner",
-            "telegram_user_id": str(tg.id),
-            "telegram_chat_id": str(getattr(update.effective_chat, "id", tg.id)),
-            "is_active": True,
-        }
+        from services.messaging.whatsapp_routing import whatsapp_phone_is_owner
+
+        if phone and whatsapp_phone_is_owner(phone):
+            return get_owner_user() or {
+                "id": OWNER_SEED_USER_ID,
+                "role": "owner",
+                "telegram_user_id": str(tg.id),
+                "telegram_chat_id": str(getattr(update.effective_chat, "id", tg.id)),
+                "is_active": True,
+            }
+        return None
     if str(tg.id) == str(owner_id):
         return get_owner_user() or {
             "id": OWNER_SEED_USER_ID,
@@ -1102,14 +1106,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    link_telegram_to_user(
-        user["id"],
-        telegram_user_id=str(tg.id),
-        telegram_chat_id=str(chat.id),
-        telegram_username=tg.username,
-        telegram_first_name=tg.first_name,
-        telegram_last_name=tg.last_name,
-    )
+    if not getattr(update, "is_whatsapp", False):
+        link_telegram_to_user(
+            user["id"],
+            telegram_user_id=str(tg.id),
+            telegram_chat_id=str(chat.id),
+            telegram_username=tg.username,
+            telegram_first_name=tg.first_name,
+            telegram_last_name=tg.last_name,
+        )
 
     if is_owner_user(user):
         msg = await update.message.reply_text(

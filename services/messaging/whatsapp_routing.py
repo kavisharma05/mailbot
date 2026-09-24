@@ -55,6 +55,25 @@ def clear_whatsapp_routing_cache() -> None:
     _phone_to_user_key.cache_clear()
 
 
+def _lookup_map_key(normalized: str) -> str | None:
+    mapping = _phone_to_user_key()
+    if not normalized or not mapping:
+        return None
+    if normalized in mapping:
+        return mapping[normalized]
+    for phone, key in mapping.items():
+        if wa_phones_match(normalized, phone):
+            return key
+    return None
+
+
+def whatsapp_phone_is_owner(phone: str) -> bool:
+    owner = _owner_phone_digits()
+    if not owner:
+        return False
+    return wa_phones_match(normalize_wa_digits(phone), owner)
+
+
 def _resolve_map_key(key: str) -> dict[str, Any] | None:
     k = (key or "").strip()
     if not k:
@@ -90,7 +109,7 @@ def resolve_whatsapp_bot_user(phone: str) -> dict[str, Any] | None:
     if owner and wa_phones_match(normalized, owner):
         return get_owner_user()
 
-    key = _phone_to_user_key().get(normalized)
+    key = _lookup_map_key(normalized)
     if key:
         user = _resolve_map_key(key)
         if user:
@@ -122,6 +141,8 @@ def whatsapp_actor_telegram_id(phone: str) -> int:
         raw = str(user.get("telegram_user_id") or "").strip()
         if raw.lstrip("-").isdigit():
             return int(raw)
-    if str(owner_id).lstrip("-").isdigit():
+        if str(user.get("role") or "") != "owner":
+            return phone_to_stable_user_id(phone)
+    if whatsapp_phone_is_owner(phone) and str(owner_id).lstrip("-").isdigit():
         return int(owner_id)
     return phone_to_stable_user_id(phone)

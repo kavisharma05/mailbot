@@ -55,7 +55,7 @@ class WhatsAppChat:
 
 class WhatsAppMessage:
     def __init__(self, phone: str, text: str, message_id: str, bot: WhatsAppBot) -> None:
-        self._phone = phone
+        self._phone = normalize_wa_digits(phone)
         self.text = text
         self.message_id = message_id
         self._bot = bot
@@ -82,7 +82,7 @@ class _SentMessageStub:
 
 class WhatsAppCallbackMessage:
     def __init__(self, phone: str, bot: WhatsAppBot) -> None:
-        self._phone = phone
+        self._phone = normalize_wa_digits(phone)
         self._bot = bot
         self._query: WhatsAppCallbackQuery | None = None
         phone_id = _phone_to_user_id(phone)
@@ -107,7 +107,7 @@ class WhatsAppCallbackMessage:
 
 class WhatsAppCallbackQuery:
     def __init__(self, phone: str, data: str, bot: WhatsAppBot) -> None:
-        self._phone = phone
+        self._phone = normalize_wa_digits(phone)
         self.data = data
         self._bot = bot
         self._notice: str | None = None

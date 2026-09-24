@@ -726,6 +726,7 @@ async def oauth_callback(
     from services.mailbox_user import set_user as set_mb_user
     from services.users import get_user_by_id, update_user_fields
 
+    backfill: dict = {"status": "skipped", "reason": "no_user"}
     urow = get_user_by_id(oauth_user_id) if oauth_user_id else None
     if urow:
         mb = set_mb_user(urow)
@@ -746,12 +747,12 @@ async def oauth_callback(
                 logger.warning("Could not read Gmail display name after connect: %s", exc)
             if fields:
                 update_user_fields(oauth_user_id, fields)
+            backfill = await run_gmail_reconnect_backfill(ptb_app.bot)
         except Exception as exc:
             logger.warning("Could not fetch Gmail profile after connect: %s", exc)
         finally:
             reset_gmail_user_context(gt)
             reset_mb(mb)
-    backfill = await run_gmail_reconnect_backfill(ptb_app.bot)
     logger.info("Gmail reconnected; backfill: %s", backfill)
     return HTMLResponse(
         "<h1>Gmail reconnected</h1><p>You can close this tab and return to Telegram.</p>"

@@ -25,6 +25,30 @@ def test_owner_phone_resolves_without_map(monkeypatch):
     clear_whatsapp_routing_cache()
 
 
+def test_map_matches_meta_local_number(monkeypatch):
+    monkeypatch.setenv("WHATSAPP_OWNER_PHONE", "917489491188")
+    monkeypatch.setenv("WHATSAPP_PHONE_MAP", "917984586096:tripti132")
+    from config import get_settings
+    from services.messaging.whatsapp_routing import (
+        clear_whatsapp_routing_cache,
+        resolve_whatsapp_bot_user,
+        whatsapp_phone_allowed,
+    )
+
+    get_settings.cache_clear()
+    clear_whatsapp_routing_cache()
+    monkeypatch.setattr(
+        "services.messaging.whatsapp_routing._resolve_map_key",
+        lambda key: {"id": "u-t", "role": "student", "telegram_user_id": "111"}
+        if key == "tripti132"
+        else None,
+    )
+    assert whatsapp_phone_allowed("7984586096")
+    assert resolve_whatsapp_bot_user("7984586096")["id"] == "u-t"
+    get_settings.cache_clear()
+    clear_whatsapp_routing_cache()
+
+
 def test_mapped_peer_phone(monkeypatch):
     monkeypatch.setenv("WHATSAPP_OWNER_PHONE", "917489491188")
     monkeypatch.setenv("WHATSAPP_PHONE_MAP", "917984586096:tripti,919142052201:ashish")
