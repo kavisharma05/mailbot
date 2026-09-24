@@ -9,3 +9,5 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: WHATSAPP_PHONE_MAP
+        value: "917984586096:tripti132,919142052201:ashish792003"

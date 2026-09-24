@@ -7,6 +7,13 @@ def normalize_wa_digits(phone: str) -> str:
     return str(phone or "").lstrip("+").replace(" ", "").replace("-", "")
 
 
+def phone_to_stable_user_id(phone: str) -> int:
+    digits = normalize_wa_digits(phone)
+    if digits.isdigit():
+        return int(digits)
+    return abs(hash(digits)) % (10**12)
+
+
 def wa_phones_match(a: str, b: str) -> bool:
     """True when numbers match exactly or one is the other with country code (e.g. 91…)."""
     da = normalize_wa_digits(a)

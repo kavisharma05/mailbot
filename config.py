@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     whatsapp_app_secret: str = ""
     whatsapp_verify_token: str = ""
     whatsapp_owner_phone: str = ""
+    # Inbound-only peers: phone:user_key pairs (comma-separated).
+    # user_key = telegram @username, users.id UUID, or display-name hint (e.g. tripti).
+    # Example: 917984586096:tripti,919142052201:ashish
+    whatsapp_phone_map: str = "917984586096:tripti132,919142052201:ashish792003"
     whatsapp_api_version: str = "v22.0"
     whatsapp_alert_template: str = ""
     whatsapp_digest_template: str = ""

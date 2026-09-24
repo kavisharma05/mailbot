@@ -9,6 +9,7 @@ from typing import Any
 from telegram.constants import ChatType
 
 from services.messaging.format import html_to_whatsapp, whatsapp_interactive_from_markup
+from services.messaging.phone import normalize_wa_digits, phone_to_stable_user_id
 from services.messaging.whatsapp import get_whatsapp_client
 from services.telegram_util import chunk_text
 
@@ -16,29 +17,18 @@ logger = logging.getLogger(__name__)
 
 
 def _phone_to_user_id(phone: str) -> int:
-    digits = str(phone or "").lstrip("+").replace(" ", "").replace("-", "")
-    if digits.isdigit():
-        return int(digits)
-    return abs(hash(digits)) % (10**12)
+    return phone_to_stable_user_id(phone)
 
 
-def _owner_actor_id(phone: str) -> int:
-    """Telegram owner id, so handlers recognize this WhatsApp chat.
-
-    The Cloud API user id is a phone number. That never matches the Telegram
-    owner id, and chat_message then returns without sending a reply.
-    """
+def _whatsapp_actor_id(phone: str) -> int:
+    """Map this WhatsApp chat to the user's Telegram id when possible."""
     try:
-        from config import get_settings
+        from services.messaging.whatsapp_routing import whatsapp_actor_telegram_id
 
-        settings = get_settings()
-        raw = settings.owner_user_id() if hasattr(settings, "owner_user_id") else ""
-        raw = str(raw or "").strip()
-        if raw.lstrip("-").isdigit():
-            return int(raw)
+        return whatsapp_actor_telegram_id(phone)
     except Exception:
-        logger.debug("WhatsApp owner id lookup failed", exc_info=True)
-    return _phone_to_user_id(phone)
+        logger.debug("WhatsApp actor id lookup failed", exc_info=True)
+        return _phone_to_user_id(phone)
 
 
 @dataclass
@@ -70,7 +60,7 @@ class WhatsAppMessage:
         self.message_id = message_id
         self._bot = bot
         phone_id = _phone_to_user_id(phone)
-        self.from_user = WhatsAppUser(id=_owner_actor_id(phone))
+        self.from_user = WhatsAppUser(id=_whatsapp_actor_id(phone))
         self.chat = WhatsAppChat(id=phone_id, inbound_message_id=message_id)
         self.reply_to_message = None
         self.entities = None
@@ -124,7 +114,7 @@ class WhatsAppCallbackQuery:
         self._replied = False
         self.message = WhatsAppCallbackMessage(phone, bot)
         self.message._query = self
-        self.from_user = WhatsAppUser(id=_owner_actor_id(phone))
+        self.from_user = WhatsAppUser(id=_whatsapp_actor_id(phone))
 
     async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
         """Telegram shows this as a toast. WhatsApp has no toast, so keep the text to send."""
@@ -158,9 +148,15 @@ class WhatsAppUpdate:
         *,
         message: WhatsAppMessage | None = None,
         callback_query: WhatsAppCallbackQuery | None = None,
+        whatsapp_phone: str = "",
     ) -> None:
         self.message = message
         self.callback_query = callback_query
+        self.whatsapp_phone = normalize_wa_digits(
+            whatsapp_phone
+            or (message._phone if message else "")
+            or (callback_query._phone if callback_query else "")
+        )
         if message:
             self.effective_user = message.from_user
             self.effective_chat = message.chat

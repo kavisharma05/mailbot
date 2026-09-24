@@ -206,9 +206,22 @@ def _resolve_user(update: Update) -> dict[str, Any] | None:
         else getattr(settings, "telegram_owner_user_id", "")
         or getattr(settings, "telegram_owner_chat_id", "")
     )
-    if str(tg.id) == str(owner_id) or getattr(update, "is_whatsapp", False):
-        # WhatsApp is already limited to the owner phone. Treat that chat as
-        # the owner even when the Cloud API id is the phone, not the Telegram id.
+    if getattr(update, "is_whatsapp", False):
+        from services.messaging.whatsapp_routing import resolve_whatsapp_bot_user
+
+        phone = getattr(update, "whatsapp_phone", "") or ""
+        if phone:
+            row = resolve_whatsapp_bot_user(phone)
+            if row:
+                return row
+        return get_owner_user() or {
+            "id": OWNER_SEED_USER_ID,
+            "role": "owner",
+            "telegram_user_id": str(tg.id),
+            "telegram_chat_id": str(getattr(update.effective_chat, "id", tg.id)),
+            "is_active": True,
+        }
+    if str(tg.id) == str(owner_id):
         return get_owner_user() or {
             "id": OWNER_SEED_USER_ID,
             "role": "owner",
@@ -2245,11 +2258,15 @@ async def chat_message(
     if not _require_user(update):
         if not getattr(update, "is_whatsapp", False):
             return
-        from services.mailbox_user import set_user
-        from services.user_ids import OWNER_SEED_USER_ID
-        from services.users import get_owner_user
+        from services.messaging.whatsapp_routing import resolve_whatsapp_bot_user
 
-        set_user(get_owner_user() or {"id": OWNER_SEED_USER_ID, "role": "owner", "is_active": True})
+        phone = getattr(update, "whatsapp_phone", "") or ""
+        row = resolve_whatsapp_bot_user(phone) if phone else None
+        if not row:
+            return
+        from services.mailbox_user import set_user
+
+        set_user(row)
     input_text = text_override or update.message.text
 
     if _get_compose(context.user_data):

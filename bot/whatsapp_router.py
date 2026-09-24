@@ -6,8 +6,12 @@ import copy
 import asyncio
 import logging
 
+from config import get_settings
+
 from bot import handlers
 from bot.handlers import _get_compose
+from services.messaging.whatsapp_routing import whatsapp_phone_allowed
+
 from bot.whatsapp_adapter import (
     WhatsAppContext,
     build_callback_update,
@@ -272,13 +276,13 @@ async def _process_media(
 
 async def process_whatsapp_message(phone: str, message: dict) -> None:
     """Handle one inbound WhatsApp message dict from Meta webhook payload."""
-    owner = owner_phone_for_bot()
     normalized = normalize_wa_digits(phone)
-    if owner and not wa_phones_match(normalized, owner):
+    if not whatsapp_phone_allowed(normalized):
         logger.info(
-            "Ignoring WhatsApp message from non-owner %s (WHATSAPP_OWNER_PHONE=%s)",
+            "Ignoring WhatsApp message from unmapped phone %s (owner=%s, map configured=%s)",
             normalized,
-            owner,
+            owner_phone_for_bot() or "(none)",
+            bool((get_settings().whatsapp_phone_map or "").strip()),
         )
         return
 

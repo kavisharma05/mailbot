@@ -210,7 +210,8 @@ After `migration_multi_user.sql`:
 | `WHATSAPP_PHONE_NUMBER_ID` | Phone number ID from WhatsApp → API Setup |
 | `WHATSAPP_APP_SECRET` | App secret for `X-Hub-Signature-256` on `/whatsapp/webhook` |
 | `WHATSAPP_VERIFY_TOKEN` | Must match Meta webhook verify token |
-| `WHATSAPP_OWNER_PHONE` | Owner WhatsApp number (digits only, e.g. `917489491188`) |
+| `WHATSAPP_OWNER_PHONE` | Owner WhatsApp number (digits only, e.g. `917489491188`) — alerts/digests stay here |
+| `WHATSAPP_PHONE_MAP` | Peers on WhatsApp (default: Tripti + Ashish). Override with `phone:telegram_username` pairs, comma-separated |
 | `WHATSAPP_API_VERSION` | Graph version (default `v22.0`) |
 | `WHATSAPP_ALERT_TEMPLATE` | Approved utility template for outside-24h nudges (one `{{1}}` body param) |
 | `WHATSAPP_DIGEST_TEMPLATE` | Optional digest-specific template; falls back to `WHATSAPP_ALERT_TEMPLATE` |
