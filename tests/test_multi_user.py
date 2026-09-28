@@ -15,6 +15,68 @@ def test_normalize_username():
     assert _normalize_username("@Alice") == "alice"
 
 
+def test_open_login_signs_kavish132_in_as_owner(monkeypatch):
+    monkeypatch.delenv("WEB_OPEN_LOGIN", raising=False)
+    from services.users import open_web_login
+
+    owner = {
+        "id": OWNER_SEED_USER_ID,
+        "role": "owner",
+        "telegram_username": None,
+        "display_name": "Kavish",
+    }
+    sessions: list[dict] = []
+
+    class Table:
+        def __init__(self, name):
+            self.name = name
+
+        def update(self, payload):
+            return self
+
+        def eq(self, *_args):
+            return self
+
+        def upsert(self, payload, on_conflict=None):
+            del on_conflict
+            sessions.append(payload)
+            return self
+
+        def execute(self):
+            return type("R", (), {"data": []})()
+
+    class DB:
+        def table(self, name):
+            return Table(name)
+
+    with (
+        patch("services.users.get_user_by_username", return_value=None),
+        patch("services.users.ensure_owner_user", return_value=dict(owner)),
+        patch(
+            "services.users.update_user_fields",
+            return_value={**owner, "telegram_username": "kavish132"},
+        ),
+        patch("services.users.get_pending_invite_for_username", return_value={"id": "inv-1"}),
+        patch("services.users._users_table_ok", return_value=True),
+        patch("services.users.get_db", return_value=DB()),
+    ):
+        result = open_web_login("@Kavish132")
+
+    assert result["ok"] is True
+    assert result["token"]
+    assert result["user"]["id"] == OWNER_SEED_USER_ID
+    assert result["user"]["telegram_username"] == "kavish132"
+    assert sessions and sessions[0]["user_id"] == OWNER_SEED_USER_ID
+
+
+def test_other_usernames_still_need_a_code(monkeypatch):
+    monkeypatch.delenv("WEB_OPEN_LOGIN", raising=False)
+    from services.users import open_web_login
+
+    assert open_web_login("kavish") is None
+    assert open_web_login("someoneelse") is None
+
+
 def test_oauth_state_roundtrip():
     state = create_oauth_state(OWNER_SEED_USER_ID)
     ok, uid = verify_oauth_state(state)

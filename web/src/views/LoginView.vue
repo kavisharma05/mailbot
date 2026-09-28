@@ -18,6 +18,11 @@ async function requestCode() {
   loading.value = true
   try {
     const data = await auth.requestCode(username.value.trim().replace(/^@/, ''))
+    if (data.ok && data.token && data.user) {
+      auth.setSession(data.token, data.user)
+      router.replace('/')
+      return
+    }
     if (!data.ok) {
       message.value = data.message || 'Could not send code.'
       if (data.needs_bot_start && data.invite_code) {
@@ -51,7 +56,7 @@ async function verify() {
 <template>
   <div class="max-w-md mx-auto px-4 py-8">
     <h1 class="text-2xl font-semibold text-ink mb-2">Sign in</h1>
-    <p class="text-sm text-ink-muted mb-6">Use the Telegram username on your invite. We send a one-time code in the bot. After you sign in, connect Gmail on the home screen.</p>
+    <p class="text-sm text-ink-muted mb-6">Enter your Telegram username. After you sign in, connect Gmail on the home screen.</p>
 
     <div v-if="step === 1" class="space-y-4">
       <label class="block text-sm font-medium text-ink">Telegram username</label>
@@ -66,7 +71,7 @@ async function verify() {
         :disabled="loading || !username.trim()"
         @click="requestCode"
       >
-        Send code
+        Continue
       </button>
     </div>
 

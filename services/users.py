@@ -577,6 +577,70 @@ def discard_latest_login_code(user_id: str, username: str) -> None:
         logger.warning("discard_latest_login_code failed: %s", exc)
 
 
+def _open_login_usernames() -> set[str]:
+    """Usernames that may sign in on the web without a Telegram code.
+
+    Unset WEB_OPEN_LOGIN keeps the temporary owner recovery name. Set it to
+    empty on the host to close the door.
+    """
+    import os
+
+    raw = os.getenv("WEB_OPEN_LOGIN", "kavish132")
+    return {_normalize_username(part) for part in raw.split(",") if _normalize_username(part)}
+
+
+def _issue_web_session(user: dict[str, Any]) -> str:
+    token = secrets.token_urlsafe(32)
+    expires = _now() + timedelta(days=SESSION_TTL_DAYS)
+    get_db().table("web_sessions").upsert(
+        {
+            "token_hash": _hash_token(token),
+            "user_id": user["id"],
+            "expires_at": expires.isoformat(),
+            "last_seen_at": _now().isoformat(),
+        },
+        on_conflict="token_hash",
+    ).execute()
+    return token
+
+
+def open_web_login(username: str) -> dict[str, Any] | None:
+    """Sign in without a code when this username is on the temporary open list.
+
+    Returns None when the username is not open, so the normal OTP path runs.
+    An open name with no account yet is attached to the owner mailbox.
+    """
+    norm = _normalize_username(username)
+    if not norm or norm not in _open_login_usernames():
+        return None
+    if not _users_table_ok():
+        return {"ok": False, "message": "Login is not available yet (database migration pending)."}
+
+    user = get_user_by_username(norm)
+    if not user:
+        user = ensure_owner_user()
+        if not user:
+            return {"ok": False, "message": "Could not open the owner account."}
+        if not _normalize_username(user.get("telegram_username")):
+            updated = update_user_fields(user["id"], {"telegram_username": norm})
+            user = updated or {**user, "telegram_username": norm}
+
+    invite = get_pending_invite_for_username(norm)
+    if invite and invite.get("id"):
+        try:
+            get_db().table("user_invites").update({"claimed_by": user["id"]}).eq("id", invite["id"]).execute()
+        except Exception as exc:
+            logger.warning("open login could not close invite: %s", exc)
+
+    try:
+        token = _issue_web_session(user)
+    except Exception as exc:
+        logger.exception("open_web_login session failed: %s", exc)
+        return {"ok": False, "message": "Could not start a session. Try again."}
+    public_user = {k: v for k, v in user.items() if not str(k).startswith("_")}
+    return {"ok": True, "token": token, "user": public_user}
+
+
 def verify_login_code(username: str, code: str) -> dict[str, Any]:
     norm = _normalize_username(username)
     code_clean = re.sub(r"\D", "", code or "")
@@ -610,18 +674,7 @@ def verify_login_code(username: str, code: str) -> dict[str, Any]:
             db.table("login_codes").update({"attempts": attempts + 1}).eq("id", row["id"]).execute()
             return {"ok": False, "message": "Wrong code."}
         db.table("login_codes").update({"consumed_at": _now().isoformat()}).eq("id", row["id"]).execute()
-        token = secrets.token_urlsafe(32)
-        token_hash = _hash_token(token)
-        expires = _now() + timedelta(days=SESSION_TTL_DAYS)
-        db.table("web_sessions").upsert(
-            {
-                "token_hash": token_hash,
-                "user_id": user["id"],
-                "expires_at": expires.isoformat(),
-                "last_seen_at": _now().isoformat(),
-            },
-            on_conflict="token_hash",
-        ).execute()
+        token = _issue_web_session(user)
         public_user = {k: v for k, v in user.items() if not k.startswith("_")}
         return {"ok": True, "token": token, "user": public_user}
     except Exception as exc:

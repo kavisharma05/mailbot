@@ -13,6 +13,7 @@ from config import get_settings
 from services.users import (
     discard_latest_login_code,
     get_user_by_id,
+    open_web_login,
     request_login_code,
     revoke_session_token,
     verify_login_code,
@@ -49,6 +50,16 @@ async def _telegram_send(chat_id: str, text: str) -> bool:
 
 @router.post("/request-code")
 async def auth_request_code(body: RequestCodeBody):
+    opened = open_web_login(body.username)
+    if opened is not None:
+        if not opened.get("ok"):
+            return {"ok": False, "message": opened.get("message")}
+        return {
+            "ok": True,
+            "token": opened["token"],
+            "user": opened["user"],
+            "message": "Signed in.",
+        }
     result = request_login_code(body.username)
     if not result.get("ok"):
         return {
