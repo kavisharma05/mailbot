@@ -31,11 +31,25 @@ DIGEST_KEYWORDS = {
 
 
 def digest_template_name() -> str:
+    """Legacy alias — prefer ``nudge_template_name`` for kind-aware sends."""
+    return nudge_template_name("morning")
+
+
+def nudge_template_name(kind: str) -> str:
     settings = get_settings()
-    return (
-        (settings.whatsapp_digest_template or "").strip()
-        or (settings.whatsapp_alert_template or "").strip()
-    )
+    alert = (settings.whatsapp_alert_template or "").strip()
+    digest = (settings.whatsapp_digest_template or "").strip()
+    if kind in ("morning", "evening"):
+        return digest or alert
+    return alert or digest
+
+
+def nudge_body_parameter(template_name: str, kind: str) -> str | None:
+    """Static digest templates have no {{1}}; alert templates need a short teaser."""
+    digest = (get_settings().whatsapp_digest_template or "").strip()
+    if template_name and digest and template_name == digest:
+        return None
+    return _teaser(kind)
 
 
 def _owner_phone() -> str:
@@ -151,7 +165,7 @@ async def stash_and_nudge(phone: str, *, kind: str, text: str) -> bool:
     on the owner's next inbound message (or when they send DIGEST).
     """
     await stash_pending_digest(phone, kind=kind, text=text)
-    tmpl = digest_template_name()
+    tmpl = nudge_template_name(kind)
     if not tmpl:
         logger.info(
             "WhatsApp %s stashed for %s (no utility template configured)",
@@ -159,9 +173,7 @@ async def stash_and_nudge(phone: str, *, kind: str, text: str) -> bool:
             phone,
         )
         return False
-    # Static digest templates have no {{1}}; alert templates need a teaser.
-    digest_only = (get_settings().whatsapp_digest_template or "").strip()
-    body = None if digest_only else _teaser(kind)
+    body = nudge_body_parameter(tmpl, kind)
     client = get_whatsapp_client()
     nudged = await client.send_template(phone, tmpl, body_parameter=body)
     if not nudged and body is not None:
@@ -175,21 +187,47 @@ async def stash_and_nudge(phone: str, *, kind: str, text: str) -> bool:
     return nudged
 
 
-async def deliver_whatsapp_digest(text: str, *, kind: str) -> str:
-    """Try free-form digest; stash (+ optional template nudge) if the window is closed.
+async def deliver_owner_whatsapp_proactive(
+    phone: str,
+    text: str,
+    *,
+    kind: str,
+    from_html: bool = True,
+    reply_markup: Any = None,
+) -> str:
+    """Deliver proactive owner content: free-form in-window, else template nudge + stash.
 
     Returns ``sent``, ``stashed``, or ``skipped``.
     """
+    from services.messaging.service_window import service_window_open
+
     client = get_whatsapp_client()
-    phone = _owner_phone()
     if not client.enabled or not phone or not (text or "").strip():
         return "skipped"
 
-    ok = await client.send_text(
-        phone, text, from_html=True, template_fallback=False, outbox_kind=kind
-    )
-    if ok:
-        return "sent"
+    user_data = await load_user_data(phone)
+    if service_window_open(user_data):
+        ok = await client.send_text(
+            phone,
+            text,
+            from_html=from_html,
+            reply_markup=reply_markup,
+            template_fallback=True,
+            outbox_kind=kind,
+        )
+        if ok:
+            return "sent"
 
     await stash_and_nudge(phone, kind=kind, text=text)
     return "stashed"
+
+
+async def deliver_whatsapp_digest(text: str, *, kind: str) -> str:
+    """Owner digest: free-form in-window, else stash + approved template nudge.
+
+    Returns ``sent``, ``stashed``, or ``skipped``.
+    """
+    phone = _owner_phone()
+    if not (text or "").strip():
+        return "skipped"
+    return await deliver_owner_whatsapp_proactive(phone, text, kind=kind, from_html=True)

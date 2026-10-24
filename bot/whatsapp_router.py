@@ -327,6 +327,9 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
     # An inbound message opens Meta's 24h window — deliver any stashed briefing
     # unless the user only opened the menu (/menu, start, help).
     user_data = await load_user_data(normalized)
+    from services.messaging.service_window import touch_service_window
+
+    touch_service_window(user_data)
     snapshot = copy.deepcopy(user_data)
     wants_digest = False
     if msg_type == "text":

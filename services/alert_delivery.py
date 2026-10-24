@@ -89,11 +89,15 @@ async def _mirror_owner_alert_to_whatsapp(
     reply_markup = (
         build_action_keyboard(assignment_id, show_reply=show_reply) if assignment_id else None
     )
-    ok = await client.send_text(phone, text, from_html=True, reply_markup=reply_markup)
-    if not ok:
-        logger.warning("WhatsApp mirror failed for owner alert on Telegram chat %s", chat_id)
+    from services.messaging.pending_digest import deliver_owner_whatsapp_proactive
+
+    outcome = await deliver_owner_whatsapp_proactive(
+        phone, text, kind="alert", from_html=True, reply_markup=reply_markup
+    )
+    if outcome == "skipped":
+        logger.warning("WhatsApp mirror skipped (not configured) for Telegram chat %s", chat_id)
         return
-    logger.info("WhatsApp mirror sent for owner alert on Telegram chat %s", chat_id)
+    logger.info("WhatsApp mirror %s for owner alert on Telegram chat %s", outcome, chat_id)
     await record_content_sent(phone, text)
     attach_ok = await _deliver_whatsapp_attachments(attachments, caption_prefix=caption_prefix)
     if not attach_ok:
