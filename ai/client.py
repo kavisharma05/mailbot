@@ -215,7 +215,7 @@ def _openai_compatible_post(
                 _set_last_error(body, resp.status_code, provider)
                 logger.error("%s failed (%s): %s", provider, resp.status_code, body[:300])
                 if resp.status_code == 429 or _is_daily_limit_text(body):
-                    _cooldown(provider, daily=_is_daily_limit_text(body), seconds=180)
+                    _cooldown(provider, daily=_is_daily_limit_text(body), seconds=20)
                 elif resp.status_code in (401, 403):
                     _cooldown(provider, seconds=3600)
                 elif resp.status_code == 402:
@@ -303,7 +303,7 @@ def _call_groq(
             text = str(exc)
             _set_last_error(text, exc.status_code, provider)
             if exc.status_code == 429 or _is_daily_limit_text(text):
-                _cooldown(provider, daily=_is_daily_limit_text(text), seconds=180)
+                _cooldown(provider, daily=_is_daily_limit_text(text), seconds=20)
                 logger.error("%s rate/daily limit: %s", provider, exc)
                 return None
             if exc.status_code in (401, 403):
@@ -539,7 +539,7 @@ def _claude_error(resp: Any, *, provider: str) -> None:
     _set_last_error(body, resp.status_code, provider)
     logger.error("claude_session failed (%s): %s", resp.status_code, body[:300])
     if resp.status_code == 429 or _is_daily_limit_text(body):
-        _cooldown(provider, daily=_is_daily_limit_text(body), seconds=180)
+        _cooldown(provider, daily=_is_daily_limit_text(body), seconds=20)
     elif resp.status_code in (401, 403):
         _cooldown(provider, seconds=90)
     elif resp.status_code == 402:

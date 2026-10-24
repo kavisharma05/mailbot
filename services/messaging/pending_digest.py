@@ -162,7 +162,10 @@ async def stash_and_nudge(phone: str, *, kind: str, text: str) -> bool:
     # Static digest templates have no {{1}}; alert templates need a teaser.
     digest_only = (get_settings().whatsapp_digest_template or "").strip()
     body = None if digest_only else _teaser(kind)
-    nudged = await get_whatsapp_client().send_template(phone, tmpl, body_parameter=body)
+    client = get_whatsapp_client()
+    nudged = await client.send_template(phone, tmpl, body_parameter=body)
+    if not nudged and body is not None:
+        nudged = await client.send_template(phone, tmpl, body_parameter=None)
     logger.info(
         "WhatsApp %s stashed for %s; template nudge %s",
         kind,

@@ -55,17 +55,20 @@ class Settings(BaseSettings):
     # Fallback when Groq hits rate limits (https://cloud.cerebras.ai)
     cerebras_api_key: str = ""
     cerebras_model: str = "gpt-oss-120b"
-    cerebras_enabled: bool = True
+    cerebras_enabled: bool = False
 
     # Free provider pool extras
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.6-flash"
     github_models_token: str = ""
     github_models_model: str = "openai/gpt-4o-mini"
-    github_models_enabled: bool = True
+    github_models_enabled: bool = False
     openrouter_api_key: str = ""
     openrouter_model: str = "google/gemma-4-31b-it:free"
-    nemotron_enabled: bool = True
+    nemotron_enabled: bool = False
+
+    # Load .env.claude_session.account1 only when explicitly forced (Render default off).
+    claude_session_force_enabled: bool = False
 
     # Optional Claude.ai browser-session provider (account 1 only for now).
     # This is additive: existing free providers stay configured and are used as fallbacks.
@@ -136,7 +139,7 @@ def get_settings() -> Settings:
     settings = Settings()
     # Keep the browser-session export out of the normal Settings constructor so
     # tests and scripts that build isolated Settings objects never pick it up.
-    if _CLAUDE_SESSION_FILE.exists():
+    if _CLAUDE_SESSION_FILE.exists() and settings.claude_session_force_enabled:
         values = dotenv_values(_CLAUDE_SESSION_FILE)
         enabled = str(values.get("CLAUDE_SESSION_ENABLED") or "").lower() in {
             "1",

@@ -22,7 +22,11 @@ def set_gmail_user_context(user_id: str):
 
 
 def reset_gmail_user_context(token) -> None:
-    _gmail_user_id.reset(token)
+    try:
+        _gmail_user_id.reset(token)
+    except ValueError:
+        # Another asyncio task may have touched this ContextVar (e.g. background watcher).
+        _gmail_user_id.set(OWNER_SEED_USER_ID)
 
 
 def active_gmail_user_id() -> str:

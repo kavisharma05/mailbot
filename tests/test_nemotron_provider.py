@@ -23,6 +23,7 @@ def test_provider_chain_ordering_per_mode():
         supabase_url="https://example.supabase.co",
         supabase_service_key="sk",
         task_secret="ts",
+        nemotron_enabled=True,
     )
     with patch("ai.client.get_settings", return_value=settings):
         text_names = [name for name, _ in _provider_chain(json_mode=False)]
@@ -161,7 +162,7 @@ def test_reasoning_only_response_is_not_served_as_answer():
 def test_call_json_falls_through_when_first_provider_returns_non_json():
     """A provider returning garbage for a JSON call must not poison the request."""
     client_module._cooldowns.clear()
-    settings = _settings(nemotron_api_key="n-key")
+    settings = _settings(nemotron_api_key="n-key", nemotron_enabled=True)
 
     # JSON chain order is groq first, nemotron later — so groq serves garbage
     # and nemotron must rescue the call.

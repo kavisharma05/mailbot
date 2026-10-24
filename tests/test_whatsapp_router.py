@@ -50,6 +50,7 @@ def test_whatsapp_hi_reaches_chat(monkeypatch):
 
     monkeypatch.setattr(whatsapp_router, "load_user_data", fake_load)
     monkeypatch.setattr(whatsapp_router, "save_user_data", fake_save)
+    monkeypatch.setattr(whatsapp_router, "flush_pending_digest", AsyncMock(return_value=False))
     monkeypatch.setattr(whatsapp_router, "announce_pending_digest", AsyncMock(return_value=False))
     monkeypatch.setattr(whatsapp_router.handlers, "chat_message", fake_chat)
     monkeypatch.setattr(
@@ -92,6 +93,7 @@ def test_unknown_whatsapp_command_gets_a_reply(monkeypatch):
 
     monkeypatch.setattr(whatsapp_router, "load_user_data", fake_load)
     monkeypatch.setattr(whatsapp_router, "save_user_data", fake_save)
+    monkeypatch.setattr(whatsapp_router, "flush_pending_digest", AsyncMock(return_value=False))
     monkeypatch.setattr(whatsapp_router, "announce_pending_digest", AsyncMock(return_value=False))
     client = type("C", (), {"send_text": fake_send})()
     monkeypatch.setattr(whatsapp_router, "get_whatsapp_client", lambda: client)

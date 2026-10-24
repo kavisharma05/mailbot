@@ -458,13 +458,11 @@ async def _process_message(
     delivery_ok = True
     marked_early = False
 
-    # Catch-up / history-fallback: mark old mail silently — never re-spam the inbox.
+    # Old mail and backfill: classify and persist silently — never re-spam the inbox.
     age_hours = _mail_age_hours(details)
     suppress_alerts = bool(
-        catchup_mode
-        and age_hours is not None
-        and age_hours > CATCHUP_ALERT_MAX_AGE_HOURS
-    )
+        age_hours is not None and age_hours > CATCHUP_ALERT_MAX_AGE_HOURS
+    ) or bool(skip_past_deadlines and _deadline_is_past(deadline_date))
 
     owner_text = format_incoming_mail_message(
         subject=details.get("subject"),
@@ -1004,7 +1002,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
             alerts += outcome["alerts"]
             notifications += int(outcome.get("notifications") or 0)
 
-        if failed == 0 and not hit_cap:
+        if failed == 0:
             await asyncio.to_thread(
                 update_watch_state,
                 last_history_id=history_id,
@@ -1012,6 +1010,8 @@ async def _run_gmail_watcher_inner(bot) -> dict:
                 user_id=mailbox_user.user_id(),
             )
             logger.info("Initialized watch state at historyId=%s", history_id)
+            if hit_cap:
+                logger.warning("Init catch-up hit alert cap; history advanced anyway")
         else:
             await asyncio.to_thread(
                 update_watch_state, last_checked_at=now, user_id=mailbox_user.user_id()
@@ -1023,7 +1023,7 @@ async def _run_gmail_watcher_inner(bot) -> dict:
             )
         return {
             "status": "initialized",
-            "history_id": history_id if (failed == 0 and not hit_cap) else None,
+            "history_id": history_id if failed == 0 else None,
             "processed": processed,
             "alerts": alerts,
             "notifications": notifications,
@@ -1080,7 +1080,13 @@ async def _run_gmail_watcher_inner(bot) -> dict:
     # Advance when healthy — OR when history failed but the API returned a
     # fresh anchor (stale startHistoryId 404 reset): the fallback recent-inbox
     # scan already covered the gap, so re-anchoring is safe and self-healing.
-    can_advance = failed == 0 and not hit_cap and (not history_failed or bool(latest_or_init))
+    # After alert cap, remaining backlog ticks should still re-anchor so we do not
+    # replay the same history window every 60s (suppress_alerts keeps cap rare).
+    can_advance = failed == 0 and (not history_failed or bool(latest_or_init))
+    if hit_cap and can_advance:
+        logger.warning(
+            "Alert cap hit but advancing history — older mail in this batch was processed silently"
+        )
     if can_advance:
         new_history_id = latest_or_init or await asyncio.to_thread(get_profile_history_id)
         await asyncio.to_thread(
@@ -1140,7 +1146,9 @@ async def run_gmail_backfill(bot, days: int = 14) -> dict:
             continue
 
         try:
-            outcome = await _process_message(message_id, bot, skip_past_deadlines=True)
+            outcome = await _process_message(
+                message_id, bot, skip_past_deadlines=True, catchup_mode=True
+            )
         except Exception as exc:
             logger.exception("Backfill processing failed for %s: %s", message_id, exc)
             continue
@@ -1355,10 +1363,12 @@ async def run_gmail_reconnect_backfill(bot) -> dict:
             lines.append(f"   Due: {due}")
         if len(missed) > 15:
             lines.append(f"\n…and {len(missed) - 15} more.")
-        await send_html(bot, _owner_dm_chat(settings), "\n".join(lines))
+        await send_owner_update(bot, _owner_dm_chat(settings), "\n".join(lines))
 
+    history_id = await asyncio.to_thread(get_profile_history_id)
     await asyncio.to_thread(
         update_watch_state,
+        last_history_id=history_id,
         gmail_reconnected_at=datetime.now(timezone.utc),
         clear_gmail_disconnected=True,
         user_id=mailbox_user.user_id(),

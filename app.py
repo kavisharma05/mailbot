@@ -457,7 +457,14 @@ async def telegram_webhook(secret: str, request: Request) -> Response:
     if not await should_process_update(update.update_id):
         logger.info("Skipping duplicate Telegram update_id=%s", update.update_id)
         return Response(status_code=200)
-    await ptb_app.process_update(update)
+
+    async def _run_telegram_update() -> None:
+        try:
+            await ptb_app.process_update(update)
+        except Exception:
+            logger.exception("Telegram update handling failed update_id=%s", update.update_id)
+
+    asyncio.create_task(_run_telegram_update())
     return Response(status_code=200)
 
 
@@ -729,14 +736,6 @@ async def oauth_callback(
     from gmail_api.client import get_gmail_service
 
     store_refresh_token(refresh_token, user_id=oauth_user_id)
-    from services.db import update_watch_state
-
-    if oauth_user_id:
-        await asyncio.to_thread(
-            update_watch_state,
-            clear_gmail_disconnected=True,
-            user_id=oauth_user_id,
-        )
     from gmail_api.auth import reset_gmail_user_context, set_gmail_user_context
     from services.mailbox_user import reset as reset_mb
     from services.mailbox_user import set_user as set_mb_user

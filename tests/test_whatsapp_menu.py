@@ -51,8 +51,12 @@ def router_env(monkeypatch):
     async def fake_save(_phone, _data):
         return None
 
+    from unittest.mock import AsyncMock
+
     monkeypatch.setattr(whatsapp_router, "load_user_data", fake_load)
     monkeypatch.setattr(whatsapp_router, "save_user_data", fake_save)
+    monkeypatch.setattr(whatsapp_router, "flush_pending_digest", AsyncMock(return_value=False))
+    monkeypatch.setattr(whatsapp_router, "announce_pending_digest", AsyncMock(return_value=False))
     return whatsapp_router
 
 

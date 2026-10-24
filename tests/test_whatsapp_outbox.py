@@ -108,7 +108,7 @@ def test_stash_appends_to_existing_pending(monkeypatch):
     pending = store["111"][pending_digest.PENDING_KEY]
     assert "old digest" in pending["text"]
     assert "new alert" in pending["text"]
-    assert pending["kind"] == "morning"
+    assert pending["kind"] == "alert"
 
 
 def test_webhook_failed_status_stashes_and_nudges(monkeypatch):

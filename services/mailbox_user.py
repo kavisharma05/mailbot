@@ -17,7 +17,10 @@ def set_user(user: dict[str, Any]):
 
 
 def reset(token) -> None:
-    _active_user.reset(token)
+    try:
+        _active_user.reset(token)
+    except ValueError:
+        _active_user.set(None)
 
 
 def current() -> dict[str, Any] | None:

@@ -184,7 +184,7 @@ def test_process_message_defers_when_owner_alert_fails():
             "subject": "Test",
             "sender": "Academic Office <office@imtnag.ac.in>",
             "body": "Please report attendance issues",
-            "received_at_iso": "2026-07-23T10:00:00+00:00",
+            "received_at_iso": datetime.now(timezone.utc).isoformat(),
             "attachments": [],
             "attachment_text": "",
         }
@@ -502,7 +502,7 @@ def test_partial_delivery_marks_processed_without_requeue_storm():
         "category": "deadline",
         "task": "Submit report",
         "summary": "Due soon",
-        "deadline_date": "2026-07-30T23:59:59+05:30",
+        "deadline_date": (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59+05:30"),
     }
     details = {
         "message_id": "msg-1",
@@ -510,7 +510,7 @@ def test_partial_delivery_marks_processed_without_requeue_storm():
         "subject": "Test",
         "sender": "Office <office@imtnag.ac.in>",
         "body": "Body",
-        "received_at_iso": "2026-07-23T10:00:00+00:00",
+        "received_at_iso": datetime.now(timezone.utc).isoformat(),
         "attachments": [],
         "attachment_text": "",
     }
@@ -763,9 +763,9 @@ def test_watcher_alert_cap_stops_storm_and_defers_history():
         assert result["alert_cap_hit"] is True
         assert result["notifications"] == MAX_ALERTS_PER_RUN
         assert mock_proc.call_count == MAX_ALERTS_PER_RUN
-        # history must NOT advance while a storm is suspected
-        assert result["history_id"] == "1000"
-        assert update_calls[0].get("last_history_id") is None
+        # Cap stops this tick's alerts; history still advances so we do not replay forever.
+        assert result["history_id"] == "2000"
+        assert update_calls[0].get("last_history_id") == "2000"
 
     asyncio.run(_run())
 

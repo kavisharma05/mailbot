@@ -237,11 +237,14 @@ class WhatsAppClient:
                 logger.warning("WhatsApp text send failed %s: %s", resp.status_code, resp.text[:500])
                 ok = False
                 if template_fallback and self._is_outside_window_error(resp):
-                    tmpl = (self._settings.whatsapp_alert_template or "").strip()
-                    if tmpl:
-                        summary = prepare_outbound_text(text, from_html=from_html)
-                        fallback_body = summary[0] if summary else piece
-                        return await self.send_template(to, tmpl, body_parameter=fallback_body[:1024])
+                    from services.messaging.pending_digest import stash_and_nudge
+
+                    stashed = await stash_and_nudge(
+                        self._normalize_to(to),
+                        kind=outbox_kind,
+                        text=text,
+                    )
+                    return stashed
                 break
             mid = _message_id_from_response(resp)
             if mid:
