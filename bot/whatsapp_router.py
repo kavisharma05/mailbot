@@ -22,6 +22,7 @@ from bot.whatsapp_adapter import (
 from bot.whatsapp_menu import CMD_PREFIX, MENU_KEYWORDS, send_main_menu
 from services.messaging.pending_digest import (
     DIGEST_KEYWORDS,
+    PENDING_KEY,
     announce_pending_digest,
     flush_pending_digest,
 )
@@ -62,6 +63,38 @@ _COMMANDS: dict[str, object] = {
 # Telegram-oriented text (start/help share the same handler on Telegram).
 _MENU_COMMAND_STYLES = {"start": "welcome", "help": "help", "menu": "menu"}
 _SAFE_DURING_COMPOSE = {"cancel", "reset", "new", "send", "help", "menu", "start"}
+
+
+def _has_pending_digest(user_data: dict) -> bool:
+    pending = user_data.get(PENDING_KEY)
+    return isinstance(pending, dict) and bool(pending.get("text"))
+
+
+def _inbound_wants_menu_only(message: dict) -> bool:
+    """True when the user only asked for the interactive menu (no auto-flush)."""
+    msg_type = message.get("type")
+    if msg_type == "text":
+        body = (message.get("text") or {}).get("body") or ""
+        stripped = body.strip()
+        if stripped.lower() in MENU_KEYWORDS:
+            return True
+        if stripped.startswith("/"):
+            cmd = stripped.split()[0][1:].split("@")[0].lower()
+            if cmd in _MENU_COMMAND_STYLES:
+                return True
+        return False
+    if msg_type == "interactive":
+        interactive = message.get("interactive") or {}
+        if interactive.get("type") == "list_reply":
+            cb = (interactive.get("list_reply") or {}).get("id") or ""
+        elif interactive.get("type") == "button_reply":
+            cb = (interactive.get("button_reply") or {}).get("id") or ""
+        else:
+            cb = ""
+        if cb.startswith(CMD_PREFIX):
+            cmd = cb[len(CMD_PREFIX) :].strip().lower()
+            return cmd in _MENU_COMMAND_STYLES
+    return False
 
 
 async def _remind_compose_in_progress(phone: str) -> None:
@@ -291,8 +324,8 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
     msg_id = str(message.get("id") or "")
     msg_type = message.get("type")
 
-    # An inbound message opens Meta's 24h window. The full digest is sent only
-    # when they ask for it, so Hello and /menu do not dump a briefing.
+    # An inbound message opens Meta's 24h window — deliver any stashed briefing
+    # unless the user only opened the menu (/menu, start, help).
     user_data = await load_user_data(normalized)
     snapshot = copy.deepcopy(user_data)
     wants_digest = False
@@ -314,10 +347,12 @@ async def process_whatsapp_message(phone: str, message: dict) -> None:
             cb = ""
         wants_digest = cb == f"{CMD_PREFIX}digest"
 
+    menu_only = _inbound_wants_menu_only(message)
+    has_pending = _has_pending_digest(user_data)
     flushed = False
-    if wants_digest:
+    if wants_digest or (has_pending and not menu_only):
         flushed = await flush_pending_digest(normalized, user_data)
-    else:
+    elif has_pending:
         try:
             await announce_pending_digest(normalized, user_data)
         except Exception:

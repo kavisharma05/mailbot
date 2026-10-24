@@ -80,11 +80,21 @@ async function connectGmail() {
 
     <div
       v-if="dashboard.data && dashboard.data.gmail_connected === false"
-      class="card px-4 py-4 flex flex-col gap-2"
+      class="card px-4 py-4 flex flex-col gap-2 border border-amber-200/80 bg-amber-50/40"
     >
-      <p class="text-body text-ink font-medium">Connect Gmail</p>
-      <p class="text-caption text-ink-2">Link your inbox to track deadlines and send mail from the app.</p>
-      <button type="button" class="btn-primary mt-1" @click="connectGmail">Connect Gmail</button>
+      <p class="text-body text-ink font-medium">
+        {{ dashboard.data.gmail_needs_reconnect ? 'Reconnect Gmail' : 'Connect Gmail' }}
+      </p>
+      <p class="text-caption text-ink-2">
+        {{
+          dashboard.data.gmail_needs_reconnect
+            ? 'Mail watching is paused until you sign in with Google again (same as Telegram /status).'
+            : 'Link your inbox to track deadlines and send mail from the app.'
+        }}
+      </p>
+      <button type="button" class="btn-primary mt-1" @click="connectGmail">
+        {{ dashboard.data.gmail_needs_reconnect ? 'Reconnect Gmail' : 'Connect Gmail' }}
+      </button>
     </div>
 
     <!-- Loading skeleton -->

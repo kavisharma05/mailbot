@@ -10,6 +10,7 @@ on:
 jobs:
   ping:
     runs-on: ubuntu-latest
+    environment: mailbot
     timeout-minutes: 3
     steps:
       - name: Ping /ping

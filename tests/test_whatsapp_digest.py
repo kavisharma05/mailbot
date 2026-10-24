@@ -7,8 +7,11 @@ import pytest
 from services.messaging.pending_digest import (
     DIGEST_KEYWORDS,
     PENDING_KEY,
+    STASH_MAX_CHARS,
+    _trim_stash_text,
     deliver_whatsapp_digest,
     flush_pending_digest,
+    stash_pending_digest,
     take_pending_digest,
 )
 
@@ -20,6 +23,34 @@ def _run(coro):
 def test_digest_keywords_include_plain_digest():
     assert "digest" in DIGEST_KEYWORDS
     assert "/digest" in DIGEST_KEYWORDS
+
+
+def test_trim_stash_text_keeps_newest_tail():
+    old = "A" * (STASH_MAX_CHARS - 50)
+    new = "B" * 200
+    combined = f"{old}\n\n— — —\n\n{new}"
+    trimmed = _trim_stash_text(combined)
+    assert trimmed.endswith("B" * 200)
+    assert len(trimmed) <= STASH_MAX_CHARS
+    assert trimmed.count("B") == 200
+
+
+def test_stash_same_kind_replaces_instead_of_prepend(monkeypatch):
+    stored: dict = {PENDING_KEY: {"kind": "evening", "text": "old evening", "announced": True}}
+
+    async def fake_load(_phone):
+        return dict(stored)
+
+    async def fake_save(_phone, data):
+        stored.clear()
+        stored.update(data)
+
+    monkeypatch.setattr("services.messaging.pending_digest.load_user_data", fake_load)
+    monkeypatch.setattr("services.messaging.pending_digest.save_user_data", fake_save)
+
+    _run(stash_pending_digest("1111111111", kind="evening", text="fresh evening"))
+    assert stored[PENDING_KEY]["text"] == "fresh evening"
+    assert stored[PENDING_KEY]["announced"] is False
 
 
 def test_take_pending_digest_pops():
@@ -144,7 +175,7 @@ def test_router_does_not_flush_pending_on_menu(monkeypatch):
         return True
 
     async def fake_load(_phone):
-        return {}
+        return {PENDING_KEY: {"kind": "evening", "text": "saved"}}
 
     async def fake_save(_phone, _data):
         return None
@@ -164,6 +195,44 @@ def test_router_does_not_flush_pending_on_menu(monkeypatch):
         )
     )
     assert flushed == []
+
+
+def test_router_flushes_pending_on_any_inbound_reply(monkeypatch):
+    monkeypatch.setenv("WHATSAPP_OWNER_PHONE", "1111111111")
+    from config import get_settings
+
+    get_settings.cache_clear()
+    from bot import whatsapp_router
+
+    flushed: list[str] = []
+
+    async def fake_flush(phone, user_data=None):
+        flushed.append(phone)
+        if user_data is not None:
+            user_data.pop(PENDING_KEY, None)
+        return True
+
+    async def fake_load(_phone):
+        return {PENDING_KEY: {"kind": "morning", "text": "briefing"}}
+
+    async def fake_save(_phone, _data):
+        return None
+
+    async def fake_dispatch_text(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(whatsapp_router, "flush_pending_digest", fake_flush)
+    monkeypatch.setattr(whatsapp_router, "load_user_data", fake_load)
+    monkeypatch.setattr(whatsapp_router, "save_user_data", fake_save)
+    monkeypatch.setattr(whatsapp_router, "_dispatch_text", fake_dispatch_text)
+
+    _run(
+        whatsapp_router.process_whatsapp_message(
+            "1111111111",
+            {"id": "m3", "type": "text", "text": {"body": "Hi"}},
+        )
+    )
+    assert flushed == ["1111111111"]
 
 
 def test_router_flushes_pending_on_digest_keyword(monkeypatch):

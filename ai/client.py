@@ -714,7 +714,7 @@ def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
             chain.append(("claude_session", _call_claude_session))
 
     def add_nemotron() -> None:
-        if settings.nemotron_api_key:
+        if settings.nemotron_enabled and settings.nemotron_api_key:
             chain.append(("nemotron", _call_nemotron))
 
     def add_groq() -> None:
@@ -756,7 +756,7 @@ def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
             chain.append(("gemini", _call_gemini))
 
     def add_cerebras() -> None:
-        if settings.cerebras_api_key:
+        if settings.cerebras_enabled and settings.cerebras_api_key:
             chain.append(("cerebras", _call_cerebras))
 
     def add_openrouter() -> None:
@@ -764,15 +764,15 @@ def _provider_chain(json_mode: bool = False) -> list[tuple[str, ProviderFn]]:
             chain.append(("openrouter", _call_openrouter))
 
     def add_github_models() -> None:
-        if settings.github_models_token:
+        if settings.github_models_enabled and settings.github_models_token:
             chain.append(("github_models", _call_github_models))
 
     add_groq()
     add_gemini()
+    add_openrouter()
     add_claude_session()
     add_cerebras()
     add_nemotron()
-    add_openrouter()
     add_github_models()
     return chain
 

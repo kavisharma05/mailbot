@@ -3,7 +3,7 @@
 Meta allows free-form messages only after the user writes first. We do not
 fight that: if a digest cannot be delivered, we stash the full text and
 (optionally) send an approved utility-template nudge. The stash is delivered
-only when the owner asks for it (DIGEST). A normal reply just opens the window.
+when the owner replies (any message opens the 24h window) or sends DIGEST.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from services.messaging.whatsapp import get_whatsapp_client
 logger = logging.getLogger(__name__)
 
 PENDING_KEY = "pending_whatsapp_digest"
+STASH_MAX_CHARS = 3800
+_STASH_SEP = "\n\n— — —\n\n"
 DIGEST_KEYWORDS = {
     "digest",
     "full digest",
@@ -38,6 +40,19 @@ def digest_template_name() -> str:
 
 def _owner_phone() -> str:
     return (get_settings().whatsapp_owner_phone or "").lstrip("+").replace(" ", "").replace("-", "")
+
+
+def _trim_stash_text(combined: str) -> str:
+    """Keep the newest content when over the WhatsApp body budget."""
+    text = combined.strip()
+    if len(text) <= STASH_MAX_CHARS:
+        return text
+    tail = text[-STASH_MAX_CHARS:]
+    sep_at = tail.find(_STASH_SEP)
+    if 0 <= sep_at < 120:
+        trimmed = tail[sep_at + len(_STASH_SEP) :].strip()
+        return trimmed or tail.strip()
+    return tail.strip()
 
 
 def _teaser(kind: str) -> str:
@@ -75,20 +90,28 @@ async def announce_pending_digest(phone: str, user_data: dict[str, Any]) -> bool
 async def stash_pending_digest(phone: str, *, kind: str, text: str) -> None:
     data = await load_user_data(phone)
     existing = data.get(PENDING_KEY)
-    if isinstance(existing, dict) and existing.get("text"):
-        # Keep everything the owner has not seen yet instead of overwriting.
-        combined = f"{str(existing['text']).rstrip()}\n\n— — —\n\n{text.strip()}"[:3800]
-        data[PENDING_KEY] = {
-            "kind": existing.get("kind") or kind,
-            "text": combined,
-            "stashed_at": existing.get("stashed_at")
-            or datetime.now(timezone.utc).isoformat(),
-        }
-    else:
+    now = datetime.now(timezone.utc).isoformat()
+    new_body = (text or "").strip()
+    if isinstance(existing, dict) and existing.get("text") and new_body:
+        existing_kind = str(existing.get("kind") or "")
+        if existing_kind == kind:
+            combined = new_body
+        else:
+            combined = _trim_stash_text(
+                f"{str(existing['text']).rstrip()}{_STASH_SEP}{new_body}"
+            )
         data[PENDING_KEY] = {
             "kind": kind,
-            "text": text,
-            "stashed_at": datetime.now(timezone.utc).isoformat(),
+            "text": _trim_stash_text(combined),
+            "stashed_at": now,
+            "announced": False,
+        }
+    elif new_body:
+        data[PENDING_KEY] = {
+            "kind": kind,
+            "text": _trim_stash_text(new_body),
+            "stashed_at": now,
+            "announced": False,
         }
     await save_user_data(phone, data)
 
@@ -125,7 +148,7 @@ async def stash_and_nudge(phone: str, *, kind: str, text: str) -> bool:
     """Stash content for later and send the approved template nudge.
 
     Returns True when the template nudge was sent. The stashed text is sent
-    only when the owner replies DIGEST.
+    on the owner's next inbound message (or when they send DIGEST).
     """
     await stash_pending_digest(phone, kind=kind, text=text)
     tmpl = digest_template_name()

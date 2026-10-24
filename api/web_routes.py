@@ -233,7 +233,23 @@ def _sync_meta(user_id: str | None = None) -> dict[str, Any]:
         "synced": True,
         "last_checked_at": last,
         "gmail_disconnected": bool(state.get("gmail_disconnected_at")),
+        "gmail_disconnected_at": state.get("gmail_disconnected_at"),
     }
+
+
+def _gmail_link_status(user_id: str | None, user: dict[str, Any]) -> tuple[bool, bool]:
+    """(gmail_connected, needs_reconnect) — aligned with Telegram /status (watch_state + token)."""
+    from gmail_api.auth import _effective_refresh_token
+
+    state = get_watch_state(user_id) or {}
+    if state.get("gmail_disconnected_at"):
+        linked_before = bool(user.get("gmail_address")) or bool(_effective_refresh_token(user_id))
+        return False, linked_before
+    if _effective_refresh_token(user_id):
+        return True, False
+    if user.get("gmail_address"):
+        return True, False
+    return False, False
 
 
 def _partition_open_assignments(
@@ -427,7 +443,7 @@ async def dashboard(user: dict = Depends(web_user)):
         "classes_today": sum(1 for s in today_sessions if not s.get("cancelled")),
         "placement": sum(1 for a in buckets["all"] if a.get("category") == "placement"),
     }
-    gmail_connected = bool(user.get("gmail_address")) or user.get("role") == "owner"
+    gmail_connected, gmail_needs_reconnect = _gmail_link_status(uid, user)
     return {
         "greeting_name": _greeting_name(user),
         "student_name": user.get("display_name")
@@ -437,6 +453,7 @@ async def dashboard(user: dict = Depends(web_user)):
         "db_ok": db_ok,
         "stats": stats,
         "gmail_connected": gmail_connected,
+        "gmail_needs_reconnect": gmail_needs_reconnect,
         "user": {"id": uid, "role": user.get("role"), "telegram_username": user.get("telegram_username")},
         "urgent_task": _serialize_task(urgent, now=now) if urgent else None,
         "today_classes": [_serialize_class(s) for s in today_sessions],

@@ -55,14 +55,17 @@ class Settings(BaseSettings):
     # Fallback when Groq hits rate limits (https://cloud.cerebras.ai)
     cerebras_api_key: str = ""
     cerebras_model: str = "gpt-oss-120b"
+    cerebras_enabled: bool = True
 
     # Free provider pool extras
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.6-flash"
     github_models_token: str = ""
     github_models_model: str = "openai/gpt-4o-mini"
+    github_models_enabled: bool = True
     openrouter_api_key: str = ""
     openrouter_model: str = "google/gemma-4-31b-it:free"
+    nemotron_enabled: bool = True
 
     # Optional Claude.ai browser-session provider (account 1 only for now).
     # This is additive: existing free providers stay configured and are used as fallbacks.

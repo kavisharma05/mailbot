@@ -48,6 +48,7 @@ from services.watcher import (
     run_gmail_reconnect_backfill,
     run_gmail_watcher,
     watcher_lock,
+    watcher_result_auth_failed,
 )
 from services.websocket_manager import broadcast_fire_and_forget, connect, disconnect
 
@@ -154,7 +155,8 @@ async def _background_watcher_loop() -> None:
             watcher_ok = True
             logger.info("Background watcher result: %s", result)
             broadcast_fire_and_forget("sync_status", {"watcher": result})
-            await ping_heartbeat(ok=True)
+            auth_degraded = watcher_result_auth_failed(result)
+            await ping_heartbeat(ok=not auth_degraded)
             from services.db import update_watch_state
 
             await asyncio.to_thread(
@@ -476,6 +478,12 @@ async def watch_gmail(x_task_secret: str = Header(..., alias="x-task-secret")):
             status_code=503,
             detail="Gmail refresh token expired or revoked; use /oauth/start to reconnect",
         ) from exc
+    if watcher_result_auth_failed(result):
+        await ping_heartbeat(ok=False)
+        raise HTTPException(
+            status_code=503,
+            detail="Gmail refresh token expired or revoked for one or more mailboxes; use /oauth/start to reconnect",
+        )
     await ping_heartbeat(ok=True)
     from services.db import update_watch_state
 
@@ -721,6 +729,14 @@ async def oauth_callback(
     from gmail_api.client import get_gmail_service
 
     store_refresh_token(refresh_token, user_id=oauth_user_id)
+    from services.db import update_watch_state
+
+    if oauth_user_id:
+        await asyncio.to_thread(
+            update_watch_state,
+            clear_gmail_disconnected=True,
+            user_id=oauth_user_id,
+        )
     from gmail_api.auth import reset_gmail_user_context, set_gmail_user_context
     from services.mailbox_user import reset as reset_mb
     from services.mailbox_user import set_user as set_mb_user

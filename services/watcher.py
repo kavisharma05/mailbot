@@ -927,7 +927,31 @@ async def run_gmail_watcher(bot) -> dict:
 
     if len(results) == 1:
         return results[0]
-    return {"status": "multi", "users": results, **totals}
+    auth_failed = sum(1 for row in results if row.get("status") == "auth_failed")
+    out: dict[str, Any] = {"status": "multi", "users": results, **totals}
+    if auth_failed:
+        out["auth_failed"] = auth_failed
+        if auth_failed == len(results):
+            out["status"] = "auth_failed"
+    return out
+
+
+def watcher_result_auth_failed(result: dict[str, Any]) -> bool:
+    """True when Gmail OAuth failed for the owner or every watched mailbox."""
+    from services.user_ids import OWNER_SEED_USER_ID
+
+    if result.get("status") == "auth_failed":
+        return True
+    users = result.get("users")
+    if not isinstance(users, list) or not users:
+        return False
+    if all(str(row.get("status") or "") == "auth_failed" for row in users):
+        return True
+    return any(
+        str(row.get("status") or "") == "auth_failed"
+        and str(row.get("user_id") or "") == OWNER_SEED_USER_ID
+        for row in users
+    )
 
 
 async def _processed_lookup(message_id: str) -> bool | None:
@@ -1218,15 +1242,22 @@ async def notify_gmail_auth_failure(bot, user: dict[str, Any] | None = None) -> 
             return
         settings = get_settings()
         chat = _owner_dm_chat(settings)
+        if user:
+            peer_chat = str(user.get("telegram_chat_id") or "").strip()
+            if peer_chat:
+                chat = peer_chat
         if not chat:
             return
 
         now = datetime.now(timezone.utc)
-        await asyncio.to_thread(
-            update_watch_state, gmail_disconnected_at=now, user_id=uid
-        )
+        state = await asyncio.to_thread(get_watch_state, uid)
+        if not state or not state.get("gmail_disconnected_at"):
+            await asyncio.to_thread(
+                update_watch_state, gmail_disconnected_at=now, user_id=uid
+            )
 
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        from services.user_ids import OWNER_SEED_USER_ID
 
         text = (
             "⚠️ <b>Gmail access lost</b>\n\n"
@@ -1249,6 +1280,28 @@ async def notify_gmail_auth_failure(bot, user: dict[str, Any] | None = None) -> 
             _gmail_auth_alert_sent.add(uid)
         except Exception as exc:
             logger.warning("Failed to send Gmail auth failure alert: %s", exc)
+
+        if uid == OWNER_SEED_USER_ID or (user and str(user.get("role") or "") == "owner"):
+            try:
+                from services.messaging.pending_digest import digest_template_name
+                from services.messaging.whatsapp import get_whatsapp_client
+
+                client = get_whatsapp_client()
+                phone = (settings.whatsapp_owner_phone or "").lstrip("+").replace(" ", "")
+                if client.enabled and phone:
+                    tmpl = digest_template_name()
+                    teaser = "Gmail access lost — reconnect via Telegram or the web app."
+                    if tmpl:
+                        await client.send_template(phone, tmpl, body_parameter=teaser[:1024])
+                    else:
+                        await client.send_text(
+                            phone,
+                            teaser,
+                            from_html=False,
+                            template_fallback=False,
+                        )
+            except Exception as exc:
+                logger.warning("WhatsApp Gmail auth alert failed: %s", exc)
     finally:
         if mb_token is not None:
             mailbox_user.reset(mb_token)
