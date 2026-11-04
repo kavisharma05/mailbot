@@ -294,13 +294,30 @@ async def websocket_endpoint(ws: WebSocket, token: str | None = Query(default=No
         await disconnect(ws)
 
 
+def _whatsapp_health() -> dict[str, bool]:
+    settings = get_settings()
+    client = get_whatsapp_client()
+    return {
+        "enabled": bool(settings.whatsapp_enabled),
+        "can_send": bool(client.can_send),
+        "owner_phone_set": bool((settings.whatsapp_owner_phone or "").strip()),
+        "alert_template_set": bool((settings.whatsapp_alert_template or "").strip()),
+        "digest_template_set": bool((settings.whatsapp_digest_template or "").strip()),
+        "verify_token_set": bool((settings.whatsapp_verify_token or "").strip()),
+        "app_secret_set": bool((settings.whatsapp_app_secret or "").strip()),
+    }
+
+
 @fastapi_app.get("/healthz")
 async def healthz():
     from ai.client import get_llm_status
 
     db = check_db_health()
+    wa = _whatsapp_health()
     status = "ok" if db.get("ok") else "degraded"
-    return {"status": status, "llm": get_llm_status(), "db": db}
+    if wa["enabled"] and not wa["can_send"]:
+        status = "degraded"
+    return {"status": status, "llm": get_llm_status(), "db": db, "whatsapp": wa}
 
 
 @fastapi_app.get("/privacy", response_class=HTMLResponse)
